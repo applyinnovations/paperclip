@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AGENT_ADAPTER_TYPES } from "@paperclipai/shared";
 import type { AgentAdapterType, JoinRequest } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
+import { OidcSignIn } from "@/components/OidcSignIn";
 import { CompanyPatternIcon } from "@/components/CompanyPatternIcon";
 import { useCompany } from "@/context/CompanyContext";
 import { Link, useNavigate, useParams } from "@/lib/router";
@@ -806,6 +807,8 @@ export function InviteLandingPage() {
                         : "Create account and continue"}
                   </Button>
                 </form>
+
+                <OidcSignIn callbackURL={`/invite/${encodeURIComponent(token)}`} />
 
                 <p className="text-xs leading-5 text-zinc-500">
                   {authMode === "sign_up"
