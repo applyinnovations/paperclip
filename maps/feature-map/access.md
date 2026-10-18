@@ -23,6 +23,9 @@ Agent access: [companion](../agent-access-map/access.md).
 ### `login`
 
 Open `/auth`; first-owner bootstrap uses `/board-claim/:token` when configured.
+Configured self-hosted instances also show an OpenID Connect button on sign-in
+and invitation pages. Existing users link the provider in Settings → Profile
+with their current password. See [OIDC policy](../../doc/OIDC.md).
 
 ### `invite-members`
 
@@ -42,6 +45,9 @@ Preconditions: follow the [baseline](./README.md#before-driving-a-journey). For 
 ### `login`
 
 Automated: [auth UI](../../ui/src/pages/Auth.test.tsx) and [session routes](../../server/src/__tests__/auth-session-route.test.ts) cover their respective layers.
+The [OIDC integration suite](../../server/src/__tests__/oidc.integration.test.ts)
+uses real signed tokens and a disposable provider/database for callback,
+linking, signup, invitation, bootstrap, logout and isolation checks.
 
 Manual: Sign in, reload a company deep link, sign out, and revisit it. Confirm the browser requests authentication rather than showing cached company data. Test an invalid claim separately on disposable state.
 

@@ -13,6 +13,7 @@ import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { PaperclipLoading } from "@/components/AnimatedPaperclipIcon";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { PaperclipLockup } from "../components/PaperclipLockup";
+import { OidcSignIn } from "@/components/OidcSignIn";
 
 type AuthMode = "sign_in" | "sign_up";
 
@@ -24,7 +25,7 @@ export function AuthPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(searchParams.has("error") ? "Single sign-on failed. Try again or sign in with your Paperclip password. Existing accounts must be linked from Profile settings after password sign-in." : null);
   const errorId = "auth-error";
 
   const nextPath = useMemo(
@@ -203,6 +204,8 @@ export function AuthPage() {
                   : "Create Account"}
             </Button>
           </form>
+
+          <OidcSignIn callbackURL={nextPath} />
 
           <div className="mt-5 text-sm text-muted-foreground">
             {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
