@@ -30,7 +30,9 @@ Policy: Company access plus action-specific grants; instance administration requ
 board administrator.
 OIDC sign-in creates no agent authority or company/admin grants. Account linking
 requires a human password and the same active local session. Agents continue
-to use their own bearer credentials.
+to use their own bearer credentials. Human OIDC initiation rejects caller-owned
+scopes and authorization parameters. Provider-token retrieval, refresh and
+account-info APIs are denied while this authentication-only provider is configured.
 
 Evidence: `source-only` — [implementation](../../server/src/routes/access.ts#L3018) at
 the reviewed commit above.

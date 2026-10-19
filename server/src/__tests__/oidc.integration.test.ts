@@ -1,8 +1,9 @@
 import express from "express";
+import type { Auth } from "better-auth";
 import { createHash, randomUUID } from "node:crypto";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { authAccounts, authSessions, authUsers, authVerifications, companies, companyMemberships, createDb, instanceUserRoles, invites } from "@paperclipai/db";
 import { createBetterAuthHandler, createBetterAuthInstance, resolveBetterAuthSession } from "../auth/better-auth.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -69,6 +70,7 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
       authPublicBaseUrl: ORIGIN, authDisableSignUp: disableSignUp, allowedHostnames: ["127.0.0.1"], port: 41999 } as Config;
     const auth = createBetterAuthInstance(db, config, [ORIGIN]);
     const api = express();
+    api.locals.auth = auth;
     api.all("/api/auth/{*authPath}", createBetterAuthHandler(auth));
     api.use(express.json());
     api.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: (req) => resolveBetterAuthSession(auth, req) }));
@@ -93,6 +95,108 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     request(api).get(`${flow.target.pathname}${flow.target.search}`).set("cookie", cookie);
   const passwordSignup = (api: express.Express) => request(api).post("/api/auth/sign-up/email").set("origin", ORIGIN)
     .send({ name: "Local Person", email: "person@example.test", password: PASSWORD });
+
+
+  it.each(["sign-in/social", "link-social"])("rejects caller-owned authorization inputs on %s", async (endpoint) => {
+    const api = app();
+    const local = await passwordSignup(api);
+    const context = await (api.locals.auth as Auth).$context;
+    const verify = vi.spyOn(context.password, "verify");
+    try {
+      for (const authorization of [
+        { scopes: ["offline_access", "privileged.read"] }, { scopes: ["openid offline_access"] },
+        { scopes: "offline_access" }, { scopes: [] }, { scopes: null },
+        { additionalParams: { resource: "https://resource.example.test" } },
+        { additionalParams: { audience: "privileged-api" } },
+        { additionalParams: { prompt: "consent" } },
+        { additionalParams: { access_type: "offline" } },
+        { additionalParams: { scope: "openid privileged.read" } },
+        { additionalParams: {} }, { additionalParams: null },
+      ]) {
+        const response = await request(api).post(`/api/auth/${endpoint}`).set("origin", ORIGIN).set("cookie", cookies(local))
+          .send({ provider: "oidc", callbackURL: "/", additionalData: { password: PASSWORD }, ...authorization });
+        expect(response.status, JSON.stringify(authorization)).toBe(400);
+        expect(response.body.url).toBeUndefined();
+      }
+      expect(verify).not.toHaveBeenCalled();
+      expect(await db.select().from(authVerifications)).toHaveLength(0);
+    } finally { verify.mockRestore(); }
+  });
+
+  it.each(["get-access-token", "refresh-token", "account-info"])("denies %s for stored provider credentials", async (endpoint) => {
+    const api = app();
+    const login = await complete(api, await start(api));
+    const session = cookies(login);
+    const account = (await db.select().from(authAccounts))[0];
+    await db.update(authAccounts).set({
+      accessToken: "legacy-access-sentinel", refreshToken: "legacy-refresh-sentinel", idToken: "legacy-id-sentinel",
+      accessTokenExpiresAt: new Date(Date.now() + 60_000), refreshTokenExpiresAt: new Date(Date.now() + 60_000),
+    }).where(eq(authAccounts.id, account.id));
+    const tokenRequests = provider.state.tokenRequests;
+    for (const selector of [
+      { accountId: account.id }, { useAccountCookie: true }, { accountId: randomUUID() },
+      { accountId: account.id, providerId: "different-provider" }, { accountId: account.id, userId: randomUUID() },
+    ]) {
+      const response = endpoint === "account-info"
+        ? await request(api).get(`/api/auth/${endpoint}`).set("cookie", session).query(selector)
+        : await request(api).post(`/api/auth/${endpoint}`).set("origin", ORIGIN).set("cookie", session).send(selector);
+      expect(response.status).toBe(403);
+      expect(JSON.stringify(response.body)).not.toContain("legacy-");
+    }
+    if (endpoint === "account-info") {
+      expect((await request(api).get(`/api/auth/account-info?accountId=${account.id}&accountId=${account.id}`)
+        .set("cookie", session)).status).toBe(403);
+    }
+    expect(provider.state.tokenRequests).toBe(tokenRequests);
+    const accounts = await request(api).get("/api/auth/list-accounts").set("cookie", session);
+    expect(accounts.status).toBe(200);
+    expect(JSON.stringify(accounts.body)).not.toContain("legacy-");
+    expect((await request(api).get("/actor").set("cookie", session)).body.source).toBe("session");
+  });
+
+  it("rate limits linking password verification before a fourth credential attempt", async () => {
+    process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED = "true";
+    const api = app();
+    const local = await passwordSignup(api);
+    expect(local.status).toBe(200);
+    const context = await (api.locals.auth as Auth).$context;
+    const verify = vi.spyOn(context.password, "verify");
+    const clock = vi.spyOn(Date, "now");
+    try {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const response = await request(api).post("/api/auth/link-social").set("origin", ORIGIN).set("cookie", cookies(local))
+          .send({ provider: "oidc", callbackURL: "/", additionalData: { password: "wrong-password" } });
+        expect(response.status).toBe(attempt < 3 ? 401 : 429);
+      }
+      expect(verify).toHaveBeenCalledTimes(3);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const response = await request(api).post("/api/auth/sign-in/email").set("origin", ORIGIN)
+          .send({ email: "person@example.test", password: "wrong-password" });
+        expect(response.status).toBe(attempt < 3 ? 401 : 429);
+      }
+      expect(verify).toHaveBeenCalledTimes(6);
+      clock.mockReturnValue(Date.now() + 11_000);
+      await start(api, cookies(local), PASSWORD);
+      expect(verify).toHaveBeenCalledTimes(7);
+    } finally { clock.mockRestore(); verify.mockRestore(); }
+  });
+
+
+  it("honors an explicit rate-limit disable override for linking", async () => {
+    process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED = "false";
+    const api = app();
+    const local = await passwordSignup(api);
+    const context = await (api.locals.auth as Auth).$context;
+    const verify = vi.spyOn(context.password, "verify");
+    try {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const response = await request(api).post("/api/auth/link-social").set("origin", ORIGIN).set("cookie", cookies(local))
+          .send({ provider: "oidc", callbackURL: "/", additionalData: { password: "wrong-password" } });
+        expect(response.status).toBe(401);
+      }
+      expect(verify).toHaveBeenCalledTimes(4);
+    } finally { verify.mockRestore(); }
+  });
 
   it("creates an issuer/subject account and session without company or admin grants", async () => {
     const api = app();
