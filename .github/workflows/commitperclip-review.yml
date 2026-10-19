@@ -8,12 +8,16 @@ on:
 # pull_request_target gives access to secrets for untrusted fork PRs.
 
 permissions:
-  pull-requests: write
-  checks: write
+  pull-requests: read
   contents: read
 
 jobs:
   review:
+    if: github.repository == 'paperclipai/paperclip'
+    permissions:
+      pull-requests: write
+      checks: write
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

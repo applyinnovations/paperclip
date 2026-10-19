@@ -13,7 +13,38 @@ permissions:
 
 jobs:
   ci:
-    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
+    if: github.repository == 'paperclipai/paperclip' && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci')
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+
+  fork_quality:
+    if: github.repository != 'paperclipai/paperclip' && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout policy from the base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - name: Run read-only PR policy checks
+        run: node .github/scripts/run-fork-quality-gates.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+  fork_ci:
+    needs: [fork_quality]
+    if: github.repository != 'paperclipai/paperclip' && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci')
+    uses: ./.github/workflows/pr-trusted.yml
