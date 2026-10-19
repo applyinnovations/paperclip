@@ -5,6 +5,8 @@ import { createRemoteJWKSet, decodeJwt } from "jose";
 import { oidcUrl, type OidcConfig } from "./oidc-config.js";
 import { logger } from "../middleware/logger.js";
 
+const PROVIDER_CREDENTIAL_PATHS = new Set(["/get-access-token", "/refresh-token", "/account-info"]);
+
 const SIGNING_ALGORITHMS = new Set(["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"]);
 
 export async function discoverOidc(config: OidcConfig) {
@@ -45,6 +47,8 @@ export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
   let available = false;
   return {
     id: "paperclip-oidc",
+    // Match Better Auth's credential-attempt policy before the linking hook verifies a password.
+    rateLimit: config ? [{ pathMatcher: (path: string) => path === "/link-social", window: 10, max: 3 }] : [],
     endpoints: {
       oidcProvider: createAuthEndpoint("/oidc/provider", { method: "GET" }, async (ctx) => {
         ctx.setHeader("Cache-Control", "no-store");
@@ -105,10 +109,20 @@ export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
     },
     hooks: {
       before: [{
+        // Paperclip uses its sole social provider for identity, never provider API access.
+        // Canonical endpoint paths also cover legacy account rows and account-cookie selectors.
+        matcher: (ctx) => Boolean(config && ctx.path && PROVIDER_CREDENTIAL_PATHS.has(ctx.path)),
+        handler: createAuthMiddleware(async () => {
+          throw new APIError("FORBIDDEN", { message: "Provider credentials are unavailable for this sign-in integration." });
+        }),
+      }, {
         matcher: (ctx) => Boolean(config && (ctx.path === "/sign-in/social" || ctx.path === "/link-social") && ctx.body?.provider === config.providerId),
         handler: createAuthMiddleware(async (ctx) => {
           if (ctx.headers?.get("origin") !== config!.baseUrl) {
             throw new APIError("FORBIDDEN", { message: "OIDC requests require this instance's public origin." });
+          }
+          if (ctx.body?.scopes !== undefined || ctx.body?.additionalParams !== undefined) {
+            throw new APIError("BAD_REQUEST", { message: "OIDC sign-in uses fixed identity permissions." });
           }
           if (ctx.body?.idToken) throw new APIError("BAD_REQUEST", { message: "Use the OIDC authorization code flow." });
           for (const field of ["callbackURL", "errorCallbackURL", "newUserCallbackURL"]) {
