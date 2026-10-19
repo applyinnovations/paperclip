@@ -70,7 +70,7 @@ function createLocalSandboxRunner() {
       counter += 1;
       return await runChildProcess(`cursor-sandbox-env-${counter}`, input.command, input.args ?? [], {
         cwd: input.cwd ?? process.cwd(),
-        env: input.env ?? {},
+        env: { ...input.env, PATH: [input.env?.PATH ?? process.env.PATH, path.dirname(process.execPath)].filter(Boolean).join(path.delimiter) },
         stdin: input.stdin,
         timeoutSec: Math.max(1, Math.ceil((input.timeoutMs ?? 30_000) / 1000)),
         graceSec: 5,

@@ -1,6 +1,4 @@
 import { Worker } from "node:worker_threads";
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,7 +43,7 @@ export async function runSnapshotThread(request: SnapshotThreadRequest): Promise
     const url = new URL(source ? "./workspace-snapshot-thread-worker.ts" : "./workspace-snapshot-thread-worker.js", import.meta.url);
     const options = { workerData: request, env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory } };
     worker = source
-      ? new Worker(`import(${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm/api")).href)}).then(({tsImport}) => tsImport(${JSON.stringify(url.href)}, ${JSON.stringify(import.meta.url)}));`, { ...options, eval: true })
+      ? new Worker(`import(${JSON.stringify(import.meta.resolve("tsx/esm/api"))}).then(({tsImport}) => tsImport(${JSON.stringify(url.href)}, ${JSON.stringify(import.meta.url)}));`, { ...options, eval: true })
       : new Worker(url, options);
     const child = worker;
     const response = await new Promise<SnapshotThreadResponse>((resolve, reject) => {

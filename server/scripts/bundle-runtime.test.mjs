@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -100,7 +100,7 @@ describe("bundleRuntime", () => {
   it("leaves the server's own dependencies to runtime resolution", async () => {
     const outdir = path.join(root, "server", "dist-runtime");
     const summary = await bundleRuntime({ entry: path.join(root, "server", "dist", "index.js"), outdir });
-    rmSync(path.join(root, "server", "node_modules", "server-dep"));
+    unlinkSync(path.join(root, "server", "node_modules", "server-dep"));
     symlinkSync(path.join(root, "node_modules", ".pnpm", "server-dep@2"), path.join(root, "server", "node_modules", "server-dep"), "dir");
     const { stdout } = await execFileAsync(process.execPath, [summary.outfile], { cwd: path.join(root, "server"), timeout: 30_000 });
     expect(JSON.parse(stdout).flavor).toBe("replaced after build");
