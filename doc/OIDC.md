@@ -35,6 +35,11 @@ commit its value. Optional settings:
 The public base URL must be an origin without a path. HTTPS is required except
 for loopback development. Paperclip requests `openid profile email` and matches
 the issuer exactly. Keep the issuer, provider ID and client registration stable.
+Client requests cannot add scopes or authorization parameters. This provider is
+for sign-in only: Better Auth's provider-token retrieval, refresh and account-info
+APIs are unavailable while OIDC is configured, including for preexisting account
+rows. Better Auth still stores provider tokens; protect the database and its
+backups. Restrict the IdP client registration to the identity scopes above.
 
 Restart after configuration changes. Invalid local settings refuse startup.
 Provider discovery has a five-second timeout; failure hides the provider button
@@ -49,7 +54,10 @@ Existing users must sign in with their local password, open Settings → Profile
 → Single sign-on, enter that password and select **Link**, then authenticate
 with the same verified email at the provider. Linking expires after five minutes
 and requires the same live Paperclip session. Email matching alone never links
-accounts or transfers access.
+accounts or transfers access. Password confirmation uses Better Auth's strict
+three-attempt, ten-second per-IP/path policy when authentication rate limiting is
+enabled, matching password sign-in. The existing explicit rate-limit override
+still applies; this does not introduce a shared per-account lockout.
 
 `PAPERCLIP_AUTH_DISABLE_SIGN_UP` also applies to OIDC, including invitees.
 When signup is enabled, a new verified identity can create an account but gains

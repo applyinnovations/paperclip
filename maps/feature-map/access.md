@@ -47,7 +47,8 @@ Preconditions: follow the [baseline](./README.md#before-driving-a-journey). For 
 Automated: [auth UI](../../ui/src/pages/Auth.test.tsx) and [session routes](../../server/src/__tests__/auth-session-route.test.ts) cover their respective layers.
 The [OIDC integration suite](../../server/src/__tests__/oidc.integration.test.ts)
 uses real signed tokens and a disposable provider/database for callback,
-linking, signup, invitation, bootstrap, logout and isolation checks.
+linking, signup, invitation, bootstrap, logout, fixed authorization inputs,
+provider-credential export denial, password-confirmation throttling and isolation checks.
 
 Manual: Sign in, reload a company deep link, sign out, and revisit it. Confirm the browser requests authentication rather than showing cached company data. Test an invalid claim separately on disposable state.
 
