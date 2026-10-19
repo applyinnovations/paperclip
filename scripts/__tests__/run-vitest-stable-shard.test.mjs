@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -582,6 +582,39 @@ test("a failed chat child fails the job after its sibling finishes", { skip: pro
     assert.equal(result.status, 1, result.stdout + result.stderr);
     assert.match(result.stderr, /failed \(7\)/);
     assert.equal(readFileSync(receipt, "utf8"), "finished", "a failed worker must not abandon its sibling");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
+test("the launcher puts isolated fixtures under an explicit temporary parent", { skip: process.platform === "win32" }, () => {
+  const directory = realpathSync(mkdtempSync(path.join(os.tmpdir(), "fixture-parent-proof-")));
+  const parent = path.join(directory, "fixtures");
+  const receipt = path.join(directory, "child.json");
+  const fakePnpm = path.join(directory, "pnpm");
+  try {
+    mkdirSync(parent);
+    writeFileSync(fakePnpm, `#!${process.execPath}
+      require('node:fs').writeFileSync(${JSON.stringify(receipt)}, JSON.stringify({
+        args: process.argv.slice(2), home: process.env.PAPERCLIP_HOME,
+        config: process.env.PAPERCLIP_CONFIG, temporary: process.env.TMPDIR,
+      }));
+    `);
+    chmodSync(fakePnpm, 0o755);
+    const result = spawnSync(process.execPath, [script, "--mode", "general", "--group", "general-workspaces-c"], {
+      cwd: repoRoot, encoding: "utf8", timeout: 30_000,
+      env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+        PAPERCLIP_TEST_TMPDIR: parent, PAPERCLIP_CI_PROFILE: "false" },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const child = JSON.parse(readFileSync(receipt, "utf8"));
+    const root = path.dirname(child.home);
+    assert.equal(path.dirname(root), parent);
+    assert.equal(path.basename(root).startsWith("pv-"), true);
+    assert.equal(child.temporary, path.join(root, "t"));
+    assert.equal(child.config, path.join(child.home, "config.json"));
+    assert.deepEqual(child.args, ["exec", "vitest", "run", "--exclude", "**/dist/**", "--project", "@paperclipai/db"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

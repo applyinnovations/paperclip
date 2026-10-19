@@ -13,6 +13,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { OidcSignIn } from "@/components/OidcSignIn";
 
 function deriveInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -158,6 +159,7 @@ export function ProfileSettings() {
       ) : null}
 
       <section className="space-y-8">
+        <OidcSignIn callbackURL="/company/settings/profile" link />
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
           <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />
           <div className="absolute inset-0 bg-(image:--gradient-extract-7)" />

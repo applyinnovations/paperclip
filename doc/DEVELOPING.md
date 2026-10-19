@@ -608,6 +608,12 @@ Use the cheap local default unless you are specifically working on browser flows
 pnpm test
 ```
 
+The test launcher uses unique, canonical fixture roots. To select a filesystem
+with enough temporary quota, set `PAPERCLIP_TEST_TMPDIR` to an existing short
+absolute path, for example `PAPERCLIP_TEST_TMPDIR=/var/tmp/pc-tests pnpm test`.
+Unix defaults to `/tmp`; Windows uses the operating system temporary directory.
+This changes fixture placement, not test selection or isolation.
+
 `pnpm test` runs the Vitest suite only. For interactive Vitest watch mode use:
 
 ```sh
