@@ -86,6 +86,7 @@ export type {
   InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
   InstanceSettings,
+  PublicInstanceSettings,
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
   BackupRetentionPolicy,

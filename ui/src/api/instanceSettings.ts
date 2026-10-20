@@ -2,7 +2,7 @@ import type {
   InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
   InstanceSsoSettings,
-  InstanceSettings,
+  PublicInstanceSettings,
   IssueGraphLivenessAutoRecoveryPreview,
   PatchInstanceSettings,
   PatchInstanceGeneralSettings,
@@ -13,9 +13,9 @@ import { api } from "./client";
 
 export const instanceSettingsApi = {
   get: () =>
-    api.get<InstanceSettings>("/instance/settings"),
+    api.get<PublicInstanceSettings>("/instance/settings"),
   update: (patch: PatchInstanceSettings) =>
-    api.patch<InstanceSettings>("/instance/settings", patch),
+    api.patch<PublicInstanceSettings>("/instance/settings", patch),
   getGeneral: () =>
     api.get<InstanceGeneralSettings>("/instance/settings/general"),
   updateGeneral: (patch: PatchInstanceGeneralSettings) =>

@@ -50,6 +50,24 @@ async function createApp(actor: any) {
 }
 
 describe("instance settings routes", () => {
+  it("does not disclose SSO client secrets through the ordinary member settings response", async () => {
+    const app = await createApp({ type: "board", source: "session", userId: "member", companyIds: ["company-1"], isInstanceAdmin: false });
+    const settings = { ...(await mockInstanceSettingsService.get()), sso: { enabled: true, providers: [{ providerId: "keycloak", type: "keycloak", clientId: "synthetic-client", clientSecret: "synthetic-secret-disclosure-sentinel", issuer: "https://identity.example.test/realms/test" }] } };
+    mockInstanceSettingsService.get.mockResolvedValue(settings);
+    const response = await request(app).get("/api/instance/settings");
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(response.body)).not.toContain("synthetic-secret-disclosure-sentinel");
+    expect(settings.sso.providers[0].clientSecret).toBe("synthetic-secret-disclosure-sentinel");
+  });
+
+  it("does not return SSO secrets from an unrelated settings update", async () => {
+    const app = await createApp({ type: "board", source: "session", userId: "admin", companyIds: ["company-1"], isInstanceAdmin: true });
+    mockInstanceSettingsService.update.mockResolvedValue({ id: "settings", sso: { enabled: true, providers: [{ providerId: "keycloak", clientSecret: "synthetic-secret-update-sentinel" }] } });
+    const response = await request(app).patch("/api/instance/settings").send({ defaultEnvironmentId: null });
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(response.body)).not.toContain("synthetic-secret-update-sentinel");
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");

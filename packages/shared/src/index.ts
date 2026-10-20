@@ -778,6 +778,7 @@ export type {
   InstanceSsoSettings,
   InstanceSsoProviderEntry,
   InstanceSettings,
+  PublicInstanceSettings,
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
   IssueGraphLivenessAutoRecoveryPreview,

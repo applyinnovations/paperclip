@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
-import type { SsoProviderConfig } from "@paperclipai/shared";
+import type { SsoProviderConfig, InstanceSettings } from "@paperclipai/shared";
 import {
   issueGraphLivenessAutoRecoveryRequestSchema,
   patchInstanceSettingsSchema,
@@ -26,6 +26,15 @@ function assertCanManageInstanceSettings(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
+function publicInstanceSettings(settings: InstanceSettings) {
+  return {
+    ...settings,
+    sso: settings.sso && { ...settings.sso, providers: settings.sso.providers.map(({ clientSecret, ...provider }) => ({
+      ...provider, clientSecretConfigured: Boolean(clientSecret),
+    })) },
+  };
+}
+
 export function instanceSettingsRoutes(
   db: Db,
   opts?: { onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void },
@@ -37,7 +46,7 @@ export function instanceSettingsRoutes(
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
-    res.json(await svc.get());
+    res.json(publicInstanceSettings(await svc.get()));
   });
 
   router.patch(
@@ -74,7 +83,7 @@ export function instanceSettingsRoutes(
           }),
         ),
       );
-      res.json(updated);
+      res.json(publicInstanceSettings(updated));
     },
   );
 

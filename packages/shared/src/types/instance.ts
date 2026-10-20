@@ -192,3 +192,7 @@ export interface IssueGraphLivenessAutoRecoveryPreview {
   skippedOutsideLookback: number;
   items: IssueGraphLivenessAutoRecoveryPreviewItem[];
 }
+
+export type PublicInstanceSettings = Omit<InstanceSettings, "sso"> & {
+  sso: Omit<InstanceSsoSettings, "providers"> & { providers: Array<Omit<InstanceSsoProviderEntry, "clientSecret"> & { clientSecretConfigured: boolean }> };
+};
