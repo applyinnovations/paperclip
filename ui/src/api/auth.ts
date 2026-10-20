@@ -213,9 +213,16 @@ export const authApi = {
     }
   },
 
+  linkSso: async (provider: string, password: string, callbackURL: string): Promise<string> => {
+    const payload = await authPost("/link-social", { provider, callbackURL, disableRedirect: true, additionalData: { password } });
+    const data = payload as { url?: string } | null;
+    if (!data?.url) throw new Error("SSO provider did not return a redirect URL");
+    return data.url;
+  },
+
   signInSso: async (providerId: string, callbackURL: string): Promise<string> => {
-    const payload = await authPost("/sign-in/oauth2", {
-      providerId,
+    const payload = await authPost("/sign-in/social", {
+      provider: providerId,
       callbackURL,
     });
     const data = payload as { url?: string } | null;

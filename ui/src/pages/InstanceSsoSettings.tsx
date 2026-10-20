@@ -25,11 +25,16 @@ function providerIdFromType(type: SsoProviderType): string {
   return type.replace(/_/g, "-");
 }
 
+const inputCls =
+    "w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50";
+
 export interface ProviderFormState {
   type: SsoProviderType;
   providerId: string;
   clientId: string;
   clientSecret: string;
+  tokenEndpointAuth?: "client_secret_basic" | "client_secret_post";
+  scopes?: string;
   issuer: string;
   discoveryUrl: string;
   tenantId: string;
@@ -68,12 +73,14 @@ export function hasIncompleteRoleRestriction(form: ProviderFormState): boolean {
   return !form.claimPath.trim() || roles.length === 0;
 }
 
-function formToEntry(form: ProviderFormState): InstanceSsoProviderEntry {
+export function formToEntry(form: ProviderFormState): InstanceSsoProviderEntry {
   const entry: InstanceSsoProviderEntry = {
     providerId: form.providerId.trim() || providerIdFromType(form.type),
     type: form.type,
     clientId: form.clientId.trim(),
-    clientSecret: form.clientSecret.trim(),
+    clientSecret: form.clientSecret,
+    ...(form.tokenEndpointAuth ? { tokenEndpointAuth: form.tokenEndpointAuth } : {}),
+    ...(form.scopes?.trim() ? { scopes: form.scopes.split(",").map(value => value.trim()).filter(Boolean) } : {}),
   };
   if (form.issuer.trim()) entry.issuer = form.issuer.trim();
   if (form.discoveryUrl.trim()) entry.discoveryUrl = form.discoveryUrl.trim();
@@ -92,12 +99,14 @@ function formToEntry(form: ProviderFormState): InstanceSsoProviderEntry {
   return entry;
 }
 
-function entryToForm(entry: InstanceSsoProviderEntry): ProviderFormState {
+export function entryToForm(entry: InstanceSsoProviderEntry): ProviderFormState {
   return {
     type: entry.type,
     providerId: entry.providerId,
     clientId: entry.clientId,
     clientSecret: entry.clientSecret,
+    tokenEndpointAuth: entry.tokenEndpointAuth,
+    scopes: entry.scopes?.join(", "),
     issuer: entry.issuer ?? "",
     discoveryUrl: entry.discoveryUrl ?? "",
     tenantId: entry.tenantId ?? "",
@@ -110,7 +119,7 @@ function entryToForm(entry: InstanceSsoProviderEntry): ProviderFormState {
 }
 
 function typeNeedsIssuer(type: SsoProviderType): boolean {
-  return type === "keycloak" || type === "okta";
+  return type === "keycloak" || type === "okta" || type === "oidc";
 }
 
 function typeNeedsTenantId(type: SsoProviderType): boolean {
@@ -159,8 +168,6 @@ function ProviderForm({
     [form, onChange],
   );
 
-  const inputCls =
-    "w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50";
 
   return (
     <section className="rounded-xl border border-border bg-card p-5 space-y-4">
@@ -236,13 +243,23 @@ function ProviderForm({
         </FormField>
       </div>
 
+      <FormField label="Token endpoint authentication">
+        <select aria-label="Token endpoint authentication" className={inputCls} value={form.tokenEndpointAuth ?? "client_secret_post"}
+          onChange={event => update({ tokenEndpointAuth: event.target.value as "client_secret_basic" | "client_secret_post" })}>
+          <option value="client_secret_post">Client secret in request body</option>
+          <option value="client_secret_basic">Client secret using HTTP Basic</option>
+        </select>
+      </FormField>
+      <FormField label="Scopes" hint="Comma-separated server-owned scopes; openid is always included.">
+        <input aria-label="Scopes" className={inputCls} value={form.scopes ?? ""} placeholder="openid, profile, email" onChange={event => update({ scopes: event.target.value })} />
+      </FormField>
       {typeNeedsIssuer(form.type) && (
         <FormField
           label="Issuer URL"
           hint={
             form.type === "keycloak"
               ? "e.g. https://keycloak.example.com/realms/my-realm"
-              : "e.g. https://dev-12345.okta.com"
+              : form.type === "oidc" ? "Optional for standard discovery URLs; required for other discovery locations." : "e.g. https://dev-12345.okta.com"
           }
         >
           <input
@@ -336,6 +353,7 @@ export function InstanceSsoSettings() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [forms, setForms] = useState<ProviderFormState[]>([]);
   const [enabled, setEnabled] = useState(false);
+  const [source, setSource] = useState<"operator" | "database">("operator");
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
@@ -350,14 +368,16 @@ export function InstanceSsoSettings() {
   useEffect(() => {
     if (ssoQuery.data && !dirty) {
       setEnabled(ssoQuery.data.enabled);
+      setSource(ssoQuery.data.source ?? (ssoQuery.data.enabled && ssoQuery.data.providers.length ? "database" : "operator"));
       setForms(ssoQuery.data.providers.map(entryToForm));
     }
   }, [ssoQuery.data, dirty]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      if (source === "operator") return instanceSettingsApi.updateSso({ source });
       const providers = forms.map(formToEntry);
-      return instanceSettingsApi.updateSso({ enabled, providers });
+      return instanceSettingsApi.updateSso({ source, enabled, providers });
     },
     onSuccess: async () => {
       setActionError(null);
@@ -400,9 +420,8 @@ export function InstanceSsoSettings() {
   const canSave =
     !saveMutation.isPending &&
     dirty &&
-    !duplicateProviderId &&
-    !hasIncompleteRoles &&
-    forms.every((f) => f.clientId.trim() && f.clientSecret.trim());
+    (source === "operator" || (!duplicateProviderId && !hasIncompleteRoles &&
+    forms.every((f) => f.clientId.trim() && f.clientSecret.trim())));
 
   if (ssoQuery.isLoading) {
     return <div className="text-sm text-muted-foreground">Loading SSO settings...</div>;
@@ -437,26 +456,34 @@ export function InstanceSsoSettings() {
         </div>
       )}
 
-      <section className="rounded-xl border border-border bg-card p-5">
+      <section className="rounded-xl border border-border bg-card p-5 space-y-4">
+        <label className="block text-sm font-medium">
+          Configuration source
+          <select aria-label="SSO configuration source" className={inputCls} value={source}
+            onChange={e => { setSource(e.target.value as "operator" | "database"); setDirty(true); }}>
+            <option value="operator">Operator configuration (environment or config file)</option>
+            <option value="database">Instance settings</option>
+          </select>
+        </label>
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1.5">
             <h2 className="text-sm font-semibold">Enable SSO</h2>
             <p className="max-w-2xl text-sm text-muted-foreground">
-              When enabled, configured SSO providers override the{" "}
-              <code className="text-xs">PAPERCLIP_SSO_PROVIDERS</code> environment variable.
-              Users who log in via SSO are automatically provisioned into all existing companies.
+              In Instance settings mode, disabling SSO stays disabled after restart.
+              Operator configuration mode uses the environment or config file.
+              Company access is granted separately through invitations.
             </p>
           </div>
           <ToggleSwitch
             checked={enabled}
             onCheckedChange={handleToggleEnabled}
-            disabled={saveMutation.isPending}
+            disabled={saveMutation.isPending || source === "operator"}
             aria-label="Toggle SSO"
           />
         </div>
       </section>
 
-      {enabled && (
+      {source === "database" && enabled && (
         <>
           {forms.map((form, index) => (
             <ProviderForm
@@ -508,12 +535,12 @@ export function InstanceSsoSettings() {
             Changes take effect immediately — the auth handler is rebuilt on save without a server restart.
           </li>
           <li>
-            SSO users who pass the role check are automatically added to all
-            existing companies on first login.
+            A successful SSO login grants no company access or administrator role.
+            Existing password accounts require password-confirmed linking in Profile.
           </li>
           <li>
-            The <code>PAPERCLIP_SSO_PROVIDERS</code> environment variable still works as a
-            fallback when SSO is not enabled in this UI.
+            Operator configuration uses <code>PAPERCLIP_SSO_PROVIDERS</code> before the config file.
+            Selecting Instance settings makes these database settings authoritative, including when disabled.
           </li>
         </ul>
       </section>

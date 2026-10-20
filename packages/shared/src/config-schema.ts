@@ -71,10 +71,11 @@ export const ssoRoleRequirementSchema = z.object({
 });
 
 export const ssoProviderConfigSchema = z.object({
-  providerId: z.string().min(1),
+  providerId: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/).refine(id => id !== "credential", "credential is reserved"),
   type: z.enum(SSO_PROVIDER_TYPES),
   clientId: z.string().min(1),
   clientSecret: z.string().min(1),
+  tokenEndpointAuth: z.enum(["client_secret_basic", "client_secret_post"]).optional(),
   issuer: z.string().url().optional(),
   discoveryUrl: z.string().url().optional(),
   tenantId: z.string().optional(),
@@ -177,6 +178,7 @@ export const paperclipConfigSchema = z
     auth: authConfigSchema.default({
       baseUrlMode: "auto",
       disableSignUp: false,
+      ssoProviders: [],
     }),
     storage: storageConfigSchema.default({
       provider: "local_disk",

@@ -1,115 +1,32 @@
 import { describe, expect, it } from "vitest";
 import type { SsoProviderConfig } from "@paperclipai/shared";
-import { withRoleRestrictedUserInfo } from "../auth/better-auth.js";
-import type { GenericOAuthConfig } from "better-auth/plugins";
-
-function makeJwt(payload: Record<string, unknown>): string {
-  const encode = (value: Record<string, unknown>) =>
-    Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "none" })}.${encode(payload)}.signature`;
-}
-
-type GetUserInfoTokens = Parameters<NonNullable<GenericOAuthConfig["getUserInfo"]>>[0];
-
-const PROVIDER: SsoProviderConfig = {
-  providerId: "oidc",
-  type: "oidc",
-  clientId: "client",
-  clientSecret: "secret",
-  discoveryUrl: "https://idp.example.com/.well-known/openid-configuration",
-  requiredRoles: {
-    claimPath: "resource_access.paperclip.roles",
-    roles: ["human"],
-  },
-};
-
-const BASE_CONFIG: GenericOAuthConfig = {
-  providerId: "oidc",
-  clientId: "client",
-  clientSecret: "secret",
-  discoveryUrl: "https://idp.example.com/.well-known/openid-configuration",
-};
-
-const HUMAN_CLAIMS = {
-  sub: "user-1",
-  email: "user@example.com",
-  email_verified: true,
-  name: "User One",
-  resource_access: { paperclip: { roles: ["human"] } },
-};
-
-describe("withRoleRestrictedUserInfo", () => {
-  it("builds the user from id_token claims when the role matches and no upstream getUserInfo exists", async () => {
-    const config = withRoleRestrictedUserInfo({ ...BASE_CONFIG }, PROVIDER);
-    expect(config.getUserInfo).toBeDefined();
-
-    const user = await config.getUserInfo!({
-      idToken: makeJwt(HUMAN_CLAIMS),
-    } as GetUserInfoTokens);
-
-    // Better Auth skips its own id_token fallback whenever a getUserInfo
-    // override is present, so the wrapper must produce the user itself —
-    // a null here surfaces to the browser as "user_info_is_missing".
-    expect(user).not.toBeNull();
-    expect(user).toMatchObject({
-      id: "user-1",
-      email: "user@example.com",
-      emailVerified: true,
-      name: "User One",
-    });
+import { ssoProviderMetadata, ssoUserInfo, ssoUrl } from "../auth/sso.js";
+const provider: SsoProviderConfig = { providerId: "custom-keycloak", type: "keycloak", clientId: "client", clientSecret: "synthetic-secret",
+  issuer: "https://idp.example.test/realms/main", requiredRoles: { claimPath: "resource_access.paperclip.roles", roles: ["human"] } };
+const claims = { sub: "subject", email: "person@example.test", email_verified: true, name: "Person", iat: 100, exp: 500,
+  resource_access: { paperclip: { roles: ["human"] } } };
+// Pure claim-policy tests; signature proof belongs to the real callback integration suite.
+const token = (value: Record<string, unknown>) => `${Buffer.from('{"alg":"none"}').toString("base64url")}.${Buffer.from(JSON.stringify(value)).toString("base64url")}.signature`;
+describe("verified SSO claim policy", () => {
+  it("admits the configured role", () => expect(ssoUserInfo(provider, token(claims))).toMatchObject({ emailVerified: true, sub: "subject" }));
+  it("rejects missing roles", () => expect(ssoUserInfo(provider, token({ ...claims, resource_access: {} }))).toBeNull());
+  it.each([false, "false", "true", 1, null])("requires literal verified email: %s", email_verified => {
+    expect(ssoUserInfo(provider, token({ ...claims, email_verified }))).toBeNull();
   });
-
-  it("delegates to the upstream getUserInfo when the provider helper defines one", async () => {
-    const upstreamUser = { id: "upstream", email: "upstream@example.com", name: "Upstream" };
-    const config = withRoleRestrictedUserInfo(
-      { ...BASE_CONFIG, getUserInfo: async () => upstreamUser },
-      PROVIDER,
-    );
-
-    const user = await config.getUserInfo!({
-      idToken: makeJwt(HUMAN_CLAIMS),
-    } as GetUserInfoTokens);
-
-    expect(user).toBe(upstreamUser);
-  });
-
-  it("rejects the login when the required role is missing from both tokens", async () => {
-    const config = withRoleRestrictedUserInfo({ ...BASE_CONFIG }, PROVIDER);
-
-    const user = await config.getUserInfo!({
-      idToken: makeJwt({ ...HUMAN_CLAIMS, resource_access: { paperclip: { roles: ["viewer"] } } }),
-    } as GetUserInfoTokens);
-
-    expect(user).toBeNull();
-  });
-
-  it("rejects the login when the response carries no tokens at all", async () => {
-    const config = withRoleRestrictedUserInfo({ ...BASE_CONFIG }, PROVIDER);
-
-    const user = await config.getUserInfo!({} as GetUserInfoTokens);
-
-    expect(user).toBeNull();
-  });
-
-  it("falls back to the access_token role claim when the id_token lacks it", async () => {
-    const config = withRoleRestrictedUserInfo({ ...BASE_CONFIG }, PROVIDER);
-
-    const user = await config.getUserInfo!({
-      idToken: makeJwt({ ...HUMAN_CLAIMS, resource_access: {} }),
-      accessToken: makeJwt({
-        sub: "user-1",
-        resource_access: { paperclip: { roles: ["human"] } },
-      }),
-    } as GetUserInfoTokens);
-
-    expect(user).not.toBeNull();
-    expect(user).toMatchObject({ id: "user-1", email: "user@example.com" });
-  });
-
-  it("leaves providers without requiredRoles untouched", () => {
-    const config: GenericOAuthConfig = { ...BASE_CONFIG };
-    const result = withRoleRestrictedUserInfo(config, { ...PROVIDER, requiredRoles: undefined });
-
-    expect(result.getUserInfo).toBeUndefined();
-  });
+  it("allows omission of role restrictions", () => expect(ssoUserInfo({ ...provider, requiredRoles: undefined }, token({ ...claims, resource_access: {} }))).not.toBeNull());
+  it("rejects a conflicting authorized party", () => expect(ssoUserInfo(provider, token({ ...claims, azp: "other-client" }))).toBeNull());
+});
+describe("native SSO provider metadata", () => {
+  it.each([
+    [provider, "https://idp.example.test/realms/main"],
+    [{ ...provider, issuer: "https://idp.example.test/realms/main/" }, "https://idp.example.test/realms/main"],
+    [{ ...provider, type: "oidc", issuer: undefined, discoveryUrl: "https://idp.example.test/realms/main/.well-known/openid-configuration" }, "https://idp.example.test/realms/main"],
+    [{ ...provider, type: "okta" }, "https://idp.example.test/realms/main"],
+    [{ ...provider, type: "okta", issuer: "https://idp.example.test/realms/main/" }, "https://idp.example.test/realms/main"],
+    [{ ...provider, type: "auth0", issuer: undefined, domain: "example.auth0.com" }, "https://example.auth0.com/"],
+    [{ ...provider, type: "auth0", issuer: "https://example.auth0.com", domain: undefined }, "https://example.auth0.com/"],
+    [{ ...provider, type: "microsoft_entra_id", issuer: undefined, tenantId: "12345678-1234-1234-1234-123456789abc" }, "https://login.microsoftonline.com/12345678-1234-1234-1234-123456789abc/v2.0"],
+  ])("derives the configured issuer for %s", (value, issuer) => expect(ssoProviderMetadata(value as SsoProviderConfig).issuer).toBe(issuer));
+  it("requires an issuer for nonstandard discovery", () => expect(() => ssoProviderMetadata({ ...provider, type: "oidc", issuer: undefined, discoveryUrl: "https://identity.example.test/discovery" })).toThrow("explicit issuer"));
+  it.each(["http://private.example.test", "https://user:password@identity.example.test", "https://identity.example.test/#fragment"])("rejects unsafe URL %s", value => expect(() => ssoUrl(value)).toThrow());
 });

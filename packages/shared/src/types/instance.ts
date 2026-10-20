@@ -138,6 +138,7 @@ export interface InstanceSsoProviderEntry {
   type: SsoProviderType;
   clientId: string;
   clientSecret: string;
+  tokenEndpointAuth?: "client_secret_basic" | "client_secret_post";
   issuer?: string;
   discoveryUrl?: string;
   tenantId?: string;
@@ -148,6 +149,7 @@ export interface InstanceSsoProviderEntry {
 }
 
 export interface InstanceSsoSettings {
+  source?: "operator" | "database";
   enabled: boolean;
   providers: InstanceSsoProviderEntry[];
 }

@@ -286,9 +286,11 @@ function normalizeSsoSettings(raw: unknown): InstanceSsoSettings {
     return {
       enabled: parsed.data.enabled ?? false,
       providers: parsed.data.providers ?? [],
+      source: parsed.data.source,
     };
   }
-  return { enabled: false, providers: [] };
+  // Invalid stored policy must not silently activate operator fallback.
+  return { source: "database", enabled: false, providers: [] };
 }
 
 export type ManagedExperimentalKeyMetadata = Partial<

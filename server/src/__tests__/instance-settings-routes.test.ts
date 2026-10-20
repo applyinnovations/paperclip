@@ -33,7 +33,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(actor: any) {
+async function createApp(actor: any, options?: Parameters<typeof import("../routes/instance-settings.js").instanceSettingsRoutes>[1]) {
   const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/instance-settings.js")>("../routes/instance-settings.js"),
@@ -44,7 +44,7 @@ async function createApp(actor: any) {
     req.actor = actor;
     next();
   });
-  app.use("/api", instanceSettingsRoutes({} as any));
+  app.use("/api", instanceSettingsRoutes({} as any, options));
   app.use(errorHandler);
   return app;
 }
@@ -839,5 +839,18 @@ describe("instance settings routes", () => {
       expect(res.status).toBe(200);
       expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ executionMode: "kubernetes" });
     });
+  });
+
+  it("validates the merged policy before saving or rebuilding", async () => {
+    const validateSsoSettings = vi.fn(() => { throw new Error("An explicit origin is required."); });
+    const onSsoSettingsChanged = vi.fn();
+    const app = await createApp({ type: "board", userId: "admin", source: "session", isInstanceAdmin: true }, { validateSsoSettings, onSsoSettingsChanged });
+    mockInstanceSettingsService.getSso.mockResolvedValue({ source: "database", enabled: false, providers: [] });
+    mockInstanceSettingsService.updateSso.mockClear();
+    const result = await request(app).patch("/api/instance/settings/sso").send({ enabled: true });
+    expect(result.status).toBe(400);
+    expect(validateSsoSettings).toHaveBeenCalledWith({ source: "database", enabled: true, providers: [] });
+    expect(mockInstanceSettingsService.updateSso).not.toHaveBeenCalled();
+    expect(onSsoSettingsChanged).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasIncompleteRoleRestriction, type ProviderFormState } from "./InstanceSsoSettings";
+import { entryToForm, formToEntry, hasIncompleteRoleRestriction, type ProviderFormState } from "./InstanceSsoSettings";
 
 function makeForm(overrides: Partial<ProviderFormState> = {}): ProviderFormState {
   return {
@@ -20,6 +20,11 @@ function makeForm(overrides: Partial<ProviderFormState> = {}): ProviderFormState
 }
 
 describe("hasIncompleteRoleRestriction", () => {
+  it("preserves existing secrets, scopes and token authentication during edits", () => {
+    const entry = { providerId: "keycloak", type: "keycloak" as const, clientId: "client", clientSecret: " synthetic-secret ",
+      issuer: "https://idp.example.test/realms/main", scopes: ["openid", "profile", "email", "groups"], tokenEndpointAuth: "client_secret_basic" as const };
+    expect(formToEntry(entryToForm(entry))).toEqual(entry);
+  });
   it("passes a form with role restriction disabled", () => {
     expect(hasIncompleteRoleRestriction(makeForm())).toBe(false);
   });

@@ -14,6 +14,7 @@ const signUpEmailMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/auth", () => ({
   authApi: {
+    getSsoProviders: async () => [],
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),

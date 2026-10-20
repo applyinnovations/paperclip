@@ -111,7 +111,7 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
 }).strict();
 
 const ssoProvidersSchema = z
-  .array(ssoProviderConfigSchema)
+  .array(ssoProviderConfigSchema).max(8)
   .superRefine((providers, ctx) => {
     // Better Auth registers providers by id — a duplicate silently
     // overwrites the earlier registration, so reject it at the boundary.
@@ -129,11 +129,17 @@ const ssoProvidersSchema = z
   });
 
 export const instanceSsoSettingsSchema = z.object({
+  source: z.enum(["operator", "database"]).optional(),
   enabled: z.boolean().default(false),
   providers: ssoProvidersSchema.default([]),
 });
 
-export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
+// Zod 4 applies nested defaults through partial(); writes must preserve omitted values.
+export const patchInstanceSsoSettingsSchema = z.object({
+  source: z.enum(["operator", "database"]).optional(),
+  enabled: z.boolean().optional(),
+  providers: ssoProvidersSchema.optional(),
+});
 
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 export type PatchInstanceGeneralSettings = z.infer<typeof patchInstanceGeneralSettingsSchema>;

@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProfileSettings } from "./ProfileSettings";
 
 const mockAuthApi = vi.hoisted(() => ({
+  getSsoProviders: vi.fn().mockResolvedValue([]),
+  linkSso: vi.fn(),
   getSession: vi.fn(),
   signInEmail: vi.fn(),
   signUpEmail: vi.fn(),

@@ -1,16 +1,9 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
-import { betterAuth, type Auth } from "better-auth";
+import { betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
-import {
-  genericOAuth,
-  keycloak,
-  auth0,
-  okta,
-  microsoftEntraId,
-} from "better-auth/plugins";
-import type { GenericOAuthConfig } from "better-auth/plugins";
+import { ssoAuth, validateSsoConfiguration } from "./sso.js";
 import type { Db } from "@paperclipai/db";
 import {
   authAccounts,
@@ -18,7 +11,7 @@ import {
   authUsers,
   authVerifications,
 } from "@paperclipai/db";
-import type { SsoProviderConfig, SsoRoleRequirement } from "@paperclipai/shared";
+import type { SsoProviderConfig } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
@@ -44,7 +37,7 @@ type BetterAuthSessionResolver = {
   api?: BetterAuthGetSessionApi;
 };
 
-type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver;
+type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver & { getSsoProviders: () => Promise<ReturnType<ReturnType<typeof ssoAuth>["getAvailable"]>> };
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
@@ -154,161 +147,6 @@ export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: n
   return Array.from(trustedOrigins);
 }
 
-function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
-  try {
-    const parts = jwt.split(".");
-    if (parts.length !== 3) return null;
-    const payload = Buffer.from(parts[1]!, "base64url").toString("utf-8");
-    return JSON.parse(payload) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function resolveClaimAtPath(claims: Record<string, unknown>, path: string): unknown {
-  let current: unknown = claims;
-  for (const segment of path.split(".")) {
-    if (!current || typeof current !== "object") return undefined;
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current;
-}
-
-function userHasRequiredRole(
-  claims: Record<string, unknown>,
-  requirement: SsoRoleRequirement,
-): boolean {
-  const value = resolveClaimAtPath(claims, requirement.claimPath);
-  if (Array.isArray(value)) {
-    return requirement.roles.some((role: string) => value.includes(role));
-  }
-  if (typeof value === "string") {
-    return requirement.roles.includes(value);
-  }
-  return false;
-}
-
-function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
-  const base = {
-    clientId: provider.clientId,
-    clientSecret: provider.clientSecret,
-    ...(provider.scopes ? { scopes: provider.scopes } : {}),
-  };
-
-  let baseConfig: GenericOAuthConfig;
-  switch (provider.type) {
-    case "keycloak":
-      baseConfig = keycloak({ ...base, issuer: provider.issuer! });
-      break;
-    case "auth0":
-      baseConfig = auth0({
-        ...base,
-        clientId: provider.clientId,
-        clientSecret: provider.clientSecret,
-        domain: provider.domain ?? new URL(provider.issuer!).hostname,
-      });
-      break;
-    case "okta":
-      baseConfig = okta({ ...base, issuer: provider.issuer! });
-      break;
-    case "microsoft_entra_id":
-      baseConfig = microsoftEntraId({ ...base, tenantId: provider.tenantId! });
-      break;
-    case "oidc":
-      baseConfig = {
-        providerId: provider.providerId,
-        discoveryUrl: provider.discoveryUrl!,
-        ...base,
-      };
-      break;
-  }
-
-  return withRoleRestrictedUserInfo(baseConfig, provider);
-}
-
-export function withRoleRestrictedUserInfo(
-  baseConfig: GenericOAuthConfig,
-  provider: SsoProviderConfig,
-): GenericOAuthConfig {
-  if (!provider.requiredRoles) {
-    return baseConfig;
-  }
-
-  const requirement = provider.requiredRoles;
-  const upstreamGetUserInfo = baseConfig.getUserInfo;
-
-  baseConfig.getUserInfo = async (tokens) => {
-    const rawTokens = tokens.raw as Record<string, unknown> | undefined;
-    const idToken = (tokens as Record<string, unknown>).idToken as string | undefined
-      ?? rawTokens?.id_token as string | undefined;
-    const accessToken = (tokens as Record<string, unknown>).accessToken as string | undefined
-      ?? rawTokens?.access_token as string | undefined;
-
-    let hasRole = false;
-
-    if (idToken) {
-      const claims = decodeJwtPayload(idToken);
-      if (claims && userHasRequiredRole(claims, requirement)) {
-        hasRole = true;
-      }
-    }
-
-    if (!hasRole && accessToken) {
-      const claims = decodeJwtPayload(accessToken);
-      if (claims && userHasRequiredRole(claims, requirement)) {
-        hasRole = true;
-      }
-    }
-
-    if (idToken || accessToken) {
-      if (!hasRole) {
-        logger.warn(
-          {
-            providerId: provider.providerId,
-            claimPath: requirement.claimPath,
-            requiredRoles: requirement.roles,
-          },
-          "SSO login rejected: user does not have required role",
-        );
-        return null;
-      }
-    } else {
-      logger.warn(
-        { providerId: provider.providerId },
-        "SSO role check skipped: no id_token or access_token in response — access denied",
-      );
-      return null;
-    }
-
-    if (upstreamGetUserInfo) {
-      return upstreamGetUserInfo(tokens);
-    }
-    // Better Auth only falls back to its own user-info resolution when the
-    // provider config has NO getUserInfo at all — and this wrapper is one.
-    // Replicate its id_token fallback here (same shape as the plugin's
-    // getUserInfo), otherwise every role-restricted provider whose helper
-    // does not define getUserInfo fails with "user_info_is_missing".
-    if (idToken) {
-      const claims = decodeJwtPayload(idToken);
-      if (claims && typeof claims.sub === "string" && typeof claims.email === "string") {
-        return {
-          id: claims.sub,
-          emailVerified: Boolean(claims.email_verified),
-          image: typeof claims.picture === "string" ? claims.picture : undefined,
-          ...claims,
-        } as Awaited<ReturnType<NonNullable<GenericOAuthConfig["getUserInfo"]>>>;
-      }
-    }
-    logger.warn(
-      { providerId: provider.providerId },
-      "SSO login rejected: id_token lacks sub/email claims and provider has no getUserInfo",
-    );
-    return null;
-  };
-
-  return baseConfig;
-}
-
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
@@ -327,36 +165,18 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
-  const oauthConfigs = config.ssoProviders.map(mapSsoProviderToOAuthConfig);
-  const plugins = oauthConfigs.length > 0 ? [genericOAuth({ config: oauthConfigs })] : [];
-
-  const authConfig: Record<string, unknown> = {
+  const sso = ssoAuth(config);
+  const authConfig: BetterAuthOptions = {
     baseURL: baseUrl,
     secret,
     trustedOrigins,
     database: drizzleAdapter(db, {
       provider: "pg",
-      schema: {
-        user: authUsers,
-        session: authSessions,
-        account: authAccounts,
-        verification: authVerifications,
-      },
+      schema: { user: authUsers, session: authSessions, account: authAccounts, verification: authVerifications },
     }),
-    emailAndPassword: {
-      enabled: true,
-      requireEmailVerification: false,
-      disableSignUp: config.authDisableSignUp,
-    },
-    ...(plugins.length > 0 ? { plugins } : {}),
-    ...(oauthConfigs.length > 0
-      ? {
-          accountLinking: {
-            enabled: true,
-            trustedProviders: config.ssoProviders.map((p) => p.providerId),
-          },
-        }
-      : {}),
+    emailAndPassword: { enabled: true, requireEmailVerification: false, disableSignUp: config.authDisableSignUp },
+    ...sso.options,
+    plugins: [sso.plugin],
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -369,7 +189,8 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     delete authConfig.baseURL;
   }
 
-  return betterAuth(authConfig as Parameters<typeof betterAuth>[0]);
+  const auth = betterAuth(authConfig);
+  return Object.assign(auth, { getSsoProviders: async () => { await auth.$context; return sso.getAvailable(); } });
 }
 
 export function createBetterAuthHandler(auth: BetterAuthHandlerTarget): RequestHandler {
@@ -384,6 +205,8 @@ export interface BetterAuthManager {
   resolveSession: (req: Request) => Promise<BetterAuthSessionResult | null>;
   resolveSessionFromHeaders: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
   rebuild: (ssoProviders: SsoProviderConfig[]) => void;
+  validateSsoProviders: (ssoProviders: SsoProviderConfig[]) => void;
+  getSsoProviders: BetterAuthInstance["getSsoProviders"];
 }
 
 export function createBetterAuthManager(
@@ -401,7 +224,10 @@ export function createBetterAuthManager(
     resolveSession: (req) => resolveBetterAuthSession(currentAuth, req),
     resolveSessionFromHeaders: (headers) =>
       resolveBetterAuthSessionFromHeaders(currentAuth, headers),
+    getSsoProviders: () => currentAuth.getSsoProviders(),
+    validateSsoProviders: (providers) => { validateSsoConfiguration(config, providers); },
     rebuild: (ssoProviders) => {
+      validateSsoConfiguration(config, ssoProviders);
       const updatedConfig = { ...config, ssoProviders };
       currentAuth = createBetterAuthInstance(db, updatedConfig, trustedOrigins);
       currentHandler = toNodeHandler(currentAuth);

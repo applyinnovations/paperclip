@@ -7,6 +7,7 @@ import { assetsApi } from "@/api/assets";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
+import { SsoAccountLink } from "@/components/SsoAccountLink";
 import { InboxAgentPolicyControl } from "@/components/InboxAgentPolicyControl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
@@ -157,6 +158,8 @@ export function ProfileSettings() {
           {actionError}
         </div>
       ) : null}
+
+      <SsoAccountLink />
 
       <section className="space-y-8">
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">

@@ -37,7 +37,7 @@ isProject: false
 
 # Universal SSO / OIDC Support for Paperclip
 
-Status: Implemented  
+Status: Historical PR #3040 design. See [SSO.md](../SSO.md) for the current callback, linking and qualification contract.
 Date: 2026-04-07  
 Owners: Server + UI + Shared + Docker
 
