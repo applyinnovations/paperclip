@@ -118,7 +118,7 @@ export function ssoAuth(config: Config) {
         authorizationUrl: metadata.authorizationUrl, tokenUrl: metadata.tokenUrl,
         accountIssuer: metadata.issuer, accountSubject: ({ profile }) => typeof profile.sub === "string" ? profile.sub : "",
         tokenEndpointAuth: { method: provider.tokenEndpointAuth ?? "client_secret_post" },
-        redirectURI: `${origin}/api/auth/callback/${provider.providerId}`, scopes: [...new Set(["openid", ...(provider.scopes ?? ["profile", "email"])])],
+        redirectURI: `${origin}/api/auth/callback/${provider.providerId}`, scopes: [...new Set(["openid", ...(provider.scopes?.length ? provider.scopes : ["profile", "email"])])],
         pkce: true, disableSignUp: config.authDisableSignUp, disableProviderLogout: true,
         getUserInfo: async tokens => tokens.idToken ? ssoUserInfo(provider, tokens.idToken) : null,
       })) });

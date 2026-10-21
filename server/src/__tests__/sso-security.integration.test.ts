@@ -242,6 +242,16 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     } finally { verify.mockRestore(); }
   });
 
+  it.each([
+    { label: "omitted", scopes: undefined, expected: ["openid", "profile", "email"] },
+    { label: "empty", scopes: [], expected: ["openid", "profile", "email"] },
+    { label: "explicit", scopes: ["openid", "email", "groups"], expected: ["openid", "email", "groups"] },
+  ])("normalizes operator scopes: $label", async ({ scopes, expected }) => {
+    const api = app(false, { ssoProviders: [providerSettings({ scopes })] });
+    await start(api);
+    expect(provider.state.lastAuthorization?.get("scope")?.split(" ")).toEqual(expected);
+  });
+
   it("creates an issuer/subject account and session without company or admin grants", async () => {
     const api = app();
     const metadata = await request(api).get("/api/auth/sso-providers");
@@ -336,6 +346,7 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     const api = app();
     const local = await passwordSignup(api);
     expect(local.status).toBe(200);
+    expect((await db.select().from(authUsers))[0].emailVerified).toBe(false);
     const collision = await complete(api, await start(api));
     expect(collision.headers.location).toContain("account_not_linked");
     expect(await db.select().from(authAccounts)).toHaveLength(1);
