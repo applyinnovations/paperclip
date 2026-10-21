@@ -262,9 +262,12 @@ export async function startServer(): Promise<StartedServer> {
     if (!rawUrl) return undefined;
     try {
       const parsed = new URL(rawUrl);
-      // Only loopback development URLs follow the backend port. A public
-      // reverse proxy can use a different port, which is part of its OIDC origin.
-      if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return rawUrl;
+      // Loopback and direct private HTTP URLs follow the backend port. A proxy's
+      // public origin (including its port) must stay stable for OIDC callbacks.
+      const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+      const isDirectPrivateHttp = config.deploymentExposure === "private" &&
+        parsed.protocol === "http:" && Number(parsed.port) === config.port;
+      if (!isLoopback && !isDirectPrivateHttp) return rawUrl;
       // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
       if (!parsed.port) return rawUrl;
       parsed.port = String(port);
