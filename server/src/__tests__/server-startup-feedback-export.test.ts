@@ -617,6 +617,19 @@ describe("startServer authenticated auth origin setup", () => {
     process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
+  it.each([3210, 3211])("preserves an explicit proxy origin when the backend listens on %s", async (listenPort) => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      authBaseUrlMode: "explicit", authPublicBaseUrl: "https://board.example.test:8443",
+    }));
+    detectPortMock.mockResolvedValueOnce(listenPort);
+    await startServer();
+    expect(createBetterAuthInstanceMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ authPublicBaseUrl: "https://board.example.test:8443" }),
+      expect.anything(),
+    );
+  });
+
   it("derives trusted origins from the detected listen port before auth initializes", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       port: 3210,
