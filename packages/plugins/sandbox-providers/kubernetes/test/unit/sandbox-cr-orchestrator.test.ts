@@ -9,7 +9,7 @@ import {
 } from "../../src/sandbox-cr-orchestrator.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
-const SANDBOX_VERSION = "v1alpha1";
+const SANDBOX_VERSION = "v1beta1";
 const SANDBOX_PLURAL = "sandboxes";
 
 // Helpers to build mock CR objects with given phase
@@ -28,7 +28,7 @@ describe("createSandboxCr", () => {
     const create = vi.fn().mockResolvedValue({ metadata: { uid: "test-uid" } });
     const clients = { custom: { createNamespacedCustomObject: create } };
     const manifest = {
-      apiVersion: "agents.x-k8s.io/v1alpha1",
+      apiVersion: "agents.x-k8s.io/v1beta1",
       kind: "Sandbox",
       metadata: { name: "pc-abc", namespace: "paperclip-acme" },
     };

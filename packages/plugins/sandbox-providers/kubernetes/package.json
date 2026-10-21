@@ -48,7 +48,7 @@
     "postpack": "if [ -f package.dev.json ]; then mv package.dev.json package.json; fi"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^1.0.0",
+    "@kubernetes/client-node": "1.4.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

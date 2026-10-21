@@ -2,14 +2,14 @@
 
 First-party Paperclip sandbox-provider plugin for Kubernetes.
 
-**Alpha:** the default backend (`sandbox-cr`) is built on `kubernetes-sigs/agent-sandbox` v1alpha1 — expect breaking changes as that CRD evolves toward Beta. A stable fallback backend (`job`, using `batch/v1` Job) is available for clusters without agent-sandbox installed, but it does NOT support multi-command exec (paperclip-server's adapter-install pattern requires sandbox-cr).
+**Alpha provider:** the default backend (`sandbox-cr`) uses the `kubernetes-sigs/agent-sandbox` v1beta1 API. A stable fallback backend (`job`, using `batch/v1` Job) is available for clusters without agent-sandbox installed, but it does NOT support multi-command exec (paperclip-server's adapter-install pattern requires sandbox-cr).
 
 ## Prerequisites
 
 ### For `sandbox-cr` backend (default, recommended)
 
 1. A Kubernetes cluster running k8s 1.27+
-2. [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) controller installed in the cluster (alpha — installs the `sandboxes.agents.x-k8s.io/v1alpha1` CRD and controller)
+2. A pinned [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) controller serving `sandboxes.agents.x-k8s.io/v1beta1`
 3. Paperclip-server running with access to the cluster (in-cluster via `inCluster: true` or external via `kubeconfig`)
 
 ### For `job` backend (stable fallback)
@@ -38,7 +38,7 @@ The plugin supports two backend modes, selected via the `backend` config field:
 | `sandbox-cr` | Yes | Alpha | Yes | `kubernetes-sigs/agent-sandbox` controller |
 | `job` | No | Stable | No | Nothing beyond k8s 1.27+ |
 
-**`sandbox-cr` (default):** Creates a `Sandbox` CR (`agents.x-k8s.io/v1alpha1`) whose controller provisions a long-lived pod running `sleep infinity`. paperclip-server execs individual commands into the running pod — this is the multi-command adapter-install pattern. When you `releaseLease`, the Sandbox CR is deleted and the controller tears down the pod.
+**`sandbox-cr` (default):** Creates a `Sandbox` CR (`agents.x-k8s.io/v1beta1`) whose controller provisions a long-lived pod running `sleep infinity`. paperclip-server execs individual commands into the running pod — this is the multi-command adapter-install pattern. When you `releaseLease`, the Sandbox CR is deleted and the controller tears down the pod. The CR also sets an absolute `shutdownTime` with `shutdownPolicy: Delete` from `podActivityDeadlineSec`, so the controller can reap it if the server cannot release it. Workspace/home/cache are ephemeral and disappear with the pod; retain important outputs through Paperclip's file sync/storage.
 
 **`job` (stable fallback):** Creates a `batch/v1` Job. The container entrypoint runs once and exits — no multi-command exec possible. Use this when you cannot install agent-sandbox, or when you need strictly stable Kubernetes APIs. Note: paperclip-server's adapter-install pattern will not work in job mode.
 
@@ -113,8 +113,8 @@ NetworkPolicy      paperclip-egress-allow         (DNS + paperclip-server callba
 For each agent run (sandbox-cr backend):
 
 ```
-Sandbox CR         pc-{ulid}                       (agents.x-k8s.io/v1alpha1; explicit delete on release)
-Pod                pc-{ulid}-{podSuffix}           (managed by Sandbox controller; torn down on CR delete)
+Sandbox CR         pc-{ulid}                       (agents.x-k8s.io/v1beta1; release or absolute shutdown deadline)
+Pod                pc-{ulid}                       (managed by Sandbox controller; torn down on CR delete)
 Secret             pc-{ulid}-env                   (owned by Sandbox CR; cascade-deleted)
 ```
 
@@ -136,7 +136,7 @@ Every agent pod is:
 - `seccompProfile: RuntimeDefault`
 - Tini as PID 1 (reaps zombies, forwards signals)
 - `fsGroupChangePolicy: OnRootMismatch` (fast PVC startup; openclaw-operator lesson)
-- `automountServiceAccountToken: true` (for the agent shim's paperclip-server callback)
+- `automountServiceAccountToken: false` (callbacks use Paperclip credentials, not Kubernetes API credentials)
 
 Plus per-namespace `pod-security.kubernetes.io/enforce: restricted` and a deny-all NetworkPolicy baseline with explicit egress allow-list (DNS, paperclip-server, configured FQDNs/CIDRs).
 
