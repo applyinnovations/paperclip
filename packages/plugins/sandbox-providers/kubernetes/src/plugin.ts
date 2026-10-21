@@ -381,6 +381,7 @@ const plugin = definePlugin({
           resources: config.defaultResources ?? {},
           runtimeClassName: config.runtimeClassName,
           imagePullSecrets: config.imagePullSecrets,
+          activeDeadlineSec: config.podActivityDeadlineSec,
         })
       : buildJobManifest({
           namespace,
@@ -407,7 +408,7 @@ const plugin = definePlugin({
         runId: params.runId,
         workloadName: jobName,
         ownerReference: {
-          apiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+          apiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
           kind: isSandboxCrBackend ? "Sandbox" : "Job",
           name: jobName,
           uid: ownerUid,
@@ -438,7 +439,7 @@ const plugin = definePlugin({
       secretName,
       runId: params.runId,
       ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
       ownerName: jobName,
       ownerUid,
       bootstrapToken,
