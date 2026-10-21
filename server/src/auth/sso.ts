@@ -3,7 +3,7 @@ import { APIError, addOAuthServerContext, createAuthMiddleware, getOAuthState, g
 import { genericOAuth, keycloak, auth0, okta, microsoftEntraId } from "better-auth/plugins";
 import type { GenericOAuthConfig } from "better-auth/plugins";
 import { createRemoteJWKSet, decodeJwt } from "jose";
-import type { SsoProviderConfig } from "@paperclipai/shared";
+import { ssoProvidersSchema, type SsoProviderConfig } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 
 const CREDENTIAL_PATHS = new Set(["/get-access-token", "/refresh-token", "/account-info"]);
@@ -80,8 +80,7 @@ export function ssoUserInfo(provider: SsoProviderConfig, token: string) {
 }
 
 export function validateSsoConfiguration(config: Config, providers = config.ssoProviders ?? []) {
-  const ids = new Set(providers.map(p => p.providerId));
-  if (ids.size !== providers.length || providers.length > 8) throw new Error("SSO requires at most eight uniquely named providers.");
+  if (!ssoProvidersSchema.safeParse(providers).success) throw new Error("Invalid SSO provider configuration.");
   if (!providers.length) return undefined;
   if (providers.length && (config.deploymentMode !== "authenticated" || config.authBaseUrlMode !== "explicit" ||
       !config.authPublicBaseUrl)) throw new Error("SSO requires authenticated mode and an explicit public origin.");

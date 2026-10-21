@@ -2265,6 +2265,7 @@ export {
   serverConfigSchema,
   authConfigSchema,
   ssoProviderConfigSchema,
+  ssoProvidersSchema,
   SSO_PROVIDER_TYPES,
   secretsConfigSchema,
   storageConfigSchema,

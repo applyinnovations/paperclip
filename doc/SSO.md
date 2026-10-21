@@ -1,9 +1,9 @@
 # Native SSO / OIDC
 
-This local convergence candidate retains PR #3040's instance settings UI/API,
-multiple providers and operator configuration. It targets Better Auth 1.7.2.
-It is not qualified for production until the recorded migration/build and live
-Keycloak acceptance gates are complete.
+Paperclip supports multiple OIDC providers through its instance settings UI/API
+or operator configuration, using Better Auth 1.7.2. Email/password authentication
+remains available. SSO establishes identity; company invitations and instance
+roles control access.
 
 ## Configuration source
 
@@ -117,15 +117,43 @@ Better Auth session secret and operator/IdP configuration together. A database
 backup alone does not cover file storage or encryption keys. Do not drop auth
 rows, change user IDs, relabel issuers or regenerate keys as a rollback shortcut.
 
-Current Better Auth account identity is `(issuer, subject)`; company permissions
-remain attached to the same Paperclip user. Our qualified candidate's actual
-issuer/subject rows are compatible. Older #3040 accounts upgraded through core
-migration 0230 have `local:oauth:<providerId>` namespaces. Provider ID alone does
-not prove the old issuer, so this candidate does not automatically relabel or
-implicitly email-link those rows. Accounts with local credentials can explicitly
-link while retaining user/company identity; legacy SSO-only accounts need a
-separately reviewed, verified issuer mapping or recovery plan before adoption.
-Renaming a provider or repointing its issuer is not an identity migration.
+Better Auth account identity is `(issuer, subject)`; company permissions remain
+attached to the same Paperclip user. Migration `0213_soft_silvermane.sql` adds
+the issuer column and unique key. It backfills passwords as `local:credential`
+and old social accounts as `local:oauth:<providerId>`. Provider ID alone does not
+prove the old issuer, so migration never relabels external identities or links
+by email. Renaming a provider or repointing its issuer is not an identity migration.
+
+### Upgrade preflight
+
+Before applying this version, run the read-only inventory against an isolated
+restore of the old database, using that restore's connection configuration:
+
+```sh
+PGOPTIONS='-c default_transaction_read_only=on' \
+  psql "$DATABASE_URL" -X --set ON_ERROR_STOP=on --file scripts/sso-upgrade-preflight.sql
+```
+
+The inventory works before and after the issuer migration. It lists social
+account owners, local-password presence, instance/company privileges and
+duplicate legacy account keys. It does not print hashes, tokens or secrets.
+Resolve duplicate keys before migration; do not delete or merge account owners
+just to satisfy the new unique index.
+
+For each listed user, verify the old issuer, subject and ownership with the user
+and the trusted IdP administrator. Prove an independent local administrator can
+sign in before upgrade. Users with a working local password can sign in locally
+after migration and explicitly link the verified provider in Profile, preserving
+their user ID and grants. Test that path on the restore first.
+
+**Stop the upgrade for privileged SSO-only users without a verified recovery
+plan.** An old session or matching email is not a recovery credential. This
+version provides no general password-reset delivery or automatic issuer-mapping
+tool. Arrange a separately reviewed, identity-verified recovery or issuer mapping
+that preserves the existing user and grants; do not create a replacement user,
+silently relabel rows or open signup as a workaround. An ordinary SSO-only user's
+access also needs this review. Preserve the old application and backup until
+every affected owner can authenticate on the isolated restore.
 
 For an application rollback, retain the additive SSO column/configuration and
 all auth rows, files and keys. An older application may ignore the extra column;
@@ -135,9 +163,9 @@ Validate both restored data and local recovery before any real rollout.
 
 ## Local Keycloak acceptance
 
-The inherited compose/realm/bootstrap recipe is a development fixture, not
-production acceptance. The callback has been updated to the standard Better Auth
-1.7 path. Do not run the bootstrap script against an existing/live instance.
+The compose/realm/bootstrap recipe is a development fixture. It sets an explicit
+public auth origin and uses the standard Better Auth 1.7 callback. Do not run the
+bootstrap script against an existing/live instance.
 Synthetic signed-provider tests exercise issuer/audience/signature/JWKS/algorithm,
 nonce, PKCE, state/replay, admission, linking, token guards and local sessions.
 They do not prove live Keycloak reverse-proxy/TLS/realm configuration, browser

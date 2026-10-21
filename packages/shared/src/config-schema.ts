@@ -114,11 +114,22 @@ export const ssoProviderConfigSchema = z.object({
   }
 });
 
+// Config files, environment input and instance settings share this boundary.
+export const ssoProvidersSchema = z.array(ssoProviderConfigSchema).max(8).superRefine((providers, ctx) => {
+  const seen = new Set<string>();
+  providers.forEach((provider, index) => {
+    if (seen.has(provider.providerId)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate providerId "${provider.providerId}" — provider ids must be unique`, path: [index, "providerId"] });
+    }
+    seen.add(provider.providerId);
+  });
+});
+
 export const authConfigSchema = z.object({
   baseUrlMode: z.enum(AUTH_BASE_URL_MODES).default("auto"),
   publicBaseUrl: z.string().url().optional(),
   disableSignUp: z.boolean().default(false),
-  ssoProviders: z.array(ssoProviderConfigSchema).default([]),
+  ssoProviders: ssoProvidersSchema.default([]),
 }).passthrough();
 
 export const storageLocalDiskConfigSchema = z.object({

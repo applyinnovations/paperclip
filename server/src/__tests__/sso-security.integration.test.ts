@@ -48,11 +48,6 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     await db.execute(sql`truncate "session", "account", "verification", "user", "instance_user_roles", "company_memberships", "companies", "invites" cascade`);
     process.env.BETTER_AUTH_SECRET = "paperclip-oidc-test-session-secret-only";
     process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED = "false";
-    for (const key of Object.keys(process.env)) if (key.startsWith("PAPERCLIP_AUTH_OIDC_")) delete process.env[key];
-    process.env.PAPERCLIP_AUTH_OIDC_ISSUER = provider.issuer;
-    process.env.PAPERCLIP_AUTH_OIDC_CLIENT_ID = "test-client";
-    process.env.PAPERCLIP_AUTH_OIDC_CLIENT_SECRET = "test-client-secret";
-    delete process.env.PAPERCLIP_AUTH_OIDC_CLIENT_SECRET_FILE;
     provider.state.email = "person@example.test";
     provider.state.sub = "person-subject";
     provider.state.emailVerified = true;
@@ -282,7 +277,6 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
 
   it("supports providers that require client_secret_post", async () => {
     provider.state.authMethod = "client_secret_post";
-    process.env.PAPERCLIP_AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD = "client_secret_post";
     const api = app();
     expect((await complete(api, await start(api))).headers.location).toContain("/invite/test-invite");
     expect(await db.select().from(authSessions)).toHaveLength(1);
@@ -475,7 +469,6 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
   }, 10_000);
 
   it("leaves password authentication unchanged when OIDC is not configured", async () => {
-    for (const key of Object.keys(process.env)) if (key.startsWith("PAPERCLIP_AUTH_OIDC_")) delete process.env[key];
     const api = app(false, { ssoProviders: [] });
     expect((await request(api).get("/api/auth/sso-providers")).body).toEqual({ providers: [] });
     expect((await passwordSignup(api)).status).toBe(200);
@@ -545,22 +538,39 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     expect(await db.select().from(authVerifications)).toHaveLength(0);
   });
 
-  it("preserves legacy account ownership and requires explicit issuer recovery", async () => {
+  it.each([false, true])("preserves privileged legacy ownership; SSO-only=%s requires recovery before linking", async (ssoOnly) => {
     const api = app();
     const local = await passwordSignup(api);
     const user = (await db.select().from(authUsers))[0];
+    if (ssoOnly) await db.delete(authAccounts).where(eq(authAccounts.userId, user.id));
+    await db.insert(instanceUserRoles).values({ userId: user.id, role: "instance_admin" });
+    const [company] = await db.insert(companies).values({ name: "Legacy Company", issuePrefix: "LEG" }).returning();
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: user.id,
+      status: "active", membershipRole: "owner" });
     const legacyId = randomUUID();
     await db.insert(authAccounts).values({ id: legacyId, providerId: "oidc", accountId: provider.state.sub,
       issuer: "local:oauth:oidc", userId: user.id, createdAt: new Date(), updatedAt: new Date() });
     const login = await complete(api, await start(api));
     expect(login.headers.location).toContain("account_not_linked");
     expect((await db.select().from(authAccounts)).find(a => a.id === legacyId)).toMatchObject({ userId: user.id, issuer: "local:oauth:oidc" });
-    expect((await complete(api, await start(api, cookies(local), PASSWORD))).headers.location).toContain("/invite/test-invite");
+    if (ssoOnly) {
+      // Even a surviving local session cannot invent the missing recovery password.
+      const link = await request(api).post("/api/auth/link-social").set("origin", ORIGIN).set("cookie", cookies(local))
+        .send({ provider: "oidc", additionalData: { password: PASSWORD }, callbackURL: "/" });
+      expect(link.status).toBe(401);
+      expect(await db.select().from(authAccounts)).toHaveLength(1);
+    } else {
+      expect((await complete(api, await start(api, cookies(local), PASSWORD))).headers.location).toContain("/invite/test-invite");
+      const login = await complete(api, await start(api));
+      expect((await request(api).get("/actor").set("cookie", cookies(login))).body).toMatchObject({ userId: user.id, isInstanceAdmin: true });
+    }
     expect(await db.select().from(authUsers)).toHaveLength(1);
     const accounts = await db.select().from(authAccounts);
-    expect(accounts).toHaveLength(3);
+    expect(accounts).toHaveLength(ssoOnly ? 1 : 3);
     expect(accounts.every(a => a.userId === user.id)).toBe(true);
-    expect(accounts.find(a => a.issuer === provider.issuer)).toMatchObject({ accountId: provider.state.sub, userId: user.id });
+    if (!ssoOnly) expect(accounts.find(a => a.issuer === provider.issuer)).toMatchObject({ accountId: provider.state.sub, userId: user.id });
+    expect(await db.select().from(instanceUserRoles)).toMatchObject([{ userId: user.id, role: "instance_admin" }]);
+    expect(await db.select().from(companyMemberships)).toMatchObject([{ principalId: user.id, companyId: company.id, membershipRole: "owner" }]);
   });
 
 });

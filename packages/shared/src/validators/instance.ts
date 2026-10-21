@@ -10,7 +10,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
-import { ssoProviderConfigSchema } from "../config-schema.js";
+import { ssoProvidersSchema } from "../config-schema.js";
 
 function presetSchema<T extends readonly number[]>(presets: T, label: string) {
   return z.number().refine(
@@ -109,24 +109,6 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .optional(),
 }).strict();
-
-const ssoProvidersSchema = z
-  .array(ssoProviderConfigSchema).max(8)
-  .superRefine((providers, ctx) => {
-    // Better Auth registers providers by id — a duplicate silently
-    // overwrites the earlier registration, so reject it at the boundary.
-    const seen = new Set<string>();
-    providers.forEach((provider, index) => {
-      if (seen.has(provider.providerId)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `duplicate providerId "${provider.providerId}" — provider ids must be unique`,
-          path: [index, "providerId"],
-        });
-      }
-      seen.add(provider.providerId);
-    });
-  });
 
 export const instanceSsoSettingsSchema = z.object({
   source: z.enum(["operator", "database"]).optional(),

@@ -3,7 +3,24 @@ import {
   findPaperclipConfigKeyWarnings,
   mergePaperclipConfig,
   paperclipConfigSchema,
+  authConfigSchema,
+  ssoProvidersSchema,
 } from "./config-schema.js";
+import { patchInstanceSsoSettingsSchema } from "./validators/instance.js";
+
+describe("shared SSO configuration boundary", () => {
+  const provider = { providerId: "keycloak", type: "keycloak", clientId: "client", clientSecret: "synthetic-secret",
+    issuer: "https://identity.example.test/realms/main" };
+  it.each([
+    [[], true], [[provider], true], [[provider, provider], false],
+    [Array.from({ length: 9 }, (_, i) => ({ ...provider, providerId: `provider-${i}` })), false],
+    [[{ ...provider, providerId: "credential" }], false],
+  ])("applies the same provider policy to operator/file/settings input: %s", (providers, accepted) => {
+    expect(ssoProvidersSchema.safeParse(providers).success).toBe(accepted);
+    expect(authConfigSchema.safeParse({ ssoProviders: providers }).success).toBe(accepted);
+    expect(patchInstanceSsoSettingsSchema.safeParse({ providers }).success).toBe(accepted);
+  });
+});
 
 describe("paperclip config schema", () => {
   it("defaults omitted runtime paths to legacy instance-root locations", () => {

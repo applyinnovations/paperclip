@@ -85,6 +85,7 @@ describeEmbeddedPostgres("account issuer migration", () => {
     const credentialAccountId = `account-${randomUUID()}`;
     const githubAccountId = `account-${randomUUID()}`;
     const googleAccountId = `account-${randomUUID()}`;
+    const companyId = randomUUID();
 
     await sql`
       INSERT INTO "user" ("id", "name", "email", "created_at", "updated_at")
@@ -97,11 +98,38 @@ describeEmbeddedPostgres("account issuer migration", () => {
         ("id", "account_id", "provider_id", "user_id", "password", "created_at", "updated_at")
       VALUES
         (${credentialAccountId}, ${credentialUserId}, 'credential', ${credentialUserId}, 'hashed', now(), now()),
-        (${githubAccountId}, 'github-subject-1', 'github', ${socialUserId}, NULL, now(), now()),
+        (${githubAccountId}, 'github-subject-1', 'github', ${credentialUserId}, NULL, now(), now()),
         (${googleAccountId}, 'google-subject-1', 'google', ${socialUserId}, NULL, now(), now())
     `;
+    await sql`INSERT INTO instance_user_roles (user_id, role) VALUES (${socialUserId}, 'instance_admin')`;
+    await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}, 'Legacy Company', 'LEG')`;
+    await sql`INSERT INTO company_memberships (company_id, principal_type, principal_id, status, membership_role)
+      VALUES (${companyId}, 'user', ${socialUserId}, 'active', 'owner')`;
+
+    const preflightSql = await fs.promises.readFile(new URL("../../../scripts/sso-upgrade-preflight.sql", import.meta.url), "utf8");
+    const preflight = () => sql.begin("read only", transaction => transaction.unsafe(preflightSql));
+    const before = await preflight();
+    expect(before).toEqual([
+      expect.objectContaining({ user_id: socialUserId, instance_admin: true, company_admin: true,
+        local_password: false, duplicate_account_key: false, social_providers: ["google"] }),
+      expect.objectContaining({ user_id: credentialUserId, instance_admin: false, company_admin: false,
+        local_password: true, duplicate_account_key: false, social_providers: ["github"] }),
+    ]);
+    // Detect an ambiguous old key without printing or changing credentials.
+    const duplicateId = randomUUID();
+    await sql`INSERT INTO account (id, account_id, provider_id, user_id, created_at, updated_at)
+      VALUES (${duplicateId}, 'google-subject-1', 'google', ${credentialUserId}, now(), now())`;
+    expect((await preflight()).every(row => row.duplicate_account_key)).toBe(true);
+    await sql`DELETE FROM account WHERE id = ${duplicateId}`;
 
     await applyPendingMigrations(database.connectionString);
+    expect(await preflight()).toEqual(before);
+    expect(await sql`SELECT user_id, role FROM instance_user_roles`).toEqual([
+      { user_id: socialUserId, role: "instance_admin" },
+    ]);
+    expect(await sql`SELECT company_id, principal_id, membership_role, status FROM company_memberships`).toEqual([
+      { company_id: companyId, principal_id: socialUserId, membership_role: "owner", status: "active" },
+    ]);
 
     const rows = await sql<{ id: string; issuer: string }[]>`
       SELECT "id", "issuer" FROM "account" ORDER BY "id"

@@ -30,7 +30,7 @@ export function SsoAccountLink() {
   }
   return <section className="rounded-xl border border-border bg-card p-5 space-y-3">
     <h2 className="text-sm font-semibold">Link an SSO account</h2>
-    <p className="text-sm text-muted-foreground">Confirm your local Paperclip password, then sign in with the provider using the same email. Local password sign-in remains available.</p>
+    <p className="text-sm text-muted-foreground">Confirm your local Paperclip password, then sign in with the provider using the same email. If you only use SSO and have no local password, ask your instance operator to arrange account recovery first.</p>
     <form onSubmit={link} className="space-y-3">
       <label className="block text-sm">Identity provider
         <select aria-label="Identity provider" value={provider} onChange={e => setProvider(e.target.value)} disabled={busy}
