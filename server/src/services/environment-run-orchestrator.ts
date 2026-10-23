@@ -515,10 +515,15 @@ export function environmentRunOrchestrator(
       }
     }
 
-    // Step 3: Persist realization metadata on lease and execution workspace
-    if (Object.keys(workspaceRealization).length > 0) {
+    // Step 3: Persist realization metadata on lease and execution workspace.
+    // Native sandbox sync reads remoteCwd directly from the lease, not from the
+    // nested workspace-realization record. Use the provider's realized directory
+    // so fresh and resumed leases both carry the current sync confinement root.
+    const sandboxRemoteCwd = environment.driver === "sandbox" ? realizedWorkspaceCwd : null;
+    if (Object.keys(workspaceRealization).length > 0 || sandboxRemoteCwd) {
       const nextLeaseMetadata = {
         ...(lease.metadata ?? {}),
+        ...(sandboxRemoteCwd ? { remoteCwd: sandboxRemoteCwd } : {}),
         workspaceRealization,
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
