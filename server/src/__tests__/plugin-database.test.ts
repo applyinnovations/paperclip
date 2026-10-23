@@ -148,11 +148,12 @@ describe("buildPluginWorkerEnv", () => {
     deploymentExposure: "public",
   };
 
-  it("passes only model provider keys through to environment driver plugins", () => {
+  it("passes only model provider credentials through to environment driver plugins", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["environment.drivers.register"] },
       instanceInfo,
       processEnv: {
+        CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token",
         ANTHROPIC_API_KEY: "anthropic-token",
         OPENAI_API_KEY: "openai-token",
         GEMINI_API_KEY: " ",
@@ -163,6 +164,7 @@ describe("buildPluginWorkerEnv", () => {
     expect(env).toEqual({
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token",
       ANTHROPIC_API_KEY: "anthropic-token",
       OPENAI_API_KEY: "openai-token",
     });
@@ -188,12 +190,13 @@ describe("buildPluginWorkerEnv", () => {
     });
   });
 
-  it("does not pass provider keys to non-environment plugins", () => {
+  it("does not pass provider credentials to non-environment plugins", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["ui.slots.register"] },
       instanceInfo,
       processEnv: {
         OPENAI_API_KEY: "openai-token",
+        CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token",
       },
     });
 
