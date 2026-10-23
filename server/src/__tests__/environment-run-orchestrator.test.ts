@@ -276,6 +276,55 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 
+  it.each([null, "/stale/workspace"])(
+    "preserves the realized sandbox directory for file sync (previous directory: %s)",
+    async (previousRemoteCwd) => {
+      const lease = makeLease({
+        provider: "kubernetes",
+        providerLeaseId: "sandbox-1",
+        metadata: {
+          sandboxProviderPlugin: true,
+          namespace: "paperclip-company-1",
+          ...(previousRemoteCwd ? { remoteCwd: previousRemoteCwd } : {}),
+        },
+      });
+      const runtime = makeMockRuntime({
+        realizeWorkspace: vi.fn().mockResolvedValue({
+          cwd: "/workspace",
+          metadata: {
+            remoteCwd: "/workspace",
+            workspaceRealization: {
+              version: 1,
+              mode: "copy",
+              remote: { path: "/workspace" },
+            },
+          },
+        }),
+      });
+      mockUpdateLeaseMetadata.mockImplementation(async (_id, metadata) => ({ ...lease, metadata }));
+      mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+      const result = await orchestrator.realizeForRun(makeRealizeInput({
+        environment: makeEnvironment("sandbox"),
+        lease,
+      }));
+
+      expect(result.lease.metadata).toEqual(expect.objectContaining({
+        remoteCwd: "/workspace",
+        namespace: "paperclip-company-1",
+        sandboxProviderPlugin: true,
+      }));
+      expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(lease.id, expect.objectContaining({
+        remoteCwd: "/workspace",
+      }));
+      // The transport closes over this lease for both native sync directions.
+      expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        lease: expect.objectContaining({ metadata: expect.objectContaining({ remoteCwd: "/workspace" }) }),
+      }));
+    },
+  );
+
   it("uses an in-place authoritative root on the adapter execution target", async () => {
     mockResolveEnvironmentExecutionTarget.mockResolvedValue({
       kind: "remote",

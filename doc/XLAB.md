@@ -24,6 +24,10 @@ revision of the deployed image
 The deployment must select `CLAUDE_CODE_OAUTH_TOKEN` in the Claude adapter
 registry's `envKeys`. Keep token values in encrypted deployment Secrets.
 
+- Preserve the provider-realized sandbox directory as lease `remoteCwd` before
+  resolving execution transport. Native Kubernetes file sync requires that root;
+  the nested workspace-realization record alone is insufficient.
+
 ## Maintenance and release
 
 1. Make feature/fix branches from `xlab` and review their changes against `xlab`.
