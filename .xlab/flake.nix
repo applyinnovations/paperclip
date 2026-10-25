@@ -28,6 +28,8 @@
         # as upstream CI does; nixpkgs' pnpm 9 is marked end-of-life.
         COREPACK_ENABLE_DOWNLOAD_PROMPT = "0";
         COREPACK_ENABLE_AUTO_PIN = "0";
+        # ci.sh links this glibc's loader into /lib64 on loader-less CI images.
+        XLAB_GLIBC = "${pkgs.glibc}";
       };
     };
 }
