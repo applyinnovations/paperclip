@@ -10,7 +10,7 @@
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in
     {
-      devShells.x86_64-linux.default = pkgs.mkShellNoCC {
+      devShells.x86_64-linux.default = pkgs.mkShell {
         packages = [
           pkgs.nodejs_24
           pkgs.corepack_24
@@ -23,6 +23,12 @@
           pkgs.gnused
           pkgs.bash
           pkgs.cacert
+          # paperclip-runner's typecheck and build run cargo (fmt, check and
+          # the runnerd release binary). It pins Rust 1.97.1 for rustup; plain
+          # cargo ignores rust-toolchain.toml and builds it with nixpkgs' Rust.
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.rustfmt
         ];
         # corepack runs exactly the pnpm pinned in package.json (packageManager),
         # as upstream CI does; nixpkgs' pnpm 9 is marked end-of-life.
