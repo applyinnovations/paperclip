@@ -17,12 +17,19 @@ step() {
 step install pnpm install --frozen-lockfile
 step typecheck pnpm -r typecheck
 step build pnpm build
-# Pull requests run only the tests affected by their change (vitest's import
-# graph against the target branch); the full suite (40+ minutes) runs from
-# .tekton/full-tests.yaml.
+# Pull requests run the test files they add or change. Import-graph selection
+# (vitest --changed) still picks most of the suite for any server change, and
+# the full suite takes 40+ minutes, so it runs nightly from
+# .tekton/full-tests.yaml and before a deploy.
 if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
-  step test pnpm exec vitest run --changed "$CI_BASE_REF" --passWithNoTests
+  mapfile -t tests < <(git diff --name-only --diff-filter=AMR "$CI_BASE_REF" HEAD \
+    | grep -E '\.test\.(ts|tsx|mts|js|mjs)$' || true)
+  if [ ${#tests[@]} -gt 0 ]; then
+    step test pnpm exec vitest run "${tests[@]}"
+  else
+    echo "::: test skipped: the change adds or edits no test files"
+  fi
 else
   step test pnpm test:run
 fi

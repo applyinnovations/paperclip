@@ -24,9 +24,9 @@ stays reachable from it.
 1. Branch from `xlab` as `feat/<topic>` or `fix/<topic>`; keep one concern per
    branch.
 2. Open a PR into `xlab`. `.tekton/pull-request.yaml` runs `.xlab/ci.sh`
-   (frozen install, typecheck, build, and the tests affected by the change via
-   `vitest --changed` against the target branch). The full suite takes 40+
-   minutes, so `.tekton/full-tests.yaml` runs it nightly on `xlab`. Run the
+   (frozen install, typecheck, build, and the test files the PR adds or
+   changes). The full suite takes 40+ minutes, so `.tekton/full-tests.yaml`
+   runs it nightly on `xlab`; check it is green before shipping. Run the
    PR checks locally with
    `CI_TEST_SCOPE=changed CI_BASE_REF=origin/xlab nix develop ./.xlab --command .xlab/ci.sh`.
 3. Add or update the change's row in [PATCHES.md](PATCHES.md).
