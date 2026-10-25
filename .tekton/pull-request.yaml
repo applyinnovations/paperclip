@@ -85,6 +85,6 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
+    # A private Nix store for this run; tools come from the shared Nix cache.
     - name: nix-store
-      persistentVolumeClaim:
-        claimName: nix-store
+      emptyDir: {}
