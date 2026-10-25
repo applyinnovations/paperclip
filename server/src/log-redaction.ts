@@ -42,8 +42,9 @@ function replaceLastPathSegment(pathValue: string, replacement: string) {
 
 export function maskUserNameForLogs(value: string, fallback = CURRENT_USER_REDACTION_TOKEN) {
   const trimmed = value.trim();
-  if (!trimmed) return fallback;
-  return `${trimmed[0]}${"*".repeat(Math.max(1, Array.from(trimmed).length - 1))}`;
+  const characters = Array.from(trimmed);
+  if (characters.length < 2) return fallback;
+  return `${characters[0]}${"*".repeat(characters.length - 1)}`;
 }
 
 function defaultUserNames() {

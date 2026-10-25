@@ -11,6 +11,8 @@ import {
   authVerifications,
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
+import { readOidcConfig } from "./oidc-config.js";
+import { oidcAccountOptions, oidcPlugin } from "./oidc.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import {
   workspaceLoginHandoffPlugin,
@@ -239,6 +241,7 @@ export function resolveWorkspaceHandoffIdentity(
 }
 
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
+  const oidc = readOidcConfig(config);
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
   const managedRuntimePublicUrl = process.env.PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL?.trim() || undefined;
@@ -280,13 +283,15 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       deploymentExposure: config.deploymentExposure,
       override: process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED,
     }),
-    advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies }),
+    advanced: { ...buildBetterAuthAdvancedOptions({ disableSecureCookies }),
+      ...(oidc ? { disableCSRFCheck: false, disableOriginCheck: false } : {}) },
+    ...oidcAccountOptions(oidc),
     // Registered only for a managed workspace instance: the plugin is what makes
     // `Open workspace` password-independent, and a control-plane instance that
     // was never handed a workspace key must not expose the exchange at all.
     ...(resolveWorkspaceHandoffIdentity(config)
       ? {
-          plugins: [
+          plugins: [oidcPlugin(oidc),
             workspaceLoginHandoffPlugin({
               db,
               // Re-resolved per exchange so a hot restart cannot keep validating
@@ -302,7 +307,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
             }),
           ],
         }
-      : {}),
+      : { plugins: [oidcPlugin(oidc)] }),
   };
 
   if (!baseUrl) {
@@ -322,7 +327,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   // only managed HTTP-loopback requests through a cookie-compatible instance.
   const loopbackAuth = betterAuth({
     ...authConfig,
-    advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies: true }),
+    advanced: { ...authConfig.advanced, ...buildBetterAuthAdvancedOptions({ disableSecureCookies: true }) },
   });
   const cookieSecurityInput = {
     deploymentMode: config.deploymentMode,

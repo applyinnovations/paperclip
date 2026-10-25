@@ -5,6 +5,26 @@ summary: Full environment variable reference
 
 All environment variables that Paperclip uses for server configuration.
 
+## OpenID Connect sign-in
+
+OIDC requires `authenticated` deployment mode and an explicit
+`PAPERCLIP_AUTH_PUBLIC_BASE_URL`. See [OIDC setup and recovery](https://github.com/paperclipai/paperclip/blob/master/doc/OIDC.md).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PAPERCLIP_AUTH_OIDC_ISSUER` | (unset) | Exact HTTPS provider issuer. Discovery uses its `.well-known/openid-configuration`. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_ID` | (unset) | Dedicated confidential client ID. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_SECRET_FILE` | (unset) | Mounted client secret file. Set this or `CLIENT_SECRET`, never both. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_SECRET` | (unset) | Client secret injected through the environment. |
+| `PAPERCLIP_AUTH_OIDC_PROVIDER_ID` | `oidc` | Stable lowercase provider ID; callback is `/api/auth/callback/<id>`. |
+| `PAPERCLIP_AUTH_OIDC_DISPLAY_NAME` | `OpenID Connect` | Public sign-in button label. |
+| `PAPERCLIP_AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` or `client_secret_post`. |
+
+Restart after changes. OIDC follows `PAPERCLIP_AUTH_DISABLE_SIGN_UP`, including
+for invitees. Existing accounts require password-confirmed linking in Profile
+settings; email matching does not link accounts or grant company/admin access.
+Password sign-in remains available. Logout revokes the local session only.
+
 ## Server Configuration
 
 | Variable | Default | Description |
