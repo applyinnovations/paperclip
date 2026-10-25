@@ -67,6 +67,28 @@ If an unapproved enrollment link expires, return to setup and select
 live pending enrollment or replaces an expired one; this does not revoke or
 repeat an existing instance approval.
 
+### Operator-owned GitHub App
+
+A self-hosted operator can use their own GitHub App instead of enrolling with
+Paperclip Cloud. The server reads the App private key from a file and mints a
+one-hour installation access token for git, `gh` and checkouts; agents only
+receive that token through the brokered launchers, never the key. Tokens are
+cached and refreshed ten minutes before expiry.
+
+| Variable | Meaning |
+| --- | --- |
+| `PAPERCLIP_GITHUB_APP_ID` | App ID |
+| `PAPERCLIP_GITHUB_APP_INSTALLATION_ID` | Installation to mint tokens for |
+| `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE` | Path to the App private key (PEM), e.g. a mounted secret |
+| `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | Comma-separated companies allowed to use it |
+| `PAPERCLIP_GITHUB_APP_REPOSITORIES` | Optional repository names to scope each token to |
+
+The App applies only to allow-listed companies with no managed GitHub
+connection, and only to runs whose trust policy allows GitHub credentials. A
+partial configuration, unreadable key or missing installation fails closed. The
+App needs **Contents** and **Pull requests** read/write (plus **Metadata**
+read); commits are attributed to `<app-slug>[bot]`.
+
 ## Identity resolution
 
 Every MCP call, `gh` invocation, native Git operation, checkout, health check,
@@ -76,8 +98,10 @@ and webhook binding uses the same order:
 2. The active personal GitHub grant owned by the run's `responsibleUserId`.
 3. For automated work without a responsible user, a personal grant only when
    an existing standing delegation names the agent.
-4. Legacy `GH_TOKEN`/`GITHUB_TOKEN` only when no managed GitHub connection is
-   configured for the company.
+4. When no managed GitHub connection is configured for the company: a company
+   `GITHUB_TOKEN`/`GH_TOKEN` secret for server-side checkouts, then the
+   operator's own GitHub App (below), then the legacy server
+   `GH_TOKEN`/`GITHUB_TOKEN`.
 
 An unavailable or ambiguous managed identity fails visibly. It never falls
 through to another person, an organization credential, or a legacy token.
