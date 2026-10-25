@@ -594,6 +594,50 @@ const support = await getEmbeddedPostgresTestSupport();
         env: {},
       });
     });
+    it("uses the operator GitHub App only when no managed identity applies and the run is trusted", async () => {
+      const githubApp = {
+        resolve: vi.fn(async () => ({
+          status: "available" as const,
+          credential: {
+            token: "ghs_app_installation",
+            source: "github_app" as const,
+            secretName: null,
+            githubIdentity: { userId: "4242", login: "paperclip-xlab-now[bot]" },
+            identitySource: "app" as const,
+          },
+        })),
+      };
+      const unconnected = await seed();
+      const result = await resolveGitHubOperationCredentials(db, unconnected, { githubApp });
+      expect(result).toMatchObject({ status: "available", source: "app", login: "paperclip-xlab-now[bot]" });
+      expect(result.env.GH_TOKEN).toBe("ghs_app_installation");
+      expect(githubApp.resolve).toHaveBeenCalledWith(unconnected.companyId);
+      const history = await db
+        .select()
+        .from(runIdentityContexts)
+        .where(eq(runIdentityContexts.runId, unconnected.runId));
+      expect(JSON.stringify(history)).not.toContain("ghs_app_installation");
+
+      githubApp.resolve.mockClear();
+      const connected = await seed();
+      await grant(connected, "A");
+      await switchTo(connected, "A");
+      expect(await resolveGitHubOperationCredentials(db, connected, { githubApp })).toMatchObject({ source: "personal" });
+      expect(githubApp.resolve).not.toHaveBeenCalled();
+
+      const quarantined = await seed();
+      await db
+        .update(issues)
+        .set({ sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "quarantined", sourceIssueId: quarantined.issueId } })
+        .where(eq(issues.id, quarantined.issueId));
+      expect(await resolveGitHubOperationCredentials(db, quarantined, { githubApp })).toMatchObject({ status: "unavailable", env: {} });
+      expect(githubApp.resolve).not.toHaveBeenCalled();
+
+      const broken = await seed();
+      expect(await resolveGitHubOperationCredentials(db, broken, {
+        githubApp: { resolve: async () => ({ status: "unavailable" as const, error: "The GitHub App could not issue an installation token" }) },
+      })).toMatchObject({ status: "unavailable", source: "app", env: {} });
+    });
     it("does not resolve the company default person's GitHub", async () => {
       const input = await seed();
       await grant(input, "A");

@@ -10,6 +10,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { and, eq, inArray, or } from "drizzle-orm";
+import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
@@ -46,11 +47,11 @@ const GIT_CREDENTIAL_HELPER =
 
 export type GitCredential = {
   token: string;
-  source: "managed_connection" | "company_secret" | "server_env";
+  source: "managed_connection" | "company_secret" | "github_app" | "server_env";
   /** The company-secret name the token came from; null for a server-environment token. */
   secretName: string | null;
   githubIdentity?: { userId: string; login: string };
-  identitySource?: "personal" | "dedicated";
+  identitySource?: "personal" | "dedicated" | "app";
   connectionId?: string;
   grantId?: string;
 };
@@ -182,6 +183,8 @@ export function describeGitAuthFailure(input: {
       ? `the ${input.used.secretName} company-secret GitHub credential`
       : input.used.source === "managed_connection"
         ? "the resolved GitHub connection"
+      : input.used.source === "github_app"
+        ? "the server's GitHub App installation token"
       : "the server-environment GitHub credential";
     return `The operation authenticated with ${label}, which was rejected or lacks access to this repository.`;
   }
@@ -201,9 +204,10 @@ type GitCredentialSecretsDeps = {
 
 /**
  * Build the credential provider for one run. Resolution order: the managed GitHub identity
- * resolver, then a company secret by well-known name, then the server process environment
- * (`GITHUB_TOKEN`/`GH_TOKEN`) for self-hosted operators. A configured managed identity fails
- * closed instead of falling through to legacy credentials. The lookup is memoized per
+ * resolver, then a company secret by well-known name, then the operator's GitHub App
+ * installation (see github-app-installation-credentials.ts), then the server process
+ * environment (`GITHUB_TOKEN`/`GH_TOKEN`) for self-hosted operators. A configured managed
+ * identity or GitHub App fails closed instead of falling through to legacy credentials. The lookup is memoized per
  * provider instance so one run performs at most one secret resolution (and writes at most
  * one audit event) no matter how many git operations it authenticates.
  */
@@ -220,11 +224,13 @@ export function createGitRemoteAuthProvider(
     secrets?: GitCredentialSecretsDeps;
     env?: NodeJS.ProcessEnv;
     secretNames?: readonly string[];
+    githubApp?: Pick<ReturnType<typeof githubAppInstallationTokenSource>, "resolve">;
   },
 ): GitRemoteAuthProvider {
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
+  const githubApp = deps?.githubApp ?? githubAppInstallationTokenSource();
   let credentialPromise: Promise<GitCredential | null> | null = null;
 
   const resolveCredential = async (): Promise<GitCredential | null> => {
@@ -258,6 +264,9 @@ export function createGitRemoteAuthProvider(
         .catch(() => "");
       if (token) return { token, source: "company_secret", secretName };
     }
+    const app = await githubApp.resolve(companyId);
+    if (app.status === "available") return app.credential;
+    if (app.status === "unavailable") throw new Error(app.error);
     const envToken = env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || "";
     if (envToken) return { token: envToken, source: "server_env", secretName: null };
     return null;
