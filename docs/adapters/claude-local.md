@@ -151,3 +151,13 @@ merged under the adapter config's `env`, so environment-level auth is
 reflected in the test result. A secret binding that is missing surfaces as
 an `environment_env_binding_missing` failure instead of a silently passing
 probe.
+
+### Kubernetes subscription credentials
+
+For Kubernetes agents, set `CLAUDE_CODE_OAUTH_TOKEN` on the server and include
+that variable in the Claude adapter registry entry's `envKeys`. Environment-driver
+plugin workers receive the token and put it in each run's Kubernetes Secret.
+Other plugin workers do not receive it. Do not use `defaultEnv` for secrets.
+A `claude setup-token` token lasts one year and does not refresh automatically.
+Replace it before expiry and restart the server through your deployment system.
+Avoid `ANTHROPIC_API_KEY` when you intend to use subscription authentication.
