@@ -1037,6 +1037,9 @@ importers:
       heif2jpeg:
         specifier: 0.1.6
         version: 0.1.6
+      jose:
+        specifier: 6.2.10
+        version: 6.2.10
       jsdom:
         specifier: ^30.0.1
         version: 30.0.1(@noble/hashes@2.4.0)
