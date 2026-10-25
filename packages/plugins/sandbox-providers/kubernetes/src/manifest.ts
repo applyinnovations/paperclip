@@ -9,7 +9,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Kubernetes Sandbox (alpha)",
   description:
-    "Built on kubernetes-sigs/agent-sandbox (v1alpha1). ALPHA — expect breaking changes as the upstream CRD evolves. Falls back to stable batch/v1 Job mode for clusters without agent-sandbox installed. First-party Paperclip sandbox-provider plugin for Kubernetes.",
+    "First-party alpha sandbox-provider plugin using kubernetes-sigs/agent-sandbox v1beta1. Supports multi-command exec and a bounded Sandbox lifetime. Falls back to stable batch/v1 Job mode for one-shot execution without agent-sandbox installed.",
   author: "Paperclip",
   categories: ["automation"],
   capabilities: ["environment.drivers.register"],

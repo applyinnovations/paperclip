@@ -1,4 +1,5 @@
-# This plugin uses only stable Kubernetes APIs. No CRD installation is required.
+# The sandbox-cr backend requires the agent-sandbox v1beta1 Sandbox CRD/controller.
+# The one-shot job backend uses only stable Kubernetes APIs and needs no CRD.
 #
 # Minimum cluster version: Kubernetes 1.27+
 #   - batch/v1 Job (GA since k8s 1.21)
@@ -17,6 +18,5 @@
 #   - kata-containers with Firecracker hypervisor
 #   - nested-virt-capable nodes
 #
-# Future backends (not currently required):
-#   - kubernetes-sigs/agent-sandbox (when it reaches v1beta1) as an alternative
-#     backend for warm pools / templates / pause-resume.
+# The current provider uses Sandbox directly; warm-pool/template extensions are
+# not required by its multi-command exec path.
