@@ -24,8 +24,11 @@ stays reachable from it.
 1. Branch from `xlab` as `feat/<topic>` or `fix/<topic>`; keep one concern per
    branch.
 2. Open a PR into `xlab`. `.tekton/pull-request.yaml` runs `.xlab/ci.sh`
-   (frozen install, typecheck, build, unit tests). Run the same locally with
-   `nix develop ./.xlab --command .xlab/ci.sh`.
+   (frozen install, typecheck, build, and the tests affected by the change via
+   `vitest --changed` against the target branch). The full suite takes 40+
+   minutes, so `.tekton/full-tests.yaml` runs it nightly on `xlab`. Run the
+   PR checks locally with
+   `CI_TEST_SCOPE=changed CI_BASE_REF=origin/xlab nix develop ./.xlab --command .xlab/ci.sh`.
 3. Add or update the change's row in [PATCHES.md](PATCHES.md).
 4. If the change is general-purpose, offer it upstream and link the PR. Once
    upstream ships it, the next intake merge carries upstream's version; remove
@@ -57,3 +60,16 @@ to move its `paperclip` input to the new commit. That repo builds the server
 and agent images, publishes them to `registry.xlab.now`, and Flux deploys them
 through `applyinnovations/xlab-deployments`. Migrations run in the server's
 init container; CNPG point-in-time recovery covers a bad one.
+
+## Signing in with Keycloak
+
+The server uses the OIDC sign-in from [doc/OIDC.md](../doc/OIDC.md) with
+provider ID `xlab`, so Keycloak's registered callback stays
+`/api/auth/callback/xlab`. Sign-up is disabled, and email matching never links
+accounts. An existing password user links once:
+
+1. Sign in with email and password.
+2. Settings → Profile → Single sign-on: enter the password, select **Link**.
+3. Complete the Keycloak sign-in within five minutes in the same session.
+
+After that, use **Sign in with xlab** and keep the password for break-glass.

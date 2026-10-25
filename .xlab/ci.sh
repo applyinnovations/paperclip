@@ -17,4 +17,12 @@ step() {
 step install pnpm install --frozen-lockfile
 step typecheck pnpm -r typecheck
 step build pnpm build
-step test pnpm test:run
+# Pull requests run only the tests affected by their change (vitest's import
+# graph against the target branch); the full suite (40+ minutes) runs from
+# .tekton/full-tests.yaml.
+if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
+  : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
+  step test pnpm exec vitest run --changed "$CI_BASE_REF" --passWithNoTests
+else
+  step test pnpm test:run
+fi
