@@ -1,5 +1,7 @@
 # Required check "tekton-xlab / paperclip-checks-" on pull requests into xlab:
-# frozen install, typecheck, build and unit tests with the .xlab toolchain.
+# frozen install, typecheck, build and the tests affected by the change, with
+# the .xlab toolchain. xlab-next is the branch xlab is rebuilt on until the
+# switchover renames it.
 # No credentials beyond PaC's read-only clone token.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
@@ -7,7 +9,7 @@ metadata:
   generateName: paperclip-checks-
   annotations:
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
-    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab, xlab-next]"
     pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "10"
@@ -15,6 +17,8 @@ spec:
   params:
     - name: revision
       value: "{{ revision }}"
+    - name: target-branch
+      value: "{{ target_branch }}"
   taskRunTemplate:
     serviceAccountName: default
     podTemplate:
@@ -29,6 +33,8 @@ spec:
   pipelineSpec:
     params:
       - name: revision
+        type: string
+      - name: target-branch
         type: string
     workspaces:
       - name: source
@@ -47,6 +53,8 @@ spec:
           - { name: url, value: https://github.com/applyinnovations/paperclip.git }
           - { name: revision, value: $(params.revision) }
           - { name: expectedCommitSha, value: $(params.revision) }
+          - name: additionalRefspecs
+            value: +refs/heads/$(params.target-branch):refs/remotes/origin/ci-base
         workspaces:
           - { name: output, workspace: source }
           - { name: basic-auth, workspace: git-auth }
@@ -61,7 +69,7 @@ spec:
             - { name: namespace, value: tekton-pipelines }
         params:
           - name: SCRIPT
-            value: nix develop ./.xlab --command .xlab/ci.sh
+            value: CI_TEST_SCOPE=changed CI_BASE_REF=origin/ci-base nix develop ./.xlab --command .xlab/ci.sh
         workspaces:
           - { name: source, workspace: source }
           - { name: nix-store, workspace: nix-store }
