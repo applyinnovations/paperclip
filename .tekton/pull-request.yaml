@@ -1,0 +1,82 @@
+# Required check "tekton-xlab / paperclip-checks-" on pull requests into xlab:
+# frozen install, typecheck, build and unit tests with the .xlab toolchain.
+# No credentials beyond PaC's read-only clone token.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: paperclip-checks-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+spec:
+  params:
+    - name: revision
+      value: "{{ revision }}"
+  taskRunTemplate:
+    serviceAccountName: default
+    podTemplate:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      nodeSelector:
+        storage.xlab.now/fast-local: "true"
+  timeouts:
+    pipeline: 90m
+  pipelineSpec:
+    params:
+      - name: revision
+        type: string
+    workspaces:
+      - name: source
+      - name: git-auth
+      - name: nix-store
+    tasks:
+      - name: clone
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v2 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+        workspaces:
+          - { name: output, workspace: source }
+          - { name: basic-auth, workspace: git-auth }
+      - name: checks
+        timeout: 80m
+        runAfter: [clone]
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-run-script }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - name: SCRIPT
+            value: nix develop ./.xlab --command .xlab/ci.sh
+        workspaces:
+          - { name: source, workspace: source }
+          - { name: nix-store, workspace: nix-store }
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 20Gi
+    - name: git-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
+    - name: nix-store
+      persistentVolumeClaim:
+        claimName: nix-store

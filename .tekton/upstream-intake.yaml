@@ -1,0 +1,74 @@
+# Nightly (xlab-deployments nightly-cron-trigger, PaC incoming webhook):
+# fast-forward master to upstream and open a PR merging upstream's newest
+# stable release into xlab. See .xlab/README.md.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: paperclip-upstream-intake-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[incoming]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/max-keep-runs: "7"
+spec:
+  taskRunTemplate:
+    serviceAccountName: default
+    podTemplate:
+      automountServiceAccountToken: false
+      nodeSelector:
+        storage.xlab.now/fast-local: "true"
+  timeouts:
+    pipeline: 30m
+  pipelineSpec:
+    workspaces:
+      - name: git-auth
+    tasks:
+      - name: intake
+        workspaces:
+          - { name: git-auth, workspace: git-auth }
+        taskSpec:
+          workspaces:
+            - name: git-auth
+              readOnly: true
+          volumes:
+            - name: work
+              emptyDir:
+                sizeLimit: 8Gi
+          steps:
+            - name: intake
+              image: docker.io/nixos/nix:2.34.0@sha256:b9c9611c8530fa8049a1215b20638536e1e71dcaf85212e47845112caf3adeea
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+                seccompProfile:
+                  type: RuntimeDefault
+              volumeMounts:
+                - { name: work, mountPath: /work }
+              env:
+                - name: NIX_CONFIG
+                  value: |
+                    experimental-features = nix-command flakes
+                    sandbox = false
+                    build-users-group =
+                    extra-substituters = http://niks3.nix-cache.svc.cluster.local
+                    extra-trusted-public-keys = nix-cache.xlab-1:bTS9fBj3hz80F1Ms2d4+az8Rc5kV/3v1mCW/KHeyKNQ=
+                    connect-timeout = 5
+                    fallback = true
+                - { name: AUTH_DIR, value: $(workspaces.git-auth.path) }
+              script: |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                export GH_TOKEN=$(cat "${AUTH_DIR}/git-provider-token")
+                export HOME=/work/home
+                mkdir -p "${HOME}"
+                git config --global user.name "xlab-now[bot]"
+                git config --global user.email "949094+xlab-now[bot]@users.noreply.github.com"
+                git clone --quiet --filter=blob:none --branch xlab \
+                  "https://x-access-token:${GH_TOKEN}@github.com/applyinnovations/paperclip.git" /work/src
+                cd /work/src
+                nix develop ./.xlab --command .xlab/upstream-intake.sh
+  workspaces:
+    - name: git-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
