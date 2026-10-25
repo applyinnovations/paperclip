@@ -26,6 +26,9 @@ spec:
         storage.xlab.now/fast-local: "true"
   timeouts:
     pipeline: 120m
+  taskRunSpecs:
+    - pipelineTaskName: publish-cache
+      serviceAccountName: nix-cache-publisher
   pipelineSpec:
     params:
       - name: revision
@@ -65,6 +68,21 @@ spec:
         workspaces:
           - { name: source, workspace: source }
           - { name: nix-store, workspace: nix-store }
+    # Push and scheduled runs publish this run's store to the shared Nix cache.
+    finally:
+      - name: publish-cache
+        taskRef:
+          resolver: cluster
+          params:
+            - name: kind
+              value: task
+            - name: name
+              value: nix-cache-publish
+            - name: namespace
+              value: tekton-pipelines
+        workspaces:
+          - name: nix-store
+            workspace: nix-store
   workspaces:
     - name: source
       volumeClaimTemplate:
@@ -77,6 +95,14 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
+    # A private Nix store for this run, shared by its tasks and deleted with the
+    # PipelineRun; tools come from the shared Nix cache.
     - name: nix-store
-      persistentVolumeClaim:
-        claimName: nix-store
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 40Gi
