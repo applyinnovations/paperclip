@@ -1,16 +1,20 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { oidcApi } from "@/api/oidc";
+import { useLocation } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-export function OidcSignIn({ callbackURL, link = false }: { callbackURL: string; link?: boolean }) {
+/** Without `callbackURL`, the provider returns the user to the current page, org prefix and query included. */
+export function OidcSignIn({ callbackURL, link = false }: { callbackURL?: string; link?: boolean }) {
+  const location = useLocation();
+  const returnTo = callbackURL ?? `${location.pathname}${location.search}`;
   const [password, setPassword] = useState("");
   const provider = useQuery({ queryKey: ["auth", "oidc-provider"], queryFn: oidcApi.getProvider, retry: false });
   const mutation = useMutation({
     mutationFn: async () => {
-      if (provider.data) await oidcApi.begin(provider.data.providerId, callbackURL, link ? password : undefined);
+      if (provider.data) await oidcApi.begin(provider.data.providerId, returnTo, link ? password : undefined);
     },
     onSettled: () => setPassword(""),
   });
