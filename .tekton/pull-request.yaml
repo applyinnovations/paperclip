@@ -85,5 +85,13 @@ spec:
       secret:
         secretName: "{{ git_auth_secret }}"
     # A private Nix store for this run; tools come from the shared Nix cache.
+    # On fast-local, not the node's system disk (an emptyDir). Tekton deletes
+    # it when the run completes.
     - name: nix-store
-      emptyDir: {}
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 40Gi
