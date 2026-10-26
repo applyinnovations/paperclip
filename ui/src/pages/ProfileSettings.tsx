@@ -159,7 +159,7 @@ export function ProfileSettings() {
       ) : null}
 
       <section className="space-y-8">
-        <OidcSignIn callbackURL="/company/settings/profile" link />
+        <OidcSignIn link />
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
           <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />
           <div className="absolute inset-0 bg-(image:--gradient-extract-7)" />
