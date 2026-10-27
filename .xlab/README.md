@@ -36,9 +36,12 @@ stays reachable from it.
 
 ## Taking upstream
 
-Nightly, `.tekton/upstream-intake.yaml` runs `.xlab/upstream-intake.sh`: it
-fast-forwards `master`, and when upstream publishes a new stable release (the
-GitHub "latest" release) it opens `upstream/<tag>` → `xlab` as a merge PR.
+Nightly, `.tekton/upstream-intake.yaml` fast-forwards `master`, and when
+upstream publishes a new stable release (the GitHub "latest" release) it opens
+`upstream/<tag>` → `xlab` as a merge PR. `.xlab/upstream-intake.sh` plans this
+without credentials (run it locally to see the plan); the pipeline's publish
+task, which holds the GitHub token and runs no repository code, pushes and opens
+the PR.
 
 - No database migration paths changed and no conflicts: auto-merge is enabled,
   so GitHub merges with a merge commit once the required checks pass.

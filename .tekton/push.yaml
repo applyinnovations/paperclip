@@ -1,6 +1,8 @@
 # On every push to xlab, ask xlab-containers to move its paperclip input to
 # this commit and rebuild the server and agent images. Flux deploys the result.
-# Holds only the shared incoming-webhook secret; never runs repository code.
+# Holds only the shared incoming-webhook secret (nightly-cron-webhook-key, which
+# must exist in tekton-buildkit beside the Repository); never runs repository
+# code.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -8,7 +10,7 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-event: "[push]"
     pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
-    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
   taskRunTemplate:
