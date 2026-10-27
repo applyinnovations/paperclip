@@ -1,6 +1,9 @@
 # Nightly (xlab-deployments nightly-cron-trigger, PaC incoming webhook):
 # fast-forward master to upstream and open a PR merging upstream's newest
 # stable release into xlab. See .xlab/README.md.
+# plan runs .xlab/upstream-intake.sh in sandboxed Nix with no credentials and
+# writes a plan; publish holds the GitHub token, runs no repository code and
+# takes every commit it pushes from upstream itself.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -8,37 +11,101 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-event: "[incoming]"
     pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
-    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
     pipelinesascode.tekton.dev/max-keep-runs: "7"
 spec:
+  params:
+    - name: revision
+      value: "{{ revision }}"
   taskRunTemplate:
     serviceAccountName: default
     podTemplate:
       automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       nodeSelector:
         storage.xlab.now/fast-local: "true"
+  taskRunSpecs:
+    - pipelineTaskName: plan
+      podTemplate:
+        hostUsers: false
   timeouts:
     pipeline: 30m
   pipelineSpec:
+    params:
+      - name: revision
+        type: string
     workspaces:
+      - name: source
       - name: git-auth
+      - name: plan
     tasks:
-      - name: intake
+      - name: clone
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+          # The plan needs history for merge bases; blobs stay lazy.
+          - { name: depth, value: "0" }
         workspaces:
+          - { name: output, workspace: source }
+          - { name: basic-auth, workspace: git-auth }
+      - name: plan
+        runAfter: [clone]
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
+        params:
+          - name: SCRIPT
+            value: nix develop ./.xlab --command .xlab/upstream-intake.sh "${CI_ARTIFACTS_PATH}/intake"
+        workspaces:
+          - { name: source, workspace: source }
+          - { name: artifacts, workspace: plan }
+      - name: publish
+        runAfter: [plan]
+        workspaces:
+          - { name: plan, workspace: plan }
           - { name: git-auth, workspace: git-auth }
         taskSpec:
           workspaces:
+            - name: plan
+              readOnly: true
             - name: git-auth
               readOnly: true
           volumes:
+            # This pod's own scratch on scratch-local; deleted with the pod and
+            # emptied by each step on exit.
             - name: work
-              emptyDir:
-                sizeLimit: 8Gi
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    accessModes: [ReadWriteOnce]
+                    storageClassName: scratch-local
+                    resources:
+                      requests:
+                        storage: 5Gi
           steps:
-            - name: intake
-              image: docker.io/nixos/nix:2.34.0@sha256:b9c9611c8530fa8049a1215b20638536e1e71dcaf85212e47845112caf3adeea
+            # Fast-forward master and push upstream/<tag> at the release
+            # commit. Only the tag comes from the plan; the commits come from
+            # upstream, and GitHub refuses a non-fast-forward master push.
+            - name: push
+              image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
               securityContext:
                 allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
                 capabilities:
                   drop: [ALL]
                 seccompProfile:
@@ -46,29 +113,151 @@ spec:
               volumeMounts:
                 - { name: work, mountPath: /work }
               env:
-                - name: NIX_CONFIG
-                  value: |
-                    experimental-features = nix-command flakes
-                    sandbox = false
-                    build-users-group =
-                    extra-substituters = http://niks3.nix-cache.svc.cluster.local
-                    extra-trusted-public-keys = nix-cache.xlab-1:bTS9fBj3hz80F1Ms2d4+az8Rc5kV/3v1mCW/KHeyKNQ=
-                    connect-timeout = 5
-                    fallback = true
                 - { name: AUTH_DIR, value: $(workspaces.git-auth.path) }
+                - { name: PLAN, value: $(workspaces.plan.path)/intake }
               script: |
-                #!/usr/bin/env bash
-                set -euo pipefail
-                export GH_TOKEN=$(cat "${AUTH_DIR}/git-provider-token")
-                export HOME=/work/home
+                #!/bin/sh
+                set -eu
+                wipe_scratch() { find /work -mindepth 1 -delete 2>/dev/null || true; }
+                trap wipe_scratch EXIT
+                fork=applyinnovations/paperclip
+                base=xlab
+                auth=$(printf 'x-access-token:%s' "$(cat "${AUTH_DIR}/git-provider-token")" | base64 -w 0)
+                # The token goes only to the fork, as a header, never to disk.
+                export HOME=/work/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=1 \
+                  GIT_CONFIG_KEY_0="http.https://github.com/${fork}.git.extraHeader" \
+                  GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}"
                 mkdir -p "${HOME}"
-                git config --global user.name "xlab-now[bot]"
-                git config --global user.email "949094+xlab-now[bot]@users.noreply.github.com"
-                git clone --quiet --filter=blob:none --branch xlab \
-                  "https://x-access-token:${GH_TOKEN}@github.com/applyinnovations/paperclip.git" /work/src
-                cd /work/src
-                nix develop ./.xlab --command .xlab/upstream-intake.sh
+                git init --quiet --bare /work/repo
+                cd /work/repo
+                git remote add origin "https://github.com/${fork}.git"
+                git remote add upstream https://github.com/paperclipai/paperclip.git
+                git fetch --quiet --no-tags --filter=blob:none origin \
+                  "+refs/heads/${base}:refs/remotes/origin/${base}" \
+                  +refs/heads/master:refs/remotes/origin/master
+                git fetch --quiet --no-tags upstream +refs/heads/master:refs/remotes/upstream/master
+                if ! git merge-base --is-ancestor origin/master upstream/master; then
+                  echo "fork master has diverged from upstream master; not syncing" >&2
+                  exit 1
+                fi
+                git push --quiet origin refs/remotes/upstream/master:refs/heads/master
+                echo "master at $(git rev-parse upstream/master)"
+                if [ ! -f "${PLAN}/tag" ]; then
+                  echo "no release to take in"
+                  exit 0
+                fi
+                tag=$(cat "${PLAN}/tag")
+                printf '%s\n' "${tag}" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || {
+                  echo "unexpected release tag in plan" >&2; exit 1; }
+                git fetch --quiet --no-tags upstream "+refs/tags/${tag}:refs/tags/${tag}"
+                commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+                if git merge-base --is-ancestor "${commit}" "origin/${base}"; then
+                  echo "${base} already contains ${tag}"
+                  exit 0
+                fi
+                git push --quiet origin "${commit}:refs/heads/upstream/${tag}"
+                echo "pushed upstream/${tag} at ${commit}"
+                # Hand only the tag to the next step.
+                wipe_scratch
+                printf '%s\n' "${tag}" > /work/pushed-tag
+                trap - EXIT
+            # Open the PR, label it and enable auto-merge as the plan says.
+            - name: pull-request
+              image: python:3.13-alpine@sha256:2dd78ad5cf13a0b68f5134dc49aa9950203a8cf4b7463431b9f3b398287c5059
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                capabilities:
+                  drop: [ALL]
+                seccompProfile:
+                  type: RuntimeDefault
+              volumeMounts:
+                - { name: work, mountPath: /work }
+              env:
+                - { name: AUTH_DIR, value: $(workspaces.git-auth.path) }
+                - { name: PLAN, value: $(workspaces.plan.path)/intake }
+                - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+              script: |
+                #!/usr/bin/env python3
+                import json, os, pathlib, re, sys, urllib.error, urllib.request
+
+                FORK, BASE = "applyinnovations/paperclip", "xlab"
+                LABELS = ["upstream", "needs-review: db-migration", "needs-review: conflict"]
+                pushed = pathlib.Path("/work/pushed-tag")
+                if not pushed.exists():
+                    print("no release branch pushed; nothing to open")
+                    sys.exit(0)
+                tag = pushed.read_text().strip()
+                pushed.unlink()
+                plan = pathlib.Path(os.environ["PLAN"])
+                if (plan / "tag").read_text().strip() != tag:
+                    sys.exit("pushed tag does not match the plan")
+                labels = [label for label in (plan / "labels").read_text().splitlines() if label]
+                if not set(labels) <= set(LABELS) or "upstream" not in labels:
+                    sys.exit(f"unexpected labels in plan: {labels}")
+                automerge = (plan / "automerge").read_text().strip()
+                if automerge not in ("true", "false"):
+                    sys.exit("unexpected automerge value in plan")
+                body = (plan / "body.md").read_text()[:60000]
+                token = (pathlib.Path(os.environ["AUTH_DIR"]) / "git-provider-token").read_text().strip()
+
+
+                def github(method, path, data=None, ok=()):
+                    request = urllib.request.Request(
+                        "https://api.github.com" + path, method=method,
+                        data=None if data is None else json.dumps(data).encode(),
+                        headers={"Authorization": f"Bearer {token}",
+                                 "Accept": "application/vnd.github+json",
+                                 "X-GitHub-Api-Version": "2022-11-28"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=30) as response:
+                            return json.load(response)
+                    except urllib.error.HTTPError as error:
+                        if error.code in ok:
+                            return None
+                        sys.exit(f"{method} {path}: {error.code} {error.read()[:500]!r}")
+
+
+                branch = f"upstream/{tag}"
+                if github("GET", f"/repos/{FORK}/pulls?head={FORK.split('/')[0]}:{branch}&state=all"):
+                    print(f"a pull request for {tag} already exists")
+                    sys.exit(0)
+                for label in LABELS:
+                    github("POST", f"/repos/{FORK}/labels", {"name": label}, ok=(422,))
+                pr = github("POST", f"/repos/{FORK}/pulls", {
+                    "title": f"Merge upstream {tag} into {BASE}",
+                    "head": branch, "base": BASE, "body": body})
+                github("POST", f"/repos/{FORK}/issues/{pr['number']}/labels", {"labels": labels})
+                print(f"opened {pr['html_url']}")
+                if automerge == "true":
+                    # GitHub merges once the ruleset's required checks pass; nothing can skip them.
+                    result = github("POST", "/graphql", {
+                        "query": "mutation($id: ID!) { enablePullRequestAutoMerge("
+                                 "input: {pullRequestId: $id, mergeMethod: MERGE}) { clientMutationId } }",
+                        "variables": {"id": pr["node_id"]}})
+                    if result.get("errors"):
+                        sys.exit(f"auto-merge: {result['errors']}")
+                    print("auto-merge enabled")
   workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 5Gi
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
+    # The plan task's output for publish: a few small files.
+    - name: plan
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 1Gi

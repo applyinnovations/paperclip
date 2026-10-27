@@ -16,6 +16,7 @@
           pkgs.corepack_24
           pkgs.git
           pkgs.gh
+          pkgs.curl
           pkgs.jq
           pkgs.coreutils
           pkgs.findutils

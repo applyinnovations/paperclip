@@ -1,7 +1,8 @@
 # Required check "tekton-xlab / paperclip-checks-" on pull requests into xlab:
 # frozen install, typecheck, build and the tests affected by the change, with
 # the .xlab toolchain.
-# No credentials beyond PaC's read-only clone token.
+# Sandboxed Nix in its own store (nix-v1); no credentials beyond PaC's
+# read-only clone token, which only the clone task sees.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -9,7 +10,7 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
     pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
-    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
@@ -27,6 +28,10 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       nodeSelector:
         storage.xlab.now/fast-local: "true"
+  taskRunSpecs:
+    - pipelineTaskName: checks
+      podTemplate:
+        hostUsers: false
   timeouts:
     pipeline: 90m
   pipelineSpec:
@@ -38,7 +43,6 @@ spec:
     workspaces:
       - name: source
       - name: git-auth
-      - name: nix-store
     tasks:
       - name: clone
         timeout: 10m
@@ -46,7 +50,7 @@ spec:
           resolver: cluster
           params:
             - { name: kind, value: task }
-            - { name: name, value: git-clone-v2 }
+            - { name: name, value: git-clone-v1 }
             - { name: namespace, value: tekton-pipelines }
         params:
           - { name: url, value: https://github.com/applyinnovations/paperclip.git }
@@ -64,14 +68,13 @@ spec:
           resolver: cluster
           params:
             - { name: kind, value: task }
-            - { name: name, value: nix-run-script }
-            - { name: namespace, value: tekton-pipelines }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
         params:
           - name: SCRIPT
             value: CI_TEST_SCOPE=changed CI_BASE_REF=origin/ci-base nix develop ./.xlab --command .xlab/ci.sh
         workspaces:
           - { name: source, workspace: source }
-          - { name: nix-store, workspace: nix-store }
   workspaces:
     - name: source
       volumeClaimTemplate:
@@ -84,14 +87,3 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
-    # A private Nix store for this run; tools come from the shared Nix cache.
-    # On fast-local, not the node's system disk (an emptyDir). Tekton deletes
-    # it when the run completes.
-    - name: nix-store
-      volumeClaimTemplate:
-        spec:
-          accessModes: [ReadWriteOnce]
-          storageClassName: fast-local
-          resources:
-            requests:
-              storage: 40Gi

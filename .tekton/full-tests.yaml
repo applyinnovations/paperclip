@@ -8,7 +8,7 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-event: "[incoming]"
     pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
-    pipelinesascode.tekton.dev/target-namespace: tekton-pipelines
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
@@ -27,6 +27,9 @@ spec:
   timeouts:
     pipeline: 120m
   taskRunSpecs:
+    - pipelineTaskName: checks
+      podTemplate:
+        hostUsers: false
     - pipelineTaskName: publish-cache
       serviceAccountName: nix-cache-publisher
   pipelineSpec:
@@ -36,7 +39,7 @@ spec:
     workspaces:
       - name: source
       - name: git-auth
-      - name: nix-store
+      - name: nix-cache-export
     tasks:
       - name: clone
         timeout: 10m
@@ -44,7 +47,7 @@ spec:
           resolver: cluster
           params:
             - { name: kind, value: task }
-            - { name: name, value: git-clone-v2 }
+            - { name: name, value: git-clone-v1 }
             - { name: namespace, value: tekton-pipelines }
         params:
           - { name: url, value: https://github.com/applyinnovations/paperclip.git }
@@ -60,15 +63,15 @@ spec:
           resolver: cluster
           params:
             - { name: kind, value: task }
-            - { name: name, value: nix-run-script }
-            - { name: namespace, value: tekton-pipelines }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
         params:
           - name: SCRIPT
             value: nix develop ./.xlab --command .xlab/ci.sh
         workspaces:
           - { name: source, workspace: source }
-          - { name: nix-store, workspace: nix-store }
-    # Push and scheduled runs publish this run's store to the shared Nix cache.
+          - { name: nix-cache-export, workspace: nix-cache-export }
+    # Scheduled runs publish what the checks exported to the shared Nix cache.
     finally:
       - name: publish-cache
         taskRef:
@@ -77,12 +80,12 @@ spec:
             - name: kind
               value: task
             - name: name
-              value: nix-cache-publish
+              value: nix-cache-publish-v1
             - name: namespace
               value: tekton-pipelines
         workspaces:
-          - name: nix-store
-            workspace: nix-store
+          - name: nix-cache-export
+            workspace: nix-cache-export
   workspaces:
     - name: source
       volumeClaimTemplate:
@@ -95,9 +98,9 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
-    # A private Nix store for this run, shared by its tasks and deleted with the
-    # PipelineRun; tools come from the shared Nix cache.
-    - name: nix-store
+    # The checks' cache export (store paths the Nix cache lacks, written only
+    # on scheduled runs) for publish-cache. The checks keep their own Nix store.
+    - name: nix-cache-export
       volumeClaimTemplate:
         spec:
           accessModes:
@@ -105,4 +108,4 @@ spec:
           storageClassName: fast-local
           resources:
             requests:
-              storage: 40Gi
+              storage: 10Gi
