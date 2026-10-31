@@ -1,8 +1,8 @@
 # On every push to xlab, ask xlab-containers to move its paperclip input to
 # this commit and rebuild the server and agent images. Flux deploys the result.
-# Holds only the shared incoming-webhook secret (nightly-cron-webhook-key, which
-# must exist in tekton-buildkit beside the Repository); never runs repository
-# code.
+# Holds only its own incoming-webhook key (xlab-containers-trigger-paperclip,
+# in tekton-buildkit; accepted only by xlab-containers main and readable only
+# by paperclip runs); never runs repository code.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -39,7 +39,7 @@ spec:
                 - name: WEBHOOK_SECRET
                   valueFrom:
                     secretKeyRef:
-                      name: nightly-cron-webhook-key
+                      name: xlab-containers-trigger-paperclip
                       key: secret
                 # xlab-containers PipelineRun that bumps only the paperclip input.
                 - name: TARGET_PIPELINERUN
