@@ -4,6 +4,10 @@
 # plan runs .xlab/upstream-intake.sh in sandboxed Nix with no credentials and
 # writes a plan; publish holds the GitHub token, runs no repository code and
 # takes every commit it pushes from upstream itself.
+# publish uses paperclip-intake-push-token, a fine-grained token for this fork
+# only with workflow write: upstream changes .github/workflows/, which the PaC
+# GitHub App may not push (no workflows permission, by design). Actions is
+# disabled on the fork, so those workflow files never run here.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -39,6 +43,7 @@ spec:
     workspaces:
       - name: source
       - name: git-auth
+      - name: intake-auth
       - name: plan
     tasks:
       - name: clone
@@ -76,7 +81,7 @@ spec:
         runAfter: [plan]
         workspaces:
           - { name: plan, workspace: plan }
-          - { name: git-auth, workspace: git-auth }
+          - { name: git-auth, workspace: intake-auth }
         taskSpec:
           workspaces:
             - name: plan
@@ -252,6 +257,10 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
+    # Key git-provider-token; fork-only token with workflow write (see top).
+    - name: intake-auth
+      secret:
+        secretName: paperclip-intake-push-token
     # The plan task's output for publish: a few small files.
     - name: plan
       volumeClaimTemplate:
