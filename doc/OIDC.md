@@ -1,7 +1,8 @@
 # OpenID Connect sign-in
 
 Self-hosted instances can configure one optional OIDC provider in authenticated
-mode. Password sign-in and existing company authorization remain available.
+mode. Password sign-in and existing company authorization remain available,
+unless you turn on [OIDC-only sign-in](#oidc-only-sign-in).
 
 ## Configuration
 
@@ -47,6 +48,48 @@ and preserves password sign-in. Restore the provider and restart to retry.
 `GET /api/auth/oidc/provider` returns only the available provider ID and label.
 Authentication warnings omit provider request details; use the provider audit
 log for diagnosis.
+
+## OIDC-only sign-in
+
+Set `PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true` to make OIDC the only way to
+sign in. The default is `false`, which keeps password sign-in. The value must be
+`true` or `false`; any other value refuses startup.
+
+When the flag is on:
+
+- The server refuses every email and password endpoint with `403`:
+  `/api/auth/sign-in/email` and every other `/api/auth/sign-in/*` path except
+  `/sign-in/social`, `/sign-up/*`, `/request-password-reset`,
+  `/reset-password` (including `/reset-password/:token`), `/change-password`,
+  `/verify-password`, `/set-password` and `/forget-password`. Better Auth's
+  `emailAndPassword` option is also off.
+- `/sign-in/social` accepts only the configured provider ID.
+- `/link-social` (password-confirmed linking) and `/unlink-account` are refused.
+  Link accounts before you turn the flag on.
+- Stored password hashes stay in the database but are never checked. Nothing is
+  deleted.
+- `GET /api/health` returns `passwordLoginDisabled: true`. The UI then hides the
+  email and password forms, account creation and the Profile linking panel.
+- Existing sessions stay valid until they expire or you revoke them, including
+  sessions that started with a password before you turned the flag on.
+- Board API keys, agent keys and CLI sign-in (`paperclipai auth login`, which a
+  signed-in board session approves in the browser) keep working.
+
+Startup fails closed. Paperclip refuses to start when the flag is on and:
+
+- the deployment mode is not `authenticated`;
+- the OIDC variables are missing or invalid; or
+- provider discovery fails. In this mode, a provider outage at startup stops the
+  server instead of leaving it with no sign-in method. Your process supervisor
+  restarts it; it starts when the provider is reachable again.
+
+Before you turn the flag on, confirm that each administrator has linked an OIDC
+identity (Settings → Profile → Single sign-on) and can sign in with it. An
+account without a linked OIDC identity cannot sign in. To recover, set the flag
+to `false` and restart. Then sign in with the password and link the account.
+
+`PAPERCLIP_AUTH_DISABLE_SIGN_UP` still controls whether a new OIDC identity can
+create an account. New invitees can join only through OIDC.
 
 ## Accounts and recovery
 

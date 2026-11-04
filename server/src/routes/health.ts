@@ -123,6 +123,7 @@ export function healthRoutes(
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
     authReady: boolean;
+    passwordLoginDisabled?: boolean;
     companyDeletionEnabled: boolean;
     serverInfo?: ServerInfoSnapshot;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
@@ -414,6 +415,8 @@ export function healthRoutes(
         commit,
         bootstrapStatus,
         bootstrapInviteActive,
+        // Public on purpose: the sign-in page must know before any session exists.
+        ...(opts.passwordLoginDisabled ? { passwordLoginDisabled: true } : {}),
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -438,6 +441,7 @@ export function healthRoutes(
       authReady: opts.authReady,
       bootstrapStatus,
       bootstrapInviteActive,
+      ...(opts.passwordLoginDisabled ? { passwordLoginDisabled: true } : {}),
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },

@@ -170,6 +170,25 @@ describe("AuthPage", () => {
     await act(() => root.unmount());
   });
 
+  it("hides the password form and account creation when password sign-in is disabled", async () => {
+    healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated", passwordLoginDisabled: true });
+    const { root } = await mount();
+    await vi.waitFor(() => expect(container.textContent).toContain("Use single sign-on to access this instance."));
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    expect(container.textContent).not.toContain("Create one");
+    expect(signInEmailMock).not.toHaveBeenCalled();
+    await act(() => root.unmount());
+  });
+
+  it("explains a failed single sign-on without offering a password when it is disabled", async () => {
+    healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated", passwordLoginDisabled: true });
+    const { root } = await mount("/auth?error=oidc");
+    await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("Single sign-on failed. Try again."));
+    expect(container.querySelector('[role="alert"]')?.textContent).not.toContain("password");
+    await act(() => root.unmount());
+  });
+
   it("exposes password-manager metadata and a11y attributes on the sign-in form", async () => {
     const { root } = await mount();
 

@@ -13,6 +13,7 @@ import {
 import type { Config } from "../config.js";
 import { readOidcConfig } from "./oidc-config.js";
 import { oidcAccountOptions, oidcPlugin } from "./oidc.js";
+import { assertPasswordLoginPolicy, passwordLoginGuardPlugin } from "./password-login.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import {
   workspaceLoginHandoffPlugin,
@@ -46,7 +47,14 @@ type BetterAuthSessionResolver = {
   api?: BetterAuthGetSessionApi;
 };
 
-type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver;
+type BetterAuthInstance = BetterAuthHandlerTarget & BetterAuthSessionResolver & {
+  /**
+   * Resolves once every Better Auth context has initialized, including OIDC
+   * discovery. Rejects when OIDC is required (password sign-in disabled) and
+   * cannot initialize, so startup can refuse to continue.
+   */
+  ready: () => Promise<void>;
+};
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
@@ -242,6 +250,14 @@ export function resolveWorkspaceHandoffIdentity(
 
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const oidc = readOidcConfig(config);
+  assertPasswordLoginPolicy(config, oidc);
+  const passwordLoginDisabled = Boolean(config.authDisablePasswordLogin);
+  // The guard comes first: plugin before-hooks run in order, and the OIDC
+  // plugin's /link-social hook verifies a password before Better Auth routes it.
+  const authPlugins = [
+    ...(passwordLoginDisabled && oidc ? [passwordLoginGuardPlugin(oidc)] : []),
+    oidcPlugin(oidc, { required: passwordLoginDisabled }),
+  ];
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
   const managedRuntimePublicUrl = process.env.PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL?.trim() || undefined;
@@ -274,7 +290,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       },
     }),
     emailAndPassword: {
-      enabled: true,
+      // Disabled for OIDC-only sign-in; passwordLoginGuardPlugin also refuses
+      // the password endpoints Better Auth does not gate on this flag.
+      enabled: !passwordLoginDisabled,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
@@ -291,7 +309,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     // was never handed a workspace key must not expose the exchange at all.
     ...(resolveWorkspaceHandoffIdentity(config)
       ? {
-          plugins: [oidcPlugin(oidc),
+          plugins: [...authPlugins,
             workspaceLoginHandoffPlugin({
               db,
               // Re-resolved per exchange so a hot restart cannot keep validating
@@ -307,7 +325,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
             }),
           ],
         }
-      : { plugins: [oidcPlugin(oidc)] }),
+      : { plugins: authPlugins }),
   };
 
   if (!baseUrl) {
@@ -320,7 +338,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     isHttpsUrl(publicUrl) &&
     isHttpsUrl(managedRuntimePublicUrl),
   );
-  if (!supportsManagedLoopbackAuth) return defaultAuth;
+  if (!supportsManagedLoopbackAuth) {
+    return Object.assign(defaultAuth, { ready: async () => { await defaultAuth.$context; } });
+  }
 
   // Better Auth fixes both the Secure attribute and the __Secure- name prefix
   // when an instance is created. Keep the public instance unchanged and route
@@ -339,6 +359,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
   };
 
   return {
+    ready: async () => { await Promise.all([defaultAuth.$context, loopbackAuth.$context]); },
     handler: (request) => {
       const auth = shouldDisableSecureAuthCookies({
         ...cookieSecurityInput,
