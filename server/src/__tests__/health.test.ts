@@ -425,6 +425,39 @@ describe("GET /health", () => {
     expect(res.body.serverInfo).toBeUndefined();
   });
 
+  it("tells anonymous sign-in pages when password sign-in is disabled", async () => {
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ count: 1 }]),
+        })),
+      })),
+    } as unknown as Db;
+    const build = (passwordLoginDisabled?: boolean) => {
+      const app = express();
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "none", source: "none" };
+        next();
+      });
+      app.use("/health", healthRoutes(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+        authReady: true,
+        passwordLoginDisabled,
+        companyDeletionEnabled: false,
+        serverInfo: testServerInfo,
+      }));
+      return app;
+    };
+
+    expect((await request(build(true)).get("/health")).body.passwordLoginDisabled).toBe(true);
+    for (const value of [false, undefined]) {
+      const res = await request(build(value)).get("/health");
+      expect(Object.prototype.hasOwnProperty.call(res.body, "passwordLoginDisabled")).toBe(false);
+    }
+  });
+
   it("redacts detailed metadata when authenticated mode is reached without auth middleware", async () => {
     const devServerStatus = await import("../dev-server-status.js");
     vi.spyOn(devServerStatus, "readPersistedDevServerStatus").mockReturnValue(undefined);

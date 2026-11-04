@@ -19,11 +19,14 @@ OIDC requires `authenticated` deployment mode and an explicit
 | `PAPERCLIP_AUTH_OIDC_PROVIDER_ID` | `oidc` | Stable lowercase provider ID; callback is `/api/auth/callback/<id>`. |
 | `PAPERCLIP_AUTH_OIDC_DISPLAY_NAME` | `OpenID Connect` | Public sign-in button label. |
 | `PAPERCLIP_AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` or `client_secret_post`. |
+| `PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN` | `false` | `true` makes OIDC the only sign-in method: the server refuses all email/password sign-in, sign-up, reset, change and verify endpoints. Requires OIDC; startup fails without it. Link administrator accounts first. |
 
 Restart after changes. OIDC follows `PAPERCLIP_AUTH_DISABLE_SIGN_UP`, including
 for invitees. Existing accounts require password-confirmed linking in Profile
 settings; email matching does not link accounts or grant company/admin access.
-Password sign-in remains available. Logout revokes the local session only.
+Password sign-in remains available unless `PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true`
+(see [OIDC-only sign-in](https://github.com/paperclipai/paperclip/blob/master/doc/OIDC.md#oidc-only-sign-in)).
+Logout revokes the local session only.
 
 ## Server Configuration
 

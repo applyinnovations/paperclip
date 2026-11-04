@@ -4,6 +4,7 @@ import { Camera, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
 import type { AuthSession, CurrentUserProfile, UpdateCurrentUserProfile } from "@paperclipai/shared";
 import { authApi } from "@/api/auth";
 import { assetsApi } from "@/api/assets";
+import { healthApi } from "@/api/health";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -35,6 +36,13 @@ export function ProfileSettings() {
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  // Linking confirms a local password, which OIDC-only instances refuse.
+  const healthQuery = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const passwordLoginDisabled = healthQuery.data?.passwordLoginDisabled === true;
 
   useEffect(() => {
     setBreadcrumbs([
@@ -159,7 +167,7 @@ export function ProfileSettings() {
       ) : null}
 
       <section className="space-y-8">
-        <OidcSignIn link />
+        {passwordLoginDisabled ? null : <OidcSignIn link />}
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
           <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />
           <div className="absolute inset-0 bg-(image:--gradient-extract-7)" />

@@ -25,7 +25,7 @@ export function AuthPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(searchParams.has("error") ? "Single sign-on failed. Try again or sign in with your Paperclip password. Existing accounts must be linked from Profile settings after password sign-in." : null);
+  const [error, setError] = useState<string | null>(searchParams.has("error") ? "sso_failed" : null);
   const errorId = "auth-error";
 
   const nextPath = useMemo(
@@ -100,6 +100,14 @@ export function AuthPage() {
     return <CloudSignIn cloud={healthQuery.data.cloud} returnTo={nextPath} />;
   }
 
+  // The server refuses every password endpoint in this mode; the form would only fail.
+  const passwordLoginDisabled = healthQuery.data?.passwordLoginDisabled === true;
+  const errorMessage = error === "sso_failed"
+    ? passwordLoginDisabled
+      ? "Single sign-on failed. Try again. Your account must already be linked to single sign-on; ask an administrator if it is not."
+      : "Single sign-on failed. Try again or sign in with your Paperclip password. Existing accounts must be linked from Profile settings after password sign-in."
+    : error;
+
   return (
     <div className="fixed inset-0 flex bg-background">
       <div className="absolute top-4 right-4 z-10">
@@ -113,15 +121,23 @@ export function AuthPage() {
           </div>
 
           <h1 className="text-xl font-semibold">
-            {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
+            {mode === "sign_in" || passwordLoginDisabled ? "Sign in to Paperclip" : "Create your Paperclip account"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {mode === "sign_in"
-              ? "Use your email and password to access this instance."
-              : "Create an account for this instance. Email confirmation is not required in v1."}
+            {passwordLoginDisabled
+              ? "Use single sign-on to access this instance."
+              : mode === "sign_in"
+                ? "Use your email and password to access this instance."
+                : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
-          <form
+          {passwordLoginDisabled && errorMessage && (
+            <p id={errorId} role="alert" className="mt-6 text-xs text-destructive">
+              {errorMessage}
+            </p>
+          )}
+
+          {!passwordLoginDisabled && <form
             className="mt-6 space-y-4"
             method="post"
             action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
@@ -186,9 +202,9 @@ export function AuthPage() {
                 aria-describedby={error ? errorId : undefined}
               />
             </div>
-            {error && (
+            {errorMessage && (
               <p id={errorId} role="alert" className="text-xs text-destructive">
-                {error}
+                {errorMessage}
               </p>
             )}
             <Button
@@ -203,11 +219,11 @@ export function AuthPage() {
                   ? "Sign In"
                   : "Create Account"}
             </Button>
-          </form>
+          </form>}
 
           <OidcSignIn callbackURL={nextPath} />
 
-          <div className="mt-5 text-sm text-muted-foreground">
+          {!passwordLoginDisabled && <div className="mt-5 text-sm text-muted-foreground">
             {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
             <button
               type="button"
@@ -219,7 +235,7 @@ export function AuthPage() {
             >
               {mode === "sign_in" ? "Create one" : "Sign in"}
             </button>
-          </div>
+          </div>}
         </div>
       </div>
 

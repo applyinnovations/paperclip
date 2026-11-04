@@ -82,4 +82,9 @@ accounts. An existing password user links once:
 2. Settings → Profile → Single sign-on: enter the password, select **Link**.
 3. Complete the Keycloak sign-in within five minutes in the same session.
 
-After that, use **Sign in with xlab** and keep the password for break-glass.
+After that, use **Sign in with xlab**.
+
+`PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true` turns off password sign-in on the
+server ([doc/OIDC.md](../doc/OIDC.md#oidc-only-sign-in)). Link every
+administrator first: an unlinked account cannot sign in. For break-glass, set
+the flag to `false` and restart.

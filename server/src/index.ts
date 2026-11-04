@@ -671,6 +671,10 @@ async function startServerWithDatabaseTeardown(
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
+
+  if (config.authDisablePasswordLogin && config.deploymentMode !== "authenticated") {
+    throw new Error("PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true requires authenticated deployment mode and OIDC sign-in.");
+  }
   
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
@@ -746,6 +750,12 @@ async function startServerWithDatabaseTeardown(
       "Authenticated mode auth origin configuration",
     );
     const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
+    if (config.authDisablePasswordLogin) {
+      // Await OIDC discovery now: with password sign-in disabled, a provider that
+      // cannot initialize must stop startup rather than leave no sign-in method.
+      await auth.ready();
+      logger.info("Password sign-in is disabled; OIDC is the only interactive sign-in method");
+    }
     betterAuthHandler = createBetterAuthHandler(auth);
     resolveSession = (req) => resolveBetterAuthSession(auth, req);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
@@ -936,6 +946,7 @@ async function startServerWithDatabaseTeardown(
     authPublicBaseUrl: config.authPublicBaseUrl,
     chatWebhookPublicBaseUrl: config.chatWebhookPublicBaseUrl,
     authReady,
+    passwordLoginDisabled: config.authDisablePasswordLogin,
     companyDeletionEnabled: config.companyDeletionEnabled,
     announcements: { enabled: config.announcementsEnabled, feedUrl: config.announcementsFeedUrl },
     pluginMigrationDb: pluginMigrationDb as any,

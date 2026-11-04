@@ -43,7 +43,12 @@ export async function discoverOidc(config: OidcConfig) {
   };
 }
 
-export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
+/**
+ * `required` is set when password sign-in is disabled: a discovery or
+ * initialization failure then rejects Better Auth's context, and startup
+ * refuses to continue, instead of leaving the instance with no sign-in method.
+ */
+export function oidcPlugin(config: OidcConfig | null, opts: { required?: boolean } = {}): BetterAuthPlugin {
   let available = false;
   return {
     id: "paperclip-oidc",
@@ -90,7 +95,10 @@ export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
         }] });
         const result = await plugin.init(ctx);
         const provider = result.context.socialProviders.find((entry) => entry.id === config.providerId);
-        if (!provider) return {};
+        if (!provider) {
+          if (opts.required) throw new Error("OIDC provider registration failed.");
+          return {};
+        }
         provider.issuer = config.issuer;
         provider.idToken = {
           issuer: config.issuer,
@@ -103,6 +111,12 @@ export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
         available = true;
         return result;
       } catch {
+        if (opts.required) {
+          throw new Error(
+            "OIDC provider initialization failed and password sign-in is disabled (PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true). " +
+            "Refusing to start without a sign-in method. Check the issuer, discovery document and network access, then restart.",
+          );
+        }
         ctx.logger.warn("OIDC provider initialization failed; local authentication remains available. Check provider configuration and restart.");
         return {};
       }
@@ -132,6 +146,8 @@ export function oidcPlugin(config: OidcConfig | null): BetterAuthPlugin {
             }
           }
           if (ctx.path !== "/link-social") return;
+          // Linking confirms a local password; refuse it outright when passwords are disabled.
+          if (opts.required) throw new APIError("FORBIDDEN", { message: "Password sign-in is disabled on this instance. Use single sign-on." });
           const session = await getSessionFromCtx(ctx, { disableCookieCache: true });
           if (!session) throw new APIError("UNAUTHORIZED", { message: "Sign in before linking an account." });
           const password: unknown = ctx.body?.additionalData?.password;

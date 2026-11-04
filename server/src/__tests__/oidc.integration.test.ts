@@ -65,9 +65,10 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     provider.state.authMethod = "client_secret_basic";
   });
 
-  function app(disableSignUp = false) {
+  function app(disableSignUp = false, disablePasswordLogin = false) {
     const config = { deploymentMode: "authenticated", deploymentExposure: "private", authBaseUrlMode: "explicit",
-      authPublicBaseUrl: ORIGIN, authDisableSignUp: disableSignUp, allowedHostnames: ["127.0.0.1"], port: 41999 } as Config;
+      authPublicBaseUrl: ORIGIN, authDisableSignUp: disableSignUp, authDisablePasswordLogin: disablePasswordLogin,
+      allowedHostnames: ["127.0.0.1"], port: 41999 } as Config;
     const auth = createBetterAuthInstance(db, config, [ORIGIN]);
     const api = express();
     api.locals.auth = auth;
@@ -429,5 +430,100 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     const api = app();
     expect((await request(api).get("/api/auth/oidc/provider")).body).toEqual({ provider: null });
     expect((await passwordSignup(api)).status).toBe(200);
+  });
+  describe("with password sign-in disabled", () => {
+    const oidcOnly = () => app(false, true);
+    // A password account and session created before the flag was turned on.
+    async function legacyPasswordUser() {
+      const local = await passwordSignup(app());
+      expect(local.status).toBe(200);
+      return cookies(local);
+    }
+
+    it("refuses every password endpoint without verifying the stored hash", async () => {
+      const session = await legacyPasswordUser();
+      const api = oidcOnly();
+      const context = await (api.locals.auth as Auth).$context;
+      const verify = vi.spyOn(context.password, "verify");
+      const hash = vi.spyOn(context.password, "hash");
+      try {
+        const post = (path: string, body: object) =>
+          request(api).post(`/api/auth/${path}`).set("origin", ORIGIN).set("cookie", session).send(body);
+        for (const [path, body] of [
+          ["sign-in/email", { email: "person@example.test", password: PASSWORD }],
+          ["set-password", { newPassword: "new-password-123" }],
+          ["sign-in/email/", { email: "person@example.test", password: PASSWORD }],
+          ["sign-up/email", { name: "Another", email: "another@example.test", password: PASSWORD }],
+          ["request-password-reset", { email: "person@example.test", redirectTo: "/" }],
+          ["forget-password", { email: "person@example.test", redirectTo: "/" }],
+          ["reset-password", { newPassword: "new-password-123", token: "forged" }],
+          ["change-password", { currentPassword: PASSWORD, newPassword: "new-password-123" }],
+          ["verify-password", { password: PASSWORD }],
+          ["link-social", { provider: "oidc", callbackURL: "/", additionalData: { password: PASSWORD } }],
+          ["unlink-account", { providerId: "credential" }],
+        ] as const) {
+          const response = await post(path, body);
+          // Server-only or legacy paths Better Auth 1.7 does not route may 404; never 2xx.
+          const allowed = ["set-password", "forget-password"].includes(path) || path.endsWith("/") ? [403, 404] : [403];
+          expect(allowed, `${path}: ${response.status} ${JSON.stringify(response.body)}`).toContain(response.status);
+          expect(cookies(response), path).not.toContain("session_token");
+        }
+        expect((await request(api).get("/api/auth/reset-password/forged-token?callbackURL=/")).status).toBe(403);
+        expect(verify).not.toHaveBeenCalled();
+        expect(hash).not.toHaveBeenCalled();
+      } finally { verify.mockRestore(); hash.mockRestore(); }
+      expect(await db.select().from(authUsers)).toHaveLength(1);
+      expect(await db.select().from(authVerifications)).toHaveLength(0);
+    });
+
+    it("signs in with OIDC, including an account linked while passwords were enabled", async () => {
+      const session = await legacyPasswordUser();
+      const linking = app();
+      expect((await complete(linking, await start(linking, session, PASSWORD))).headers.location).toContain("/invite/test-invite");
+      const api = oidcOnly();
+      expect((await request(api).get("/api/auth/oidc/provider")).body).toEqual({ provider: { providerId: "oidc", displayName: "OpenID Connect" } });
+      const login = await complete(api, await start(api));
+      expect(login.headers.location).toContain("/invite/test-invite");
+      const actor = await request(api).get("/actor").set("cookie", cookies(login));
+      expect(actor.body).toMatchObject({ type: "board", source: "session" });
+      expect(await db.select().from(authUsers)).toHaveLength(1);
+      // The stored hash is kept, but inert.
+      expect((await db.select().from(authAccounts)).map((account) => account.providerId).sort()).toEqual(["credential", "oidc"]);
+      expect((await request(api).post("/api/auth/sign-in/email").set("origin", ORIGIN)
+        .send({ email: "person@example.test", password: PASSWORD })).status).toBe(403);
+    });
+
+    it("allows only the configured provider on social sign-in", async () => {
+      const response = await request(oidcOnly()).post("/api/auth/sign-in/social").set("origin", ORIGIN)
+        .send({ provider: "github", callbackURL: "/", disableRedirect: true });
+      expect(response.status).toBe(403);
+    });
+
+    it("refuses to build without OIDC configuration", () => {
+      for (const key of Object.keys(process.env)) if (key.startsWith("PAPERCLIP_AUTH_OIDC_")) delete process.env[key];
+      expect(() => oidcOnly()).toThrow("PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true requires OIDC sign-in");
+    });
+
+    it("rejects readiness when provider discovery fails instead of falling back to passwords", async () => {
+      provider.state.outage = true;
+      const config = { deploymentMode: "authenticated", deploymentExposure: "private", authBaseUrlMode: "explicit",
+        authPublicBaseUrl: ORIGIN, authDisableSignUp: false, authDisablePasswordLogin: true,
+        allowedHostnames: ["127.0.0.1"], port: 41999 } as Config;
+      const auth = createBetterAuthInstance(db, config, [ORIGIN]);
+      await expect(auth.ready()).rejects.toThrow("Refusing to start without a sign-in method");
+    });
+
+    it("leaves password sign-in unchanged when the flag is off", async () => {
+      await legacyPasswordUser();
+      const config = { deploymentMode: "authenticated", deploymentExposure: "private", authBaseUrlMode: "explicit",
+        authPublicBaseUrl: ORIGIN, authDisableSignUp: false, authDisablePasswordLogin: false,
+        allowedHostnames: ["127.0.0.1"], port: 41999 } as Config;
+      const auth = createBetterAuthInstance(db, config, [ORIGIN]);
+      await auth.ready();
+      const api = express();
+      api.all("/api/auth/{*authPath}", createBetterAuthHandler(auth));
+      expect((await request(api).post("/api/auth/sign-in/email").set("origin", ORIGIN)
+        .send({ email: "person@example.test", password: PASSWORD })).status).toBe(200);
+    });
   });
 });

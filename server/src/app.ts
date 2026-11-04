@@ -514,6 +514,8 @@ export async function createApp(
     authPublicBaseUrl?: string;
     chatWebhookPublicBaseUrl?: string;
     authReady: boolean;
+    /** OIDC-only sign-in; reported by `/api/health` so the UI hides password forms. */
+    passwordLoginDisabled?: boolean;
     companyDeletionEnabled: boolean;
     announcements?: { enabled: boolean; feedUrl: string };
     instanceId?: string;
@@ -546,6 +548,7 @@ export async function createApp(
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     authReady: opts.authReady,
+    passwordLoginDisabled: opts.passwordLoginDisabled,
     companyDeletionEnabled: opts.companyDeletionEnabled,
     databaseBackupHealth: opts.databaseBackupHealth,
     isWarmStandby,
