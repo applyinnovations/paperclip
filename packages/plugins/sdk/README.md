@@ -357,6 +357,8 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `api.routes.register` |
 | | `http.outbound` |
 | | `secrets.read-ref` |
+| | `github.app.token` |
+| | `github.app.webhooks.verify` |
 | | `environment.drivers.register` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |

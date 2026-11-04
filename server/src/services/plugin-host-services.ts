@@ -67,6 +67,8 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
+import { githubAppWebhookVerifier } from "./github-app-webhooks.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -712,6 +714,8 @@ export function buildHostServices(
     pluginWorkerManager?: PluginWorkerManager;
     manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
     heartbeatRuntimeEnv?: Record<string, string | undefined>;
+    githubAppTokens?: Pick<ReturnType<typeof githubAppInstallationTokenSource>, "resolve">;
+    githubAppWebhooks?: ReturnType<typeof githubAppWebhookVerifier>;
   } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
@@ -1746,6 +1750,30 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
+      },
+    },
+
+    githubApp: {
+      async getInstallationToken(params) {
+        // The host client handler has already pinned companyId to the invocation's company.
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const result = await (options.githubAppTokens ?? githubAppInstallationTokenSource()).resolve(companyId);
+        if (result.status === "not_applicable") return null;
+        if (result.status === "unavailable") throw new Error(result.error);
+        return {
+          token: result.credential.token,
+          expiresAt: result.expiresAt,
+          appId: result.appId,
+          installationId: result.installationId,
+          companyId,
+        };
+      },
+      async verifyWebhook(params) {
+        if (typeof params?.rawBody !== "string" || typeof params.headers !== "object" || params.headers === null) {
+          throw new Error("githubApp.verifyWebhook requires headers and rawBody");
+        }
+        return (options.githubAppWebhooks ?? githubAppWebhookVerifier()).verify(params);
       },
     },
 

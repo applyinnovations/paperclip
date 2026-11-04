@@ -114,6 +114,7 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { checkGitHubAppsConfigAtStartup } from "./services/github-app-config.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -674,6 +675,14 @@ async function startServerWithDatabaseTeardown(
 
   if (config.authDisablePasswordLogin && config.deploymentMode !== "authenticated") {
     throw new Error("PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true requires authenticated deployment mode and OIDC sign-in.");
+  }
+
+  // Per-company GitHub Apps fail closed: a bad mapping or unreadable key stops startup.
+  const githubApps = await checkGitHubAppsConfigAtStartup();
+  if (githubApps.status === "warning") {
+    logger.warn({ error: githubApps.error }, "GitHub App configuration is invalid; GitHub App credentials are unavailable");
+  } else if (githubApps.status === "enabled") {
+    logger.info({ source: githubApps.source, apps: githubApps.apps }, "GitHub App credentials configured");
   }
   
   if (config.deploymentMode === "authenticated") {

@@ -158,6 +158,17 @@ export interface HostServices {
     ): Promise<string>;
   };
 
+  /** Provides `githubApp.getInstallationToken` and `githubApp.verifyWebhook`. */
+  githubApp: {
+    getInstallationToken(
+      params: { companyId: string },
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["githubApp.getInstallationToken"][1]>;
+    verifyWebhook(
+      params: WorkerToHostMethods["githubApp.verifyWebhook"][0],
+    ): Promise<WorkerToHostMethods["githubApp.verifyWebhook"][1]>;
+  };
+
   /** Provides `activity.log`. */
   activity: {
     log(params: {
@@ -415,6 +426,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+
+  // Operator-owned GitHub Apps
+  "githubApp.getInstallationToken": "github.app.token",
+  "githubApp.verifyWebhook": "github.app.webhooks.verify",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -784,6 +799,15 @@ export function createHostClientHandlers(
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
       const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
       return services.secrets.resolve({ ...params, companyId }, context);
+    }),
+
+    // Operator-owned GitHub Apps. The token is always for the invocation's company.
+    "githubApp.getInstallationToken": gated("githubApp.getInstallationToken", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("githubApp.getInstallationToken", params, context);
+      return services.githubApp.getInstallationToken({ companyId }, context);
+    }),
+    "githubApp.verifyWebhook": gated("githubApp.verifyWebhook", async (params) => {
+      return services.githubApp.verifyWebhook({ headers: params.headers, rawBody: params.rawBody });
     }),
 
     // Activity
