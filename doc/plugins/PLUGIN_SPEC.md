@@ -859,6 +859,8 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `local.folders`
 - `http.outbound`
 - `secrets.read-ref`
+- `github.app.token` — `ctx.githubApp.getInstallationToken()`: a short-lived installation token for the invocation company's operator-owned GitHub App. Never the private key; never another company's token
+- `github.app.webhooks.verify` — `ctx.githubApp.verifyWebhook()`: the host checks a GitHub App webhook signature and returns the App's company. The plugin never reads the webhook secret
 - `environment.drivers.register`
 
 ### Agent Tools

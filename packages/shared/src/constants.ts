@@ -1408,6 +1408,11 @@ export const PLUGIN_CAPABILITIES = [
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",
+  // Operator-owned GitHub Apps: mint the invocation company's installation token, and
+  // verify App webhook deliveries on the host. The App private key and webhook secret
+  // never reach the plugin.
+  "github.app.token",
+  "github.app.webhooks.verify",
   "environment.drivers.register",
   "local.folders",
   // Agent Tools

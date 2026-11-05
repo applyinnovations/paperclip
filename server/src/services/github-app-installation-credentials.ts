@@ -1,6 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { githubAppJwt, githubBotRequest } from "./chat-github-client.js";
 import type { GitCredential } from "./git-credentials.js";
+import {
+  githubAppForCompany,
+  GITHUB_APP_ENV,
+  GITHUB_APPS_FILE_ENV,
+  readGitHubAppsConfig,
+  type GitHubAppInstallationConfig,
+  type GitHubAppsConfigResult,
+} from "./github-app-config.js";
 
 /**
  * Operator-owned GitHub App credentials for self-hosted instances.
@@ -11,74 +19,20 @@ import type { GitCredential } from "./git-credentials.js";
  * when a git/gh operation needs one. Agents only ever receive the installation token through
  * the existing brokered launchers; the private key and the App JWT never leave this module.
  *
- * Configuration (all from the server environment):
- *   PAPERCLIP_GITHUB_APP_ID                 App ID
- *   PAPERCLIP_GITHUB_APP_INSTALLATION_ID    installation to mint tokens for
- *   PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE   path to the App private key (PEM)
- *   PAPERCLIP_GITHUB_APP_COMPANY_IDS        comma-separated company IDs allowed to use it
- *   PAPERCLIP_GITHUB_APP_REPOSITORIES       optional comma-separated repository names; when
- *                                           set, tokens are scoped to these repositories
- *
- * Unset means disabled. A partial configuration is a misconfiguration and fails closed.
- * Only allow-listed companies can use the App, so one installation is never shared across
- * tenants by accident.
+ * Configuration is either one App for an allowlist of companies (PAPERCLIP_GITHUB_APP_*) or
+ * one App per company (PAPERCLIP_GITHUB_APPS_FILE); see github-app-config.ts. Each App keeps
+ * its own token cache, so one company's token is never handed to another company.
  */
 
-export const GITHUB_APP_ENV = {
-  appId: "PAPERCLIP_GITHUB_APP_ID",
-  installationId: "PAPERCLIP_GITHUB_APP_INSTALLATION_ID",
-  privateKeyFile: "PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE",
-  companyIds: "PAPERCLIP_GITHUB_APP_COMPANY_IDS",
-  repositories: "PAPERCLIP_GITHUB_APP_REPOSITORIES",
-} as const;
-
-export type GitHubAppInstallationConfig = {
-  appId: string;
-  installationId: string;
-  privateKeyFile: string;
-  companyIds: ReadonlySet<string>;
-  repositories: readonly string[];
-};
-
-export type GitHubAppConfigResult =
-  | { status: "disabled" }
-  | { status: "invalid"; error: string }
-  | { status: "enabled"; config: GitHubAppInstallationConfig };
-
-const list = (value: string | undefined) =>
-  (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-
-export function readGitHubAppInstallationConfig(
-  env: NodeJS.ProcessEnv = process.env,
-): GitHubAppConfigResult {
-  const appId = env[GITHUB_APP_ENV.appId]?.trim() ?? "";
-  const installationId = env[GITHUB_APP_ENV.installationId]?.trim() ?? "";
-  const privateKeyFile = env[GITHUB_APP_ENV.privateKeyFile]?.trim() ?? "";
-  const companyIds = list(env[GITHUB_APP_ENV.companyIds]);
-  const repositories = list(env[GITHUB_APP_ENV.repositories]);
-  if (!appId && !installationId && !privateKeyFile && companyIds.length === 0) {
-    return { status: "disabled" };
-  }
-  const missing = [
-    !appId && GITHUB_APP_ENV.appId,
-    !installationId && GITHUB_APP_ENV.installationId,
-    !privateKeyFile && GITHUB_APP_ENV.privateKeyFile,
-    companyIds.length === 0 && GITHUB_APP_ENV.companyIds,
-  ].filter(Boolean);
-  if (missing.length > 0) {
-    return { status: "invalid", error: `GitHub App configuration is incomplete: set ${missing.join(", ")}` };
-  }
-  if (!/^[1-9][0-9]*$/.test(appId) || !/^[1-9][0-9]*$/.test(installationId)) {
-    return { status: "invalid", error: "GitHub App and installation IDs must be numeric" };
-  }
-  if (repositories.some((name) => !/^[A-Za-z0-9._-]+$/.test(name))) {
-    return { status: "invalid", error: `${GITHUB_APP_ENV.repositories} must list repository names without owners` };
-  }
-  return {
-    status: "enabled",
-    config: { appId, installationId, privateKeyFile, companyIds: new Set(companyIds), repositories },
-  };
-}
+export {
+  GITHUB_APP_ENV,
+  GITHUB_APPS_FILE_ENV,
+  readGitHubAppInstallationConfig,
+  readGitHubAppsConfig,
+  type GitHubAppConfigResult,
+  type GitHubAppInstallationConfig,
+  type GitHubAppsConfigResult,
+} from "./github-app-config.js";
 
 type InstallationToken = { token: string; expires_at: string };
 type AppInfo = { slug: string };
@@ -87,25 +41,58 @@ type BotUser = { id: number; login: string };
 export type GitHubAppTokenResult =
   | { status: "not_applicable" }
   | { status: "unavailable"; error: string }
-  | { status: "available"; credential: GitCredential };
+  | {
+      status: "available";
+      credential: GitCredential;
+      /** ISO time GitHub expires the token at. */
+      expiresAt: string;
+      appId: string;
+      installationId: string;
+    };
 
 /** Refresh this long before GitHub's expiry so a token never dies mid-operation. */
 export const GITHUB_APP_TOKEN_REFRESH_MARGIN_MS = 10 * 60_000;
+
+const CONFIG_ENV_NAMES = [GITHUB_APPS_FILE_ENV, ...Object.values(GITHUB_APP_ENV)];
 
 export function createGitHubAppInstallationTokenSource(deps: {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   readPrivateKey?: (path: string) => Promise<string>;
+  readConfigFile?: (path: string) => string;
   now?: () => Date;
 } = {}) {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const readPrivateKey = deps.readPrivateKey ?? ((path: string) => readFile(path, "utf8"));
   const now = deps.now ?? (() => new Date());
-  type CachedToken = { token: string; expiresAtMs: number; identity?: { userId: string; login: string } };
-  let cached: CachedToken | null = null;
-  let inflight: Promise<CachedToken> | null = null;
+  type Identity = { userId: string; login: string };
+  type CachedToken = { token: string; expiresAtMs: number; identity?: Identity };
+  type AppTokenState = { cached: CachedToken | null; inflight: Promise<CachedToken> | null };
+  // One cache per App installation: a company only ever reads its own App's entry.
+  const states = new Map<string, AppTokenState>();
+  const stateKey = (app: GitHubAppInstallationConfig) => `${app.appId}:${app.installationId}`;
+  const stateFor = (app: GitHubAppInstallationConfig) => {
+    const key = stateKey(app);
+    let state = states.get(key);
+    if (!state) {
+      state = { cached: null, inflight: null };
+      states.set(key, state);
+    }
+    return state;
+  };
 
-  const mint = async (config: GitHubAppInstallationConfig): Promise<CachedToken> => {
+  // The file form is read once per distinct environment and reused; a broken read is retried.
+  let configMemo: { key: string; result: GitHubAppsConfigResult } | null = null;
+  const currentConfig = (): GitHubAppsConfigResult => {
+    const env = deps.env ?? process.env;
+    const key = JSON.stringify(CONFIG_ENV_NAMES.map((name) => env[name] ?? null));
+    if (configMemo?.key === key) return configMemo.result;
+    const result = readGitHubAppsConfig(env, deps.readConfigFile);
+    configMemo = result.status === "invalid" ? null : { key, result };
+    return result;
+  };
+
+  const mint = async (config: GitHubAppInstallationConfig, previous: Identity | undefined): Promise<CachedToken> => {
     const privateKey = await readPrivateKey(config.privateKeyFile);
     const jwt = githubAppJwt(config.appId, privateKey, now());
     const minted = await githubBotRequest<InstallationToken>(
@@ -120,7 +107,7 @@ export function createGitHubAppInstallationTokenSource(deps: {
     const expiresAtMs = Date.parse(minted.expires_at);
     if (!minted.token || !Number.isFinite(expiresAtMs)) throw new Error("GitHub returned an invalid installation token");
     // Commit identity is best effort: a token without it still authenticates.
-    let identity = cached?.identity;
+    let identity = previous;
     if (!identity) {
       try {
         const app = await githubBotRequest<AppInfo>(fetchImpl, jwt, "/app");
@@ -133,24 +120,34 @@ export function createGitHubAppInstallationTokenSource(deps: {
     return { token: minted.token, expiresAtMs, identity };
   };
 
+  const appFor = (companyId: string):
+    | { status: "not_applicable" }
+    | { status: "unavailable"; error: string }
+    | { status: "found"; app: GitHubAppInstallationConfig } => {
+    const configResult = currentConfig();
+    if (configResult.status === "disabled") return { status: "not_applicable" };
+    if (configResult.status === "invalid") return { status: "unavailable", error: configResult.error };
+    const app = githubAppForCompany(configResult.config, companyId);
+    return app ? { status: "found", app } : { status: "not_applicable" };
+  };
+
   return {
-    /** Resolve a credential for one company, minting or reusing a cached installation token. */
+    /** Resolve a credential for one company, minting or reusing its App's cached installation token. */
     async resolve(companyId: string): Promise<GitHubAppTokenResult> {
-      const configResult = readGitHubAppInstallationConfig(deps.env ?? process.env);
-      if (configResult.status === "disabled") return { status: "not_applicable" };
-      if (configResult.status === "invalid") return { status: "unavailable", error: configResult.error };
-      const { config } = configResult;
-      if (!config.companyIds.has(companyId)) return { status: "not_applicable" };
-      let current = cached;
+      const found = appFor(companyId);
+      if (found.status !== "found") return found;
+      const { app } = found;
+      const state = stateFor(app);
+      let current = state.cached;
       if (!current || current.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_MARGIN_MS <= now().getTime()) {
-        inflight ??= mint(config).finally(() => {
-          inflight = null;
+        state.inflight ??= mint(app, state.cached?.identity).finally(() => {
+          state.inflight = null;
         });
         try {
-          current = cached = await inflight;
+          current = state.cached = await state.inflight;
         } catch {
           // Never surface provider bodies or key-parsing errors: they can echo credential material.
-          cached = null;
+          state.cached = null;
           return {
             status: "unavailable",
             error: "The GitHub App could not issue an installation token; check the App ID, private key and installation",
@@ -159,6 +156,9 @@ export function createGitHubAppInstallationTokenSource(deps: {
       }
       return {
         status: "available",
+        expiresAt: new Date(current.expiresAtMs).toISOString(),
+        appId: app.appId,
+        installationId: app.installationId,
         credential: {
           token: current.token,
           source: "github_app",
@@ -168,16 +168,21 @@ export function createGitHubAppInstallationTokenSource(deps: {
         },
       };
     },
-    /** Drop the cached token, e.g. after GitHub rejects it. */
-    invalidate() {
-      cached = null;
+    /** Drop cached tokens, e.g. after GitHub rejects one: for one company's App, or for all Apps. */
+    invalidate(companyId?: string) {
+      if (companyId === undefined) {
+        for (const state of states.values()) state.cached = null;
+        return;
+      }
+      const found = appFor(companyId);
+      if (found.status === "found") stateFor(found.app).cached = null;
     },
   };
 }
 
 let defaultSource: ReturnType<typeof createGitHubAppInstallationTokenSource> | null = null;
 
-/** Process-wide source so every run shares one cached installation token. */
+/** Process-wide source so every run shares one cached token per App installation. */
 export function githubAppInstallationTokenSource() {
   defaultSource ??= createGitHubAppInstallationTokenSource();
   return defaultSource;

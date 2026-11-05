@@ -950,6 +950,17 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         return `resolved:${secretRef}`;
       },
     },
+    githubApp: {
+      // The harness has no operator GitHub Apps: tokens resolve null and deliveries fail closed.
+      async getInstallationToken() {
+        requireCapability(manifest, capabilitySet, "github.app.token");
+        return null;
+      },
+      async verifyWebhook() {
+        requireCapability(manifest, capabilitySet, "github.app.webhooks.verify");
+        return { verified: false, reason: "not_configured" };
+      },
+    },
     activity: {
       async log(entry) {
         requireCapability(manifest, capabilitySet, "activity.log.write");

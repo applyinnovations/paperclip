@@ -77,6 +77,8 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
+  PluginGitHubAppInstallationToken,
+  PluginGitHubAppWebhookVerification,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1675,6 +1677,16 @@ export interface WorkerToHostMethods {
   "secrets.resolve": [
     params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
+  ];
+
+  // Operator-owned GitHub Apps
+  "githubApp.getInstallationToken": [
+    params: { companyId?: string },
+    result: PluginGitHubAppInstallationToken | null,
+  ];
+  "githubApp.verifyWebhook": [
+    params: { headers: Record<string, string | string[]>; rawBody: string },
+    result: PluginGitHubAppWebhookVerification,
   ];
 
   // Activity

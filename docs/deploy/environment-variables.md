@@ -202,6 +202,20 @@ Unknown field names are logged and ignored (mixed-version fleet safe).
 Malformed JSON or an invalid value for a known field refuses startup — policy
 configuration fails closed.
 
+## GitHub App
+
+See [Operator-owned GitHub App](https://github.com/paperclipai/paperclip/blob/master/doc/connections/GITHUB.md#operator-owned-github-app).
+Use either the file or the single-App variables. Setting both refuses startup.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_GITHUB_APPS_FILE` | (unset) | Path to a JSON file that maps each company to its own GitHub App: `{"apps":[{"companyId","appId","installationId","privateKeyFile","webhookSecretFile"?,"repositories"?}]}`. Keys and webhook secrets stay in their own files. Any error (duplicate company, App or installation, malformed ID, unreadable or invalid key) refuses startup |
+| `PAPERCLIP_GITHUB_APP_ID` | (unset) | Single shared App: App ID |
+| `PAPERCLIP_GITHUB_APP_INSTALLATION_ID` | (unset) | Single shared App: installation ID |
+| `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE` | (unset) | Single shared App: path to the private key (PEM) |
+| `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | (unset) | Single shared App: comma-separated company IDs allowed to use it |
+| `PAPERCLIP_GITHUB_APP_REPOSITORIES` | (unset) | Single shared App: optional repository names to scope tokens to |
+
 ## Secrets
 
 | Variable | Default | Description |

@@ -673,6 +673,71 @@ export interface PluginHttpClient {
   fetch(url: string, init?: RequestInit): Promise<Response>;
 }
 
+/** A short-lived installation token for the operator-owned GitHub App of one company. */
+export interface PluginGitHubAppInstallationToken {
+  /** Installation access token. Use it for GitHub API calls; never log or persist it. */
+  token: string;
+  /** ISO time GitHub expires the token at. The host refreshes ahead of expiry. */
+  expiresAt: string;
+  appId: string;
+  installationId: string;
+  /** The company the token belongs to: always the invocation's company. */
+  companyId: string;
+}
+
+/** The host's verdict on a GitHub App webhook delivery. */
+export type PluginGitHubAppWebhookVerification =
+  | {
+      verified: true;
+      /** The company the App is mapped to. */
+      companyId: string;
+      appId: string;
+      /** The payload's `installation.id`, or null for App-level events without one. */
+      installationId: string | null;
+      /** `X-GitHub-Event`. */
+      event: string | null;
+      /** `X-GitHub-Delivery`. Deduplicate on it: signatures do not prevent replay. */
+      deliveryId: string | null;
+    }
+  | {
+      verified: false;
+      reason:
+        | "not_configured"
+        | "not_github_app_delivery"
+        | "unknown_app"
+        | "no_webhook_secret"
+        | "missing_signature"
+        | "bad_signature"
+        | "installation_mismatch";
+    };
+
+/**
+ * `ctx.githubApp` — the operator-owned GitHub App of a company.
+ *
+ * The operator maps each company to its own GitHub App (`PAPERCLIP_GITHUB_APPS_FILE`). The
+ * host holds the App private keys and webhook secrets; plugins only receive short-lived
+ * installation tokens and webhook verdicts.
+ */
+export interface PluginGitHubAppClient {
+  /**
+   * Get an installation token for the current invocation's company. Requires
+   * `github.app.token`. A `companyId` other than the invocation's company is denied.
+   * Outside a host invocation (a webhook handler or timer), pass a `companyId` the plugin
+   * is configured for. Resolves `null` when the company has no GitHub App.
+   */
+  getInstallationToken(options?: { companyId?: string }): Promise<PluginGitHubAppInstallationToken | null>;
+
+  /**
+   * Verify a GitHub App webhook delivery on the host. Requires
+   * `github.app.webhooks.verify`. Pass the headers and raw body from `onWebhook`
+   * unchanged. Act on the delivery only when `verified` is true.
+   */
+  verifyWebhook(input: {
+    headers: Record<string, string | string[]>;
+    rawBody: string;
+  }): Promise<PluginGitHubAppWebhookVerification>;
+}
+
 /**
  * `ctx.secrets` — resolve secret references.
  *
@@ -2169,6 +2234,9 @@ export interface PluginContext {
 
   /** Resolve secret references. Requires `secrets.read-ref`. */
   secrets: PluginSecretsClient;
+
+  /** Operator-owned GitHub App tokens and webhook verification. Requires `github.app.*`. */
+  githubApp: PluginGitHubAppClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */
   activity: PluginActivityClient;

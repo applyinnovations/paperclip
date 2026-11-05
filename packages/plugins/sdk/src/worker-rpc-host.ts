@@ -646,6 +646,20 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      githubApp: {
+        async getInstallationToken(options = {}) {
+          return callHost("githubApp.getInstallationToken", {
+            ...(options.companyId ? { companyId: options.companyId } : {}),
+          });
+        },
+        async verifyWebhook(input) {
+          return callHost("githubApp.verifyWebhook", {
+            headers: input.headers,
+            rawBody: input.rawBody,
+          });
+        },
+      },
+
       activity: {
         async log(entry): Promise<void> {
           await callHost("activity.log", {
