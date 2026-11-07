@@ -1,4 +1,4 @@
-# Required check "tekton-xlab / paperclip-checks-" on pull requests into xlab:
+# Required check "test-affected" on pull requests into xlab:
 # frozen install, typecheck, build and the tests affected by the change, with
 # the .xlab toolchain.
 # Sandboxed Nix in its own store (nix-v1); no credentials beyond PaC's
@@ -6,7 +6,7 @@
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
-  generateName: paperclip-checks-
+  name: test-affected
   annotations:
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
     pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
