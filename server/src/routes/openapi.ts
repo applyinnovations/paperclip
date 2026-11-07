@@ -1743,6 +1743,7 @@ function resolveOperationAuthLevel(
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/companies/{companyId}/agent-commentary") return "agent_heartbeat";
   if (key === "POST /api/mcp/project-tools" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools") return "agent_run";
+  if (path === "/api/run-mcp/{name}") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -10697,6 +10698,16 @@ for (const route of [
     ...(route[0] === "post" || route[0] === "put"
       ? { body: pluginLocalFolderRequestSchema }
       : {}),
+  });
+}
+
+for (const method of ["post", "get", "delete"] as const) {
+  registerCurrentRoute({
+    method,
+    path: "/api/run-mcp/{name}",
+    tags: ["projects"],
+    summary: "Operator-configured MCP server (PAPERCLIP_RUN_MCP_SERVERS_FILE) for an allowed agent run, proxied with the server's own credential",
+    responses: { 200: r.ok(), 202: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
   });
 }
 
