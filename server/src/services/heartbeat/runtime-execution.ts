@@ -1,4 +1,5 @@
 import { parseNativeSessionGoalControl } from "./scheduling.js";
+import { configuredRunMcpServers, mintRunMcpServers } from "../run-mcp-servers.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
   PAPERCLIP_WAKE_PAYLOAD_KEY,
@@ -770,6 +771,21 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
+      }
+      // Operator-configured direct MCP servers (PAPERCLIP_RUN_MCP_SERVERS_FILE),
+      // each with a token obtained for this run. A failure leaves only that
+      // server out; the reason never includes a token or response body.
+      const runMcp = await mintRunMcpServers(configuredRunMcpServers(), {
+        companyId: agent.companyId,
+        agentId: agent.id,
+      });
+      runtimeMcpServers.push(...runMcp.servers);
+      for (const server of runMcp.servers) {
+        await onLog("stdout", `[paperclip] MCP server "${server.name}" added with a run-scoped token.\n`);
+      }
+      for (const { name, reason } of runMcp.unavailable) {
+        logger.warn({ companyId: agent.companyId, agentId: agent.id, runId: run.id, server: name, reason }, "run MCP server token unavailable");
+        await onLog("stderr", `[paperclip] MCP server "${name}" is unavailable for this run (${reason}).\n`);
       }
       const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {

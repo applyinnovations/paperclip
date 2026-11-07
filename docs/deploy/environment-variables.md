@@ -216,6 +216,19 @@ Use either the file or the single-App variables. Setting both refuses startup.
 | `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | (unset) | Single shared App: comma-separated company IDs allowed to use it |
 | `PAPERCLIP_GITHUB_APP_REPOSITORIES` | (unset) | Single shared App: optional repository names to scope tokens to |
 
+## Run-scoped MCP servers
+
+Operator-run MCP servers that agent runs call directly, with a bearer token the
+server obtains for each run (OAuth 2.0 client credentials, client secret in
+the request's Basic header). Only the server reads the client secret; the run
+receives the access token in its MCP config (Claude and Codex local adapters).
+If a token cannot be obtained the run starts without that server and logs the
+reason. Native Paperclip Runner sessions do not receive these servers.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_RUN_MCP_SERVERS_FILE` | (unset) | Path to a JSON file: `{"servers":[{"name","url","companyIds","agentIds"?,"tokenUrl","clientId","clientSecretFile","scope"}]}`. `name` is the MCP server name agents see; `agentIds` limits it to those agents (omit for every agent of the companies); `tokenUrl` must be HTTPS; `scope` is space-separated and every scope must be granted. Unknown keys, malformed IDs, duplicate names, or an unreadable or empty secret file refuse startup |
+
 ## Secrets
 
 | Variable | Default | Description |

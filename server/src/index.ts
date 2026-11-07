@@ -115,6 +115,7 @@ import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runt
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { checkGitHubAppsConfigAtStartup } from "./services/github-app-config.js";
+import { checkRunMcpServersConfigAtStartup } from "./services/run-mcp-servers.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -683,6 +684,11 @@ async function startServerWithDatabaseTeardown(
     logger.warn({ error: githubApps.error }, "GitHub App configuration is invalid; GitHub App credentials are unavailable");
   } else if (githubApps.status === "enabled") {
     logger.info({ source: githubApps.source, apps: githubApps.apps }, "GitHub App credentials configured");
+  }
+  // Run-scoped MCP server tokens fail closed: a bad file or unreadable client secret stops startup.
+  const runMcpServers = await checkRunMcpServersConfigAtStartup();
+  if (runMcpServers.status === "enabled") {
+    logger.info({ servers: runMcpServers.servers }, "Run-scoped MCP servers configured");
   }
   
   if (config.deploymentMode === "authenticated") {
