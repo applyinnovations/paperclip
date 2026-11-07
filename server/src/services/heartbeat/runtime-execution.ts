@@ -1,4 +1,5 @@
 import { parseNativeSessionGoalControl } from "./scheduling.js";
+import { configuredRunMcpServers, runMcpServersForRun } from "../run-mcp-servers.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
   PAPERCLIP_WAKE_PAYLOAD_KEY,
@@ -30,7 +31,7 @@ import {
 } from "../native-runtime/native-workspace-finalization-ownership.js";
 import { createRunUsageRecorder } from "../usage-receipts.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { deriveAgentUrlKey, hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isConversation } from "../agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
@@ -770,6 +771,19 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
+      }
+      // Operator-run MCP servers (PAPERCLIP_RUN_MCP_SERVERS_FILE) for allowed
+      // agents, reached through this server's /api/run-mcp proxy with the
+      // run's own JWT. The upstream credential never enters the run.
+      const runMcpServers = runMcpServersForRun(configuredRunMcpServers(), {
+        companyId: agent.companyId,
+        agentUrlKey: deriveAgentUrlKey(agent.name, agent.id),
+        runToken: authToken,
+        apiBaseUrl: configuredPaperclipApiBaseUrl() ? paperclipApiBaseUrl() : null,
+      });
+      runtimeMcpServers.push(...runMcpServers);
+      for (const server of runMcpServers) {
+        await onLog("stdout", `[paperclip] MCP server "${server.name}" added through the Paperclip run proxy.\n`);
       }
       const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {

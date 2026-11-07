@@ -216,6 +216,22 @@ Use either the file or the single-App variables. Setting both refuses startup.
 | `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | (unset) | Single shared App: comma-separated company IDs allowed to use it |
 | `PAPERCLIP_GITHUB_APP_REPOSITORIES` | (unset) | Single shared App: optional repository names to scope tokens to |
 
+## Run-scoped MCP servers
+
+Operator-run MCP servers that allowed agents use through this server. A run
+of a listed company whose agent URL key is listed gets an MCP server at
+`/api/run-mcp/<name>`, authenticated with the run's own agent JWT (Claude and
+Codex local adapters). Each request rechecks that the run is active and the
+agent allowed, then goes to the upstream `url` with an access token the
+server obtains with OAuth client credentials and refreshes before expiry.
+Agents never see the client secret or the upstream token, and access ends
+with the run. Native Paperclip Runner sessions (`paperclip_runner`) do not
+receive these servers.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_RUN_MCP_SERVERS_FILE` | (unset) | Path to a JSON file: `{"servers":[{"name","url","companyIds","agents","tokenUrl","clientId","clientSecretFile","scope"}]}`. `name` is the MCP server name agents see; `agents` is a required allowlist of agent URL keys (the agent name lowercased with dashes, e.g. `cycle-time-engineer`; renaming an agent changes its key); `tokenUrl` must be HTTPS; every scope in `scope` must be granted. Unknown keys, malformed values, duplicate names, or an unreadable or empty secret file refuse startup |
+
 ## Secrets
 
 | Variable | Default | Description |
