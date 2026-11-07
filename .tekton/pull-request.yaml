@@ -1,4 +1,4 @@
-# Required check "test-affected" on pull requests into xlab:
+# Required check "tekton-xlab / test-affected" on pull requests into xlab:
 # frozen install, typecheck, build and the tests affected by the change, with
 # the .xlab toolchain.
 # Sandboxed Nix in its own store (nix-v1); no credentials beyond PaC's
