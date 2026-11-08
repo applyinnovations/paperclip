@@ -43,12 +43,13 @@ without credentials (run it locally to see the plan); the pipeline's publish
 task, which holds the GitHub token and runs no repository code, pushes and opens
 the PR.
 
-The publish task uses `paperclip-intake-push-token` (tekton-buildkit), a
-fine-grained token for this repository only with Contents, Workflows, Pull
-requests and Issues write. Upstream changes `.github/workflows/`, which the
-Pipelines-as-Code GitHub App is not allowed to push. GitHub Actions is disabled
-on this fork, so those workflow files never run here. The clone still uses the
-App token.
+The publish task pushes `master` and `upstream/<tag>` over SSH with
+`paperclip-intake-deploy-key` (tekton-buildkit), a write deploy key for this
+repository. Upstream changes `.github/workflows/`, which the Pipelines-as-Code
+GitHub App is not allowed to push, and the "master mirrors upstream" ruleset
+lets only this deploy key and the App update `master`. GitHub Actions is
+disabled on this fork, so those workflow files never run here. The clone and
+the pull request use the run's App token.
 
 - No database migration paths changed and no conflicts: auto-merge is enabled,
   so GitHub merges with a merge commit once the required checks pass.
