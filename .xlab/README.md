@@ -51,12 +51,13 @@ lets only this deploy key and the App update `master`. GitHub Actions is
 disabled on this fork, so those workflow files never run here. The clone and
 the pull request use the run's App token.
 
-- No database migration paths changed, no conflicts, and every upstream
-  check on the release commit passed: auto-merge is enabled, so GitHub merges
-  with a merge commit once the required checks pass.
+- No database migration paths changed, no `.tekton/` or `.xlab/` paths
+  changed, no conflicts, and every upstream check on the release commit
+  passed: auto-merge is enabled, so GitHub merges with a merge commit once
+  the required checks pass.
 - Otherwise the PR is labelled `needs-review: db-migration`,
-  `needs-review: conflict` and/or `needs-review: upstream-ci` and waits for a
-  person. Resolve conflicts on the `upstream/<tag>` branch, keeping the
+  `needs-review: ci-config`, `needs-review: conflict` and/or
+  `needs-review: upstream-ci` and waits for a person. Resolve conflicts on the `upstream/<tag>` branch, keeping the
   carried patches.
 
 Upstream runs its full test suite on its own runners and verifies a
@@ -71,6 +72,12 @@ path containing `migrat` or `drizzle`. A false positive only costs a review.
 
 Paperclip records applied migrations by content hash, so migrations only on an
 old branch are ignored rather than blocking newer ones.
+
+`xlab` is the default branch, so Pipelines-as-Code runs its `.tekton/`, and
+those pipelines run `.xlab/` and hold the intake's deploy key. The fork is
+public and auto-merges upstream, so a release that touched those paths could
+otherwise give upstream our CI credentials; `needs-review: ci-config` stops
+that. Upstream has neither directory today.
 
 ## Shipping
 

@@ -10,8 +10,9 @@
 #   3. If xlab already contains it, or a PR for it exists, plan nothing more.
 #   4. Otherwise plan branch upstream/<tag> at the release commit and a PR into
 #      xlab, auto-merged (merge commit, after the required checks pass) only
-#      when the release touches no database migration paths, merges without
-#      conflicts and upstream's own checks on the release commit all passed.
+#      when the release touches no database migration paths and no fork CI
+#      paths, merges without conflicts and upstream's own checks on the
+#      release commit all passed.
 #      Otherwise the PR is labelled for review.
 #
 #   nix develop ./.xlab --command .xlab/upstream-intake.sh OUT_DIR
@@ -27,6 +28,10 @@ base=${BASE_BRANCH:-xlab}
 # Conservative: anything that can change the database schema or data counts.
 # When in doubt a path belongs here; a false positive only means a human review.
 migration_re='(^|/)(migrations?|schema)(/|$)|\.sql$|migrat|drizzle|^packages/db/'
+# The fork's CI: PaC runs .tekton/ from xlab (the default branch), and its
+# pipelines run .xlab/ and hold the intake's credentials. A release that adds
+# or changes either must never reach xlab without a person reading it.
+ci_re='^(\.tekton|\.xlab)/'
 
 mkdir -p "${out}"
 out=$(cd "${out}" && pwd)
@@ -62,6 +67,7 @@ fi
 
 merge_base=$(git merge-base "origin/${base}" "${commit}")
 migrations=$(git diff --name-only "${merge_base}" "${commit}" | grep -E "${migration_re}" || true)
+ci_changes=$(git diff --name-only "${merge_base}" "${commit}" | grep -E "${ci_re}" || true)
 
 # Upstream verifies a release's exact source before publishing it, and its
 # full test suite runs there, on its own runners. Trust that result instead of
@@ -102,6 +108,14 @@ fi
     echo "Database migrations: none detected (rule: \`${migration_re}\`)."
   fi
   echo
+  if [ -n "${ci_changes}" ]; then
+    echo "**Fork CI paths changed upstream:** this release adds or changes files under \`.tekton/\` or \`.xlab/\`, which run in our CI with its credentials. Review before merging; this PR is not auto-merged."
+    echo
+    echo '```'
+    echo "${ci_changes}" | head -100
+    echo '```'
+    echo
+  fi
   if [ -n "${upstream_unverified}" ]; then
     echo "**Upstream checks on the release commit did not all pass:** review before merging; this PR is not auto-merged."
     echo
@@ -128,8 +142,9 @@ fi
   [ -z "${migrations}" ] || echo "needs-review: db-migration"
   [ -z "${conflicts}" ] || echo "needs-review: conflict"
   [ -z "${upstream_unverified}" ] || echo "needs-review: upstream-ci"
+  [ -z "${ci_changes}" ] || echo "needs-review: ci-config"
 } > "${out}/labels"
-if [ -z "${migrations}" ] && [ -z "${conflicts}" ] && [ -z "${upstream_unverified}" ]; then
+if [ -z "${migrations}" ] && [ -z "${conflicts}" ] && [ -z "${upstream_unverified}" ] && [ -z "${ci_changes}" ]; then
   echo true > "${out}/automerge"
 else
   echo false > "${out}/automerge"
