@@ -90,10 +90,19 @@ scratch=$(mktemp -d)
 trap 'git worktree remove --force "${scratch}" >/dev/null 2>&1 || true' EXIT
 git worktree add --quiet --detach "${scratch}" "origin/${base}"
 conflicts=""
+merge_log="${scratch}.merge.log"
 if ! git -C "${scratch}" -c user.name=intake -c user.email=intake@xlab.invalid \
-    merge --no-commit --no-ff --quiet "${commit}" >/dev/null 2>&1; then
+    merge --no-commit --no-ff --quiet "${commit}" >"${merge_log}" 2>&1; then
   conflicts=$(git -C "${scratch}" diff --name-only --diff-filter=U)
+  # A merge that failed without leaving conflicted files did not run (missing
+  # objects, a git error): fail rather than report "no conflicts".
+  if [ -z "${conflicts}" ]; then
+    echo "trial merge of ${tag} into ${base} failed without conflicts:" >&2
+    cat "${merge_log}" >&2
+    exit 1
+  fi
 fi
+rm -f "${merge_log}"
 
 {
   echo "Merges upstream stable release [${tag}](https://github.com/${upstream}/releases/tag/${tag}) into \`${base}\`."

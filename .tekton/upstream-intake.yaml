@@ -60,8 +60,11 @@ spec:
           - { name: url, value: https://github.com/applyinnovations/paperclip.git }
           - { name: revision, value: $(params.revision) }
           - { name: expectedCommitSha, value: $(params.revision) }
-          # The plan needs history for merge bases; blobs stay lazy.
+          # The plan needs full history for merge bases and every blob for
+          # its trial merge: a blob:none clone would fetch missing blobs only
+          # from this fork, which lacks upstream's newer objects.
           - { name: depth, value: "0" }
+          - { name: objectFilter, value: none }
         workspaces:
           - { name: output, workspace: source }
           - { name: basic-auth, workspace: git-auth }
