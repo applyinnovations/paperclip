@@ -4,10 +4,12 @@
 # plan runs .xlab/upstream-intake.sh in sandboxed Nix with no credentials and
 # writes a plan; publish holds the GitHub token, runs no repository code and
 # takes every commit it pushes from upstream itself.
-# publish uses paperclip-intake-push-token, a fine-grained token for this fork
-# only with workflow write: upstream changes .github/workflows/, which the PaC
-# GitHub App may not push (no workflows permission, by design). Actions is
-# disabled on the fork, so those workflow files never run here.
+# publish pushes with paperclip-intake-deploy-key, a write deploy key for this
+# fork: upstream changes .github/workflows/, which the PaC GitHub App may not
+# push (no workflows permission, by design), and the "master mirrors upstream"
+# ruleset lets only this key (and the App) update master. Actions is disabled
+# on the fork, so those workflow files never run here. The pull request is
+# opened with the run's PaC App token.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -43,7 +45,7 @@ spec:
     workspaces:
       - name: source
       - name: git-auth
-      - name: intake-auth
+      - name: intake-deploy-key
       - name: plan
     tasks:
       - name: clone
@@ -81,12 +83,15 @@ spec:
         runAfter: [plan]
         workspaces:
           - { name: plan, workspace: plan }
-          - { name: git-auth, workspace: intake-auth }
+          - { name: git-auth, workspace: git-auth }
+          - { name: deploy-key, workspace: intake-deploy-key }
         taskSpec:
           workspaces:
             - name: plan
               readOnly: true
             - name: git-auth
+              readOnly: true
+            - name: deploy-key
               readOnly: true
           volumes:
             # This pod's own scratch on scratch-local; deleted with the pod and
@@ -118,7 +123,7 @@ spec:
               volumeMounts:
                 - { name: work, mountPath: /work }
               env:
-                - { name: AUTH_DIR, value: $(workspaces.git-auth.path) }
+                - { name: KEY_DIR, value: $(workspaces.deploy-key.path) }
                 - { name: PLAN, value: $(workspaces.plan.path)/intake }
               script: |
                 #!/bin/sh
@@ -127,15 +132,19 @@ spec:
                 trap wipe_scratch EXIT
                 fork=applyinnovations/paperclip
                 base=xlab
-                auth=$(printf 'x-access-token:%s' "$(cat "${AUTH_DIR}/git-provider-token")" | base64 -w 0)
-                # The token goes only to the fork, as a header, never to disk.
-                export HOME=/work/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=1 \
-                  GIT_CONFIG_KEY_0="http.https://github.com/${fork}.git.extraHeader" \
-                  GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}"
+                # The deploy key is read where the Secret mounts it, never
+                # copied. GitHub's host keys are pinned (api.github.com/meta).
+                export HOME=/work/home GIT_CONFIG_NOSYSTEM=1
                 mkdir -p "${HOME}"
+                cat > "${HOME}/known_hosts" <<'EOF'
+                github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+                github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+                github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+                EOF
+                export GIT_SSH_COMMAND="ssh -i ${KEY_DIR}/ssh-privatekey -o IdentitiesOnly=yes -o UserKnownHostsFile=${HOME}/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
                 git init --quiet --bare /work/repo
                 cd /work/repo
-                git remote add origin "https://github.com/${fork}.git"
+                git remote add origin "git@github.com:${fork}.git"
                 git remote add upstream https://github.com/paperclipai/paperclip.git
                 git fetch --quiet --no-tags --filter=blob:none origin \
                   "+refs/heads/${base}:refs/remotes/origin/${base}" \
@@ -189,7 +198,7 @@ spec:
                 import json, os, pathlib, re, sys, urllib.error, urllib.request
 
                 FORK, BASE = "applyinnovations/paperclip", "xlab"
-                LABELS = ["upstream", "needs-review: db-migration", "needs-review: conflict"]
+                LABELS = ["upstream", "needs-review: db-migration", "needs-review: conflict", "needs-review: upstream-ci", "needs-review: ci-config"]
                 pushed = pathlib.Path("/work/pushed-tag")
                 if not pushed.exists():
                     print("no release branch pushed; nothing to open")
@@ -257,10 +266,10 @@ spec:
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
-    # Key git-provider-token; fork-only token with workflow write (see top).
-    - name: intake-auth
+    # Key ssh-privatekey; write deploy key for this fork (see top).
+    - name: intake-deploy-key
       secret:
-        secretName: paperclip-intake-push-token
+        secretName: paperclip-intake-deploy-key
     # The plan task's output for publish: a few small files.
     - name: plan
       volumeClaimTemplate:
