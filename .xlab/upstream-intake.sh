@@ -10,8 +10,9 @@
 #   3. If xlab already contains it, or a PR for it exists, plan nothing more.
 #   4. Otherwise plan branch upstream/<tag> at the release commit and a PR into
 #      xlab, auto-merged (merge commit, after the required checks pass) only
-#      when the release touches no database migration paths and merges without
-#      conflicts. Otherwise the PR is labelled for review.
+#      when the release touches no database migration paths, merges without
+#      conflicts and upstream's own checks on the release commit all passed.
+#      Otherwise the PR is labelled for review.
 #
 #   nix develop ./.xlab --command .xlab/upstream-intake.sh OUT_DIR
 #
@@ -62,6 +63,23 @@ fi
 merge_base=$(git merge-base "origin/${base}" "${commit}")
 migrations=$(git diff --name-only "${merge_base}" "${commit}" | grep -E "${migration_re}" || true)
 
+# Upstream verifies a release's exact source before publishing it, and its
+# full test suite runs there, on its own runners. Trust that result instead of
+# re-running the suite: any upstream check on the release commit that did not
+# pass (or no passing check at all) means a person looks first.
+upstream_checks=""
+page=1
+while :; do
+  runs=$(github_api "repos/${upstream}/commits/${commit}/check-runs?filter=latest&per_page=100&page=${page}")
+  upstream_checks+=$(jq -r '.check_runs[] | "\(.conclusion // .status)\t\(.name)"' <<<"${runs}")$'\n'
+  [ "$(jq '.check_runs | length' <<<"${runs}")" -lt 100 ] && break
+  page=$((page + 1))
+done
+upstream_unverified=$(grep -vE $'^(success|skipped|neutral)\t|^$' <<<"${upstream_checks}" | sort -u || true)
+if ! grep -qE $'^success\t' <<<"${upstream_checks}"; then
+  upstream_unverified="no passing upstream check on ${commit}"
+fi
+
 scratch=$(mktemp -d)
 trap 'git worktree remove --force "${scratch}" >/dev/null 2>&1 || true' EXIT
 git worktree add --quiet --detach "${scratch}" "origin/${base}"
@@ -84,6 +102,16 @@ fi
     echo "Database migrations: none detected (rule: \`${migration_re}\`)."
   fi
   echo
+  if [ -n "${upstream_unverified}" ]; then
+    echo "**Upstream checks on the release commit did not all pass:** review before merging; this PR is not auto-merged."
+    echo
+    echo '```'
+    echo "${upstream_unverified}" | head -50
+    echo '```'
+  else
+    echo "Upstream checks on the release commit: all passed."
+  fi
+  echo
   if [ -n "${conflicts}" ]; then
     echo "**Merge conflicts with ${base}:** resolve on this branch, keeping the xlab patches."
     echo
@@ -99,8 +127,9 @@ fi
   echo upstream
   [ -z "${migrations}" ] || echo "needs-review: db-migration"
   [ -z "${conflicts}" ] || echo "needs-review: conflict"
+  [ -z "${upstream_unverified}" ] || echo "needs-review: upstream-ci"
 } > "${out}/labels"
-if [ -z "${migrations}" ] && [ -z "${conflicts}" ]; then
+if [ -z "${migrations}" ] && [ -z "${conflicts}" ] && [ -z "${upstream_unverified}" ]; then
   echo true > "${out}/automerge"
 else
   echo false > "${out}/automerge"

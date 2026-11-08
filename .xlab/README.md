@@ -51,11 +51,19 @@ lets only this deploy key and the App update `master`. GitHub Actions is
 disabled on this fork, so those workflow files never run here. The clone and
 the pull request use the run's App token.
 
-- No database migration paths changed and no conflicts: auto-merge is enabled,
-  so GitHub merges with a merge commit once the required checks pass.
-- Otherwise the PR is labelled `needs-review: db-migration` and/or
-  `needs-review: conflict` and waits for a person. Resolve conflicts on the
-  `upstream/<tag>` branch, keeping the carried patches.
+- No database migration paths changed, no conflicts, and every upstream
+  check on the release commit passed: auto-merge is enabled, so GitHub merges
+  with a merge commit once the required checks pass.
+- Otherwise the PR is labelled `needs-review: db-migration`,
+  `needs-review: conflict` and/or `needs-review: upstream-ci` and waits for a
+  person. Resolve conflicts on the `upstream/<tag>` branch, keeping the
+  carried patches.
+
+Upstream runs its full test suite on its own runners and verifies a
+release's exact source before publishing it, so the intake trusts those
+results (its checks on the release commit) rather than re-running them. Our
+nightly `test-full` run is there to catch what our patches and our CI
+environment change.
 
 The migration rule is deliberately broad (`migration_re` in the script):
 `packages/db/**`, any `migration(s)` or `schema` directory, `*.sql`, and any
