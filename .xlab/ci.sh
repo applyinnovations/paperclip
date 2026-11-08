@@ -83,7 +83,7 @@ if $fhs_ci; then
 fi
 # Pull requests run the test files they add or change. Import-graph selection
 # (vitest --changed) still picks most of the suite for any server change, and
-# the full suite takes 40+ minutes, so it runs nightly from
+# the full suite takes about 2 hours, so it runs weekly from
 # .tekton/full-tests.yaml and before a deploy.
 if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"

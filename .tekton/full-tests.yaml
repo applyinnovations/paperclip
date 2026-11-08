@@ -1,6 +1,8 @@
-# Nightly full test suite on xlab (40+ minutes), triggered through the PaC
-# incoming webhook by xlab-deployments' nightly-cron-trigger. Not a required
-# check; failures show on the xlab commit.
+# Weekly full test suite on xlab (about 2 hours on one pod; upstream spreads
+# it over ~25 jobs), triggered on Sundays (UTC) through the PaC incoming
+# webhook by deployments' nightly-cron-trigger. Not a required check;
+# failures show on the xlab commit. Pull requests, including upstream
+# intake ones, test only what differs from tested source (.xlab/ci.sh).
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -25,7 +27,7 @@ spec:
       nodeSelector:
         storage.xlab.now/fast-local: "true"
   timeouts:
-    pipeline: 120m
+    pipeline: 250m
   taskRunSpecs:
     - pipelineTaskName: checks
       podTemplate:
@@ -57,7 +59,7 @@ spec:
           - { name: output, workspace: source }
           - { name: basic-auth, workspace: git-auth }
       - name: checks
-        timeout: 110m
+        timeout: 240m
         runAfter: [clone]
         taskRef:
           resolver: cluster
