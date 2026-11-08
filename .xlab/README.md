@@ -29,6 +29,10 @@ stays reachable from it.
    runs it nightly on `xlab`; check it is green before shipping. Run the
    PR checks locally with
    `CI_TEST_SCOPE=changed CI_BASE_REF=origin/xlab nix develop ./.xlab --command .xlab/ci.sh`.
+   In Tekton, `ci.sh` first makes the nixos/nix image look like upstream's
+   Ubuntu runner (FHS loader, the toolchain in `/usr/bin`, an unprivileged
+   test user under a child reaper) rather than editing upstream's tests.
+   When a test fails only in our CI, fix that environment first.
 3. Add or update the change's row in [PATCHES.md](PATCHES.md).
 4. If the change is general-purpose, offer it upstream and link the PR. Once
    upstream ships it, the next intake merge carries upstream's version; remove

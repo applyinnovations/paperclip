@@ -24,6 +24,23 @@
           pkgs.gnused
           pkgs.bash
           pkgs.cacert
+          # Upstream CI runs on Ubuntu, and tests use what it ships: ci.sh
+          # links the toolchain into /usr/bin for tests that start children
+          # with PATH=/usr/bin:/bin, finds port owners with lsof, opens PTYs
+          # with python3, and drops to an unprivileged user (setpriv) under
+          # a child reaper (tini).
+          pkgs.getconf
+          pkgs.procps
+          pkgs.util-linux
+          pkgs.gnutar
+          pkgs.gzip
+          pkgs.lsof
+          pkgs.iproute2
+          pkgs.psmisc
+          pkgs.openssh
+          pkgs.python3
+          pkgs.tini
+          pkgs.which
           # paperclip-runner's typecheck and build run cargo (fmt, check and
           # the runnerd release binary). It pins Rust 1.97.1 for rustup; plain
           # cargo ignores rust-toolchain.toml and builds it with nixpkgs' Rust.
@@ -35,8 +52,11 @@
         # as upstream CI does; nixpkgs' pnpm 9 is marked end-of-life.
         COREPACK_ENABLE_DOWNLOAD_PROMPT = "0";
         COREPACK_ENABLE_AUTO_PIN = "0";
-        # ci.sh links this glibc's loader into /lib64 on loader-less CI images.
+        # ci.sh links this glibc's loader into /lib64 on loader-less CI images,
+        # and this libstdc++ beside embedded Postgres' bundled ICU, which
+        # expects the distribution's.
         XLAB_GLIBC = "${pkgs.glibc}";
+        XLAB_LIBSTDCXX = "${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6";
       };
     };
 }
