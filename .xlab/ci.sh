@@ -87,7 +87,28 @@ fi
 # .tekton/full-tests.yaml and before a deploy.
 if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
-  mapfile -t tests < <(git diff --name-only --diff-filter=AMR "$CI_BASE_REF" HEAD \
+  diff_base=$CI_BASE_REF
+  # An upstream intake pull request merges a stable release, changing
+  # hundreds of upstream test files that upstream's CI already ran on that
+  # exact commit. When HEAD contains an upstream stable release the base
+  # does not, compare with that release instead: the tests that run are the
+  # ones that differ from upstream's (carried patches, the merge resolution,
+  # anything else the PR changes). Decided from history, not branch names.
+  git fetch --quiet --no-tags --filter=blob:none https://github.com/paperclipai/paperclip.git \
+    '+refs/tags/v*:refs/ci/upstream-tags/v*'
+  mapfile -t releases < <(git for-each-ref --sort=-v:refname --format='%(refname:lstrip=3)' refs/ci/upstream-tags/ \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+  for release in "${releases[@]}"; do
+    if git merge-base --is-ancestor "refs/ci/upstream-tags/${release}" HEAD &&
+      ! git merge-base --is-ancestor "refs/ci/upstream-tags/${release}" "$CI_BASE_REF"; then
+      diff_base="refs/ci/upstream-tags/${release}"
+      echo "::: upstream intake of ${release}: selecting tests that differ from upstream's release"
+      break
+    fi
+  done
+  # --no-renames: a renamed test counts as added, and the diff never needs a
+  # blob the partial clone lacks.
+  mapfile -t tests < <(git diff --name-only --no-renames --diff-filter=AM "$diff_base" HEAD \
     | grep -E '\.test\.(ts|tsx|mts|js|mjs)$' || true)
   # Packages excluded from the pnpm workspace (sandbox providers) install
   # standalone without a lockfile, as upstream builds them, and run their own

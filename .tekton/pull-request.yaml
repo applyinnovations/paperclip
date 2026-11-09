@@ -58,6 +58,9 @@ spec:
           - { name: expectedCommitSha, value: $(params.revision) }
           - name: additionalRefspecs
             value: +refs/heads/$(params.target-branch):refs/remotes/origin/ci-base
+          # Full history (blobs stay lazy): ci.sh checks which upstream
+          # releases the change brings in.
+          - { name: depth, value: "0" }
         workspaces:
           - { name: output, workspace: source }
           - { name: basic-auth, workspace: git-auth }
