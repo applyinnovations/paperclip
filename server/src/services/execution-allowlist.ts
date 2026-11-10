@@ -38,6 +38,13 @@ export const KUBERNETES_PROVIDER_KEY = "kubernetes" as const;
  */
 export interface ExecutionPolicy {
   executionMode?: "kubernetes" | "any";
+  /**
+   * Sandbox providers (plugin driver keys) also allowed while
+   * `executionMode` is `"kubernetes"`. Kubernetes stays allowed and stays the
+   * default; only an environment the agent or instance explicitly selects
+   * runs on a listed provider. Never widens local or ssh execution.
+   */
+  allowedSandboxProviders?: readonly string[];
   managedSandboxOnly?: boolean;
 }
 
@@ -81,12 +88,28 @@ export function isKubernetesSandboxEnvironment(
 }
 
 /**
+ * True iff the candidate is a sandbox environment on a provider the policy
+ * allows besides Kubernetes (`allowedSandboxProviders`).
+ */
+export function isAllowedAdditionalSandboxEnvironment(
+  policy: ExecutionPolicy | null | undefined,
+  candidate: ExecutionEnvironmentCandidate,
+): boolean {
+  return (
+    candidate.driver === "sandbox" &&
+    typeof candidate.provider === "string" &&
+    candidate.provider !== KUBERNETES_PROVIDER_KEY &&
+    (policy?.allowedSandboxProviders ?? []).includes(candidate.provider)
+  );
+}
+
+/**
  * Decide whether the candidate environment may run under the given policy.
  *
- * When `executionMode === "kubernetes"`, ONLY a `sandbox_provider` driver with
- * provider/driverKey "kubernetes" is allowed; a `local` driver (or any non-k8s
- * sandbox provider, or ssh, or plugin) is DENIED. Otherwise everything is
- * allowed.
+ * When `executionMode === "kubernetes"`, only a `sandbox_provider` driver with
+ * provider/driverKey "kubernetes", or one listed in `allowedSandboxProviders`,
+ * is allowed; a `local` driver, ssh, or any other sandbox provider is DENIED.
+ * Otherwise everything is allowed.
  */
 export function evaluateExecutionAllowlist(
   policy: ExecutionPolicy | null | undefined,
@@ -95,7 +118,10 @@ export function evaluateExecutionAllowlist(
   const provider = candidate.provider ?? null;
 
   if (isExecutionForcedToKubernetes(policy)) {
-    if (isKubernetesSandboxEnvironment(candidate)) {
+    if (
+      isKubernetesSandboxEnvironment(candidate) ||
+      isAllowedAdditionalSandboxEnvironment(policy, candidate)
+    ) {
       return { allowed: true };
     }
     const target =

@@ -449,9 +449,17 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   // Setting-driven: resolve whether the instance forces Kubernetes execution and
   // which loaded environment is the managed Kubernetes sandbox.
-  const { forced: forcedKubernetes, kubernetesEnvironment } = useMemo(
-    () => resolveForcedKubernetesEnvironment(generalSettings?.executionMode, environments),
-    [generalSettings?.executionMode, environments],
+  const {
+    forced: forcedKubernetes,
+    kubernetesEnvironment,
+    allowedEnvironments: allowedSandboxEnvironments,
+  } = useMemo(
+    () => resolveForcedKubernetesEnvironment(
+      generalSettings?.executionMode,
+      environments,
+      generalSettings?.allowedSandboxProviders,
+    ),
+    [generalSettings?.executionMode, generalSettings?.allowedSandboxProviders, environments],
   );
   const createSecret = useMutation({
     mutationFn: (input: { name: string; value: string }) => {
@@ -927,8 +935,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   useEffect(() => {
     if (!isCreate || !set || !forcedKubernetes || !kubernetesEnvironment) return;
     if (currentDefaultEnvironmentId === kubernetesEnvironment.id) return;
+    // An environment on a sandbox provider the policy also allows is a valid
+    // explicit choice; keep it.
+    if (allowedSandboxEnvironments.some((environment) => environment.id === currentDefaultEnvironmentId)) return;
     set({ defaultEnvironmentId: kubernetesEnvironment.id });
-  }, [isCreate, set, forcedKubernetes, kubernetesEnvironment, currentDefaultEnvironmentId]);
+  }, [isCreate, set, forcedKubernetes, kubernetesEnvironment, allowedSandboxEnvironments, currentDefaultEnvironmentId]);
 
   const runnableEnvironments = useMemo(
     () => environments.filter((environment) => {
@@ -1638,9 +1649,36 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           <div className={cn(cards ? "border border-border rounded-lg p-4 space-y-3" : "px-4 pb-3 space-y-3")}>
             <Field
               label="Default environment"
-              hint="This instance runs all agents in the Kubernetes sandbox. Local execution is disabled."
+              hint={allowedSandboxEnvironments.length > 0
+                ? "Agents run in the Kubernetes sandbox unless they select an allowed sandbox environment. Local execution is disabled."
+                : "This instance runs all agents in the Kubernetes sandbox. Local execution is disabled."}
             >
-              {kubernetesEnvironment ? (
+              {kubernetesEnvironment && allowedSandboxEnvironments.length > 0 ? (
+                // The policy also allows other sandbox providers: the agent may
+                // pick one of those; Kubernetes stays the default.
+                <SelectPopover
+                  aria-label="Default environment"
+                  value={
+                    allowedSandboxEnvironments.some((environment) => environment.id === currentDefaultEnvironmentId)
+                      ? currentDefaultEnvironmentId
+                      : kubernetesEnvironment.id
+                  }
+                  onValueChange={(nextValue) => {
+                    if (isCreate) {
+                      set!({ defaultEnvironmentId: nextValue });
+                      return;
+                    }
+                    mark("identity", "defaultEnvironmentId", nextValue || null);
+                  }}
+                  options={[
+                    { value: kubernetesEnvironment.id, label: `${kubernetesEnvironment.name} · Kubernetes sandbox` },
+                    ...allowedSandboxEnvironments.map((environment) => ({
+                      value: environment.id,
+                      label: environmentDisplayLabel(environment),
+                    })),
+                  ]}
+                />
+              ) : kubernetesEnvironment ? (
                 <div className={cn(inputClass, "flex items-center text-muted-foreground")}>
                   {kubernetesEnvironment.name} · Kubernetes sandbox
                 </div>

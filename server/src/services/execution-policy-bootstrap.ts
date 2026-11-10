@@ -28,7 +28,34 @@ export type ExecutionPolicyBootstrapEnv = Record<string, string | undefined>;
 
 export interface ExecutionPolicyBootstrap {
   executionMode: Extract<InstanceExecutionMode, "kubernetes">;
+  /** Sandbox providers also allowed (`PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS`). */
+  allowedSandboxProviders: string[];
   kubernetesConfig: KubernetesEnvironmentConfigInput;
+}
+
+const SANDBOX_PROVIDER_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+
+/**
+ * Parse `PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS`: a comma-separated
+ * list of sandbox provider keys (plugin driver keys) that agents may run on
+ * besides Kubernetes. Kubernetes is always allowed, so naming it is an error,
+ * as is any key that cannot be a driver key.
+ */
+function parseAllowedSandboxProviders(value: string | undefined): string[] {
+  const keys = [...new Set(parseList(value) ?? [])];
+  for (const key of keys) {
+    if (!SANDBOX_PROVIDER_KEY_PATTERN.test(key) || key.length > 100) {
+      throw new Error(
+        `PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS entries must be sandbox provider keys (got "${key}").`,
+      );
+    }
+    if (key === "kubernetes") {
+      throw new Error(
+        "PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS lists providers besides kubernetes; kubernetes is always allowed.",
+      );
+    }
+  }
+  return keys;
 }
 
 function parseBool(value: string | undefined): boolean | undefined {
@@ -71,7 +98,14 @@ export function parseExecutionPolicyBootstrapEnv(
   env: ExecutionPolicyBootstrapEnv,
 ): ExecutionPolicyBootstrap | null {
   const raw = env.PAPERCLIP_EXECUTION_MODE?.trim();
-  if (!raw || raw === "any") return null;
+  if (!raw || raw === "any") {
+    if (env.PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS?.trim()) {
+      throw new Error(
+        "PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS only applies with PAPERCLIP_EXECUTION_MODE=kubernetes.",
+      );
+    }
+    return null;
+  }
   if (raw !== "kubernetes") {
     throw new Error(
       `PAPERCLIP_EXECUTION_MODE must be "kubernetes" or "any" (got "${raw}").`,
@@ -128,7 +162,13 @@ export function parseExecutionPolicyBootstrapEnv(
   const adapters = parseAdapterRegistryEnv(env);
   if (adapters) kubernetesConfig.adapters = adapters;
 
-  return { executionMode: "kubernetes", kubernetesConfig };
+  return {
+    executionMode: "kubernetes",
+    allowedSandboxProviders: parseAllowedSandboxProviders(
+      env.PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS,
+    ),
+    kubernetesConfig,
+  };
 }
 
 /**
@@ -143,7 +183,11 @@ export async function applyExecutionPolicyBootstrap(
   const instanceSettings = instanceSettingsService(db);
   const environments = environmentService(db);
 
-  await instanceSettings.updateGeneral({ executionMode: bootstrap.executionMode });
+  // Written on every boot, so removing a provider from the env revokes it.
+  await instanceSettings.updateGeneral({
+    executionMode: bootstrap.executionMode,
+    allowedSandboxProviders: bootstrap.allowedSandboxProviders,
+  });
 
   const companyIds = await instanceSettings.listCompanyIds();
   let configured = 0;
@@ -164,6 +208,7 @@ export async function applyExecutionPolicyBootstrap(
   logger.info(
     {
       executionMode: bootstrap.executionMode,
+      allowedSandboxProviders: bootstrap.allowedSandboxProviders,
       companiesConfigured: configured,
       backend: bootstrap.kubernetesConfig.backend,
       runtimeClassName: bootstrap.kubernetesConfig.runtimeClassName,

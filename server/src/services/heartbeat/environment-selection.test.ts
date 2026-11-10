@@ -227,6 +227,27 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     expect(result.useIsolatedTaskDirectory).toBe(true);
   });
 
+  it("keeps an agent's environment on a sandbox provider the forced Kubernetes policy also allows", async () => {
+    const { input } = await fixture();
+    await instanceSettingsService(db).updateGeneral({ executionMode: "kubernetes", allowedSandboxProviders: ["mac-lanes"] });
+    try {
+      const [kubernetes] = await db.insert(environments).values({ name: "Kubernetes", driver: "sandbox", status: "active", config: { provider: "kubernetes" }, metadata: { managedKubernetesSandbox: true } }).returning();
+      const [macLanes] = await db.insert(environments).values({ name: "mac-lanes", driver: "sandbox", status: "active", config: { provider: "mac-lanes" } }).returning();
+      const [unlisted] = await db.insert(environments).values({ name: "Other sandbox", driver: "sandbox", status: "active", config: { provider: "fake" } }).returning();
+
+      input.agent.defaultEnvironmentId = macLanes.id;
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(macLanes.id);
+
+      input.agent.defaultEnvironmentId = unlisted.id;
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(kubernetes.id);
+
+      input.agent.defaultEnvironmentId = null;
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(kubernetes.id);
+    } finally {
+      await instanceSettingsService(db).updateGeneral({ executionMode: "any", allowedSandboxProviders: [] });
+    }
+  });
+
   it("returns the task-owned local chat root before workspace realization", async () => {
     const { input, issue } = await fixture();
     await db.update(issues).set({ originKind: "chat_channel", projectId: null }).where(eq(issues.id, issue.id));
