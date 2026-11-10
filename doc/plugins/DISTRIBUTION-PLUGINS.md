@@ -50,7 +50,9 @@ is recorded as a plugin error without taking down the application.
 
 The catalog alone does not auto-enable plugins on self-hosted instances.
 Operators can explicitly install catalog entries through the normal plugin
-CLI. The package's manifest ID and version must match the catalog.
+CLI, or select them at boot with `PAPERCLIP_PLUGIN_AUTO_INSTALL`, a
+comma-separated key list that replaces the self-hosted default (`kubernetes`)
+and then gates activation like a managed `plugins.autoInstall`. The package's manifest ID and version must match the catalog.
 The manifest's worker and optional UI entrypoints must match the verified
 `package.json` declarations and stay inside the bundle.
 

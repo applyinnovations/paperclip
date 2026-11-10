@@ -9,6 +9,7 @@ import {
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
+  resolveSelfHostedAutoInstallKeys,
   type BundledPluginProvisionerDeps,
   type ResolvedBundledPlugin,
 } from "../services/bundled-plugins.js";
@@ -189,6 +190,28 @@ describe("resolveBundledPluginInstalls", () => {
       enforceCatalogRoot: true,
     });
     expect(resolved).toHaveLength(BUNDLED_PLUGIN_CATALOG.length);
+  });
+});
+
+describe("resolveSelfHostedAutoInstallKeys", () => {
+  it("keeps the built-in default when PAPERCLIP_PLUGIN_AUTO_INSTALL is unset or blank", () => {
+    expect(resolveSelfHostedAutoInstallKeys({})).toBeNull();
+    expect(resolveSelfHostedAutoInstallKeys({ PAPERCLIP_PLUGIN_AUTO_INSTALL: "  " })).toBeNull();
+  });
+
+  it("replaces the default with the operator's trimmed, deduplicated keys", () => {
+    expect(resolveSelfHostedAutoInstallKeys({ PAPERCLIP_PLUGIN_AUTO_INSTALL: "kubernetes, mac-lanes,,kubernetes" }))
+      .toEqual(["kubernetes", "mac-lanes"]);
+  });
+
+  it("refuses to start on a selected key that no catalog provides", () => {
+    const keys = resolveSelfHostedAutoInstallKeys({ PAPERCLIP_PLUGIN_AUTO_INSTALL: "kubernetes,not-shipped" })!;
+    expect(() => resolveBundledPluginInstalls(keys, {
+      catalogRoot: CATALOG_ROOT,
+      env: {},
+      enforceCatalogRoot: false,
+      distributionPlugins: [],
+    })).toThrow(/not-shipped/);
   });
 });
 

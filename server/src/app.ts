@@ -178,6 +178,7 @@ import {
 } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  resolveSelfHostedAutoInstallKeys,
   BUNDLED_PLUGIN_CATALOG,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
@@ -720,11 +721,16 @@ export async function createApp(
     res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? "")));
   });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
+  // A self-hosted operator may select bundled and distribution plugins with
+  // PAPERCLIP_PLUGIN_AUTO_INSTALL; the selection then also gates which
+  // distribution plugins may activate, as a managed list does.
+  const selfHostedAutoInstallKeys =
+    managedAutoInstallKeys === null ? resolveSelfHostedAutoInstallKeys(process.env) : null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
-    managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
+    managedAutoInstallKeys ?? selfHostedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
     {
       catalogRoot: bundledCatalogRoot,
       env: process.env,
@@ -1002,7 +1008,7 @@ export async function createApp(
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
-      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
+      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys ?? selfHostedAutoInstallKeys),
     },
     {
       workerManager,

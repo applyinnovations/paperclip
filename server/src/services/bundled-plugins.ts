@@ -113,6 +113,24 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
  */
 export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes"];
 
+/**
+ * Env var with which a self-hosted operator selects the bundled plugins to
+ * ensure at boot: a comma-separated list of catalog keys, built-in or from
+ * the image's distribution catalog. It replaces the default list, so name
+ * `kubernetes` too when it is wanted. Unknown keys refuse startup, like a
+ * managed `plugins.autoInstall`. A managed config takes precedence.
+ */
+export const SELF_HOSTED_AUTO_INSTALL_ENV_VAR = "PAPERCLIP_PLUGIN_AUTO_INSTALL";
+
+/** The operator's self-hosted key list, or null when the env var is unset. */
+export function resolveSelfHostedAutoInstallKeys(
+  env: Record<string, string | undefined>,
+): string[] | null {
+  const raw = env[SELF_HOSTED_AUTO_INSTALL_ENV_VAR];
+  if (raw === undefined || raw.trim() === "") return null;
+  return [...new Set(raw.split(",").map((key) => key.trim()).filter((key) => key.length > 0))];
+}
+
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
 ): string {
