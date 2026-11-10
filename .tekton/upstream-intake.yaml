@@ -2,8 +2,10 @@
 # fast-forward master to upstream and open a PR merging upstream's newest
 # stable release into xlab. See .xlab/README.md.
 # plan runs .xlab/upstream-intake.sh in sandboxed Nix with no credentials and
-# writes a plan; publish holds the GitHub token, runs no repository code and
-# takes every commit it pushes from upstream itself.
+# writes a plan; publish holds the GitHub token and the deploy key and takes
+# every commit it pushes from upstream itself. Its scripts (.xlab/intake-push.sh,
+# .xlab/intake_pr.py) come from clone-trusted, a separate checkout of this run's
+# revision that the plan task never mounts, so nothing plan ran can change them.
 # publish pushes with paperclip-intake-deploy-key, a write deploy key for this
 # fork: upstream changes .github/workflows/, which the PaC GitHub App may not
 # push (no workflows permission, by design), and the "master mirrors upstream"
@@ -47,6 +49,7 @@ spec:
       - name: git-auth
       - name: intake-deploy-key
       - name: plan
+      - name: trusted
     tasks:
       - name: clone
         timeout: 10m
@@ -68,6 +71,24 @@ spec:
         workspaces:
           - { name: output, workspace: source }
           - { name: basic-auth, workspace: git-auth }
+      # The publish task's scripts: the same revision, cloned into a
+      # workspace only publish mounts.
+      - name: clone-trusted
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+          - { name: sparseCheckoutPatterns, value: /.xlab/ }
+        workspaces:
+          - { name: output, workspace: trusted }
+          - { name: basic-auth, workspace: git-auth }
       - name: plan
         runAfter: [clone]
         taskRef:
@@ -83,14 +104,17 @@ spec:
           - { name: source, workspace: source }
           - { name: artifacts, workspace: plan }
       - name: publish
-        runAfter: [plan]
+        runAfter: [plan, clone-trusted]
         workspaces:
           - { name: plan, workspace: plan }
+          - { name: trusted, workspace: trusted }
           - { name: git-auth, workspace: git-auth }
           - { name: deploy-key, workspace: intake-deploy-key }
         taskSpec:
           workspaces:
             - name: plan
+              readOnly: true
+            - name: trusted
               readOnly: true
             - name: git-auth
               readOnly: true
@@ -110,8 +134,7 @@ spec:
                         storage: 5Gi
           steps:
             # Fast-forward master and push upstream/<tag> at the release
-            # commit. Only the tag comes from the plan; the commits come from
-            # upstream, and GitHub refuses a non-fast-forward master push.
+            # commit (.xlab/intake-push.sh).
             - name: push
               image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
               securityContext:
@@ -125,60 +148,12 @@ spec:
                   type: RuntimeDefault
               volumeMounts:
                 - { name: work, mountPath: /work }
-              env:
-                - { name: KEY_DIR, value: $(workspaces.deploy-key.path) }
-                - { name: PLAN, value: $(workspaces.plan.path)/intake }
               script: |
                 #!/bin/sh
                 set -eu
-                wipe_scratch() { find /work -mindepth 1 -delete 2>/dev/null || true; }
-                trap wipe_scratch EXIT
-                fork=applyinnovations/paperclip
-                base=xlab
-                # The deploy key is read where the Secret mounts it, never
-                # copied. GitHub's host keys are pinned (api.github.com/meta).
-                export HOME=/work/home GIT_CONFIG_NOSYSTEM=1
-                mkdir -p "${HOME}"
-                cat > "${HOME}/known_hosts" <<'EOF'
-                github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
-                github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
-                github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
-                EOF
-                export GIT_SSH_COMMAND="ssh -i ${KEY_DIR}/ssh-privatekey -o IdentitiesOnly=yes -o UserKnownHostsFile=${HOME}/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
-                git init --quiet --bare /work/repo
-                cd /work/repo
-                git remote add origin "git@github.com:${fork}.git"
-                git remote add upstream https://github.com/paperclipai/paperclip.git
-                git fetch --quiet --no-tags --filter=blob:none origin \
-                  "+refs/heads/${base}:refs/remotes/origin/${base}" \
-                  +refs/heads/master:refs/remotes/origin/master
-                git fetch --quiet --no-tags upstream +refs/heads/master:refs/remotes/upstream/master
-                if ! git merge-base --is-ancestor origin/master upstream/master; then
-                  echo "fork master has diverged from upstream master; not syncing" >&2
-                  exit 1
-                fi
-                git push --quiet origin refs/remotes/upstream/master:refs/heads/master
-                echo "master at $(git rev-parse upstream/master)"
-                if [ ! -f "${PLAN}/tag" ]; then
-                  echo "no release to take in"
-                  exit 0
-                fi
-                tag=$(cat "${PLAN}/tag")
-                printf '%s\n' "${tag}" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || {
-                  echo "unexpected release tag in plan" >&2; exit 1; }
-                git fetch --quiet --no-tags upstream "+refs/tags/${tag}:refs/tags/${tag}"
-                commit=$(git rev-parse "refs/tags/${tag}^{commit}")
-                if git merge-base --is-ancestor "${commit}" "origin/${base}"; then
-                  echo "${base} already contains ${tag}"
-                  exit 0
-                fi
-                git push --quiet origin "${commit}:refs/heads/upstream/${tag}"
-                echo "pushed upstream/${tag} at ${commit}"
-                # Hand only the tag to the next step.
-                wipe_scratch
-                printf '%s\n' "${tag}" > /work/pushed-tag
-                trap - EXIT
-            # Open the PR, label it and enable auto-merge as the plan says.
+                exec sh "$(workspaces.trusted.path)/.xlab/intake-push.sh" "$(workspaces.plan.path)/intake" "$(workspaces.deploy-key.path)/ssh-privatekey" /work
+            # Open the PR, label it and enable auto-merge as the plan says
+            # (.xlab/intake_pr.py).
             - name: pull-request
               image: python:3.13-alpine@sha256:2dd78ad5cf13a0b68f5134dc49aa9950203a8cf4b7463431b9f3b398287c5059
               securityContext:
@@ -192,71 +167,10 @@ spec:
                   type: RuntimeDefault
               volumeMounts:
                 - { name: work, mountPath: /work }
-              env:
-                - { name: AUTH_DIR, value: $(workspaces.git-auth.path) }
-                - { name: PLAN, value: $(workspaces.plan.path)/intake }
-                - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
               script: |
-                #!/usr/bin/env python3
-                import json, os, pathlib, re, sys, urllib.error, urllib.request
-
-                FORK, BASE = "applyinnovations/paperclip", "xlab"
-                LABELS = ["upstream", "needs-review: db-migration", "needs-review: conflict", "needs-review: upstream-ci", "needs-review: ci-config"]
-                pushed = pathlib.Path("/work/pushed-tag")
-                if not pushed.exists():
-                    print("no release branch pushed; nothing to open")
-                    sys.exit(0)
-                tag = pushed.read_text().strip()
-                pushed.unlink()
-                plan = pathlib.Path(os.environ["PLAN"])
-                if (plan / "tag").read_text().strip() != tag:
-                    sys.exit("pushed tag does not match the plan")
-                labels = [label for label in (plan / "labels").read_text().splitlines() if label]
-                if not set(labels) <= set(LABELS) or "upstream" not in labels:
-                    sys.exit(f"unexpected labels in plan: {labels}")
-                automerge = (plan / "automerge").read_text().strip()
-                if automerge not in ("true", "false"):
-                    sys.exit("unexpected automerge value in plan")
-                body = (plan / "body.md").read_text()[:60000]
-                token = (pathlib.Path(os.environ["AUTH_DIR"]) / "git-provider-token").read_text().strip()
-
-
-                def github(method, path, data=None, ok=()):
-                    request = urllib.request.Request(
-                        "https://api.github.com" + path, method=method,
-                        data=None if data is None else json.dumps(data).encode(),
-                        headers={"Authorization": f"Bearer {token}",
-                                 "Accept": "application/vnd.github+json",
-                                 "X-GitHub-Api-Version": "2022-11-28"})
-                    try:
-                        with urllib.request.urlopen(request, timeout=30) as response:
-                            return json.load(response)
-                    except urllib.error.HTTPError as error:
-                        if error.code in ok:
-                            return None
-                        sys.exit(f"{method} {path}: {error.code} {error.read()[:500]!r}")
-
-
-                branch = f"upstream/{tag}"
-                if github("GET", f"/repos/{FORK}/pulls?head={FORK.split('/')[0]}:{branch}&state=all"):
-                    print(f"a pull request for {tag} already exists")
-                    sys.exit(0)
-                for label in LABELS:
-                    github("POST", f"/repos/{FORK}/labels", {"name": label}, ok=(422,))
-                pr = github("POST", f"/repos/{FORK}/pulls", {
-                    "title": f"Merge upstream {tag} into {BASE}",
-                    "head": branch, "base": BASE, "body": body})
-                github("POST", f"/repos/{FORK}/issues/{pr['number']}/labels", {"labels": labels})
-                print(f"opened {pr['html_url']}")
-                if automerge == "true":
-                    # GitHub merges once the ruleset's required checks pass; nothing can skip them.
-                    result = github("POST", "/graphql", {
-                        "query": "mutation($id: ID!) { enablePullRequestAutoMerge("
-                                 "input: {pullRequestId: $id, mergeMethod: MERGE}) { clientMutationId } }",
-                        "variables": {"id": pr["node_id"]}})
-                    if result.get("errors"):
-                        sys.exit(f"auto-merge: {result['errors']}")
-                    print("auto-merge enabled")
+                #!/bin/sh
+                set -eu
+                exec python3 -I "$(workspaces.trusted.path)/.xlab/intake_pr.py" "$(workspaces.plan.path)/intake" /work/pushed-tag "$(workspaces.git-auth.path)/git-provider-token"
   workspaces:
     - name: source
       volumeClaimTemplate:
@@ -273,6 +187,15 @@ spec:
     - name: intake-deploy-key
       secret:
         secretName: paperclip-intake-deploy-key
+    # .xlab/ at this run's revision, for publish only.
+    - name: trusted
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: fast-local
+          resources:
+            requests:
+              storage: 1Gi
     # The plan task's output for publish: a few small files.
     - name: plan
       volumeClaimTemplate:

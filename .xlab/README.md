@@ -45,8 +45,12 @@ Nightly, `.tekton/upstream-intake.yaml` fast-forwards `master`, and when
 upstream publishes a new stable release (the GitHub "latest" release) it opens
 `upstream/<tag>` → `xlab` as a merge PR. `.xlab/upstream-intake.sh` plans this
 without credentials (run it locally to see the plan); the pipeline's publish
-task, which holds the GitHub token and runs no repository code, pushes and opens
-the PR.
+task, which holds the GitHub token and the deploy key, pushes
+(`.xlab/intake-push.sh`) and opens the PR (`.xlab/intake_pr.py`). It runs
+those two scripts from its own checkout of the run's revision, which the plan
+task never mounts, so nothing the plan ran can change them. Their tests run in
+every pull request's checks:
+`python3 -m unittest discover -s .xlab -p 'test_*.py'`.
 
 The publish task pushes `master` and `upstream/<tag>` over SSH with
 `paperclip-intake-deploy-key` (tekton-buildkit), a write deploy key for this

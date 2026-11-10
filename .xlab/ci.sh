@@ -43,6 +43,8 @@ step() {
   echo "::: ${name} done in $((SECONDS - start))s"
 }
 
+# The fork's own CI scripts (.xlab/*.py, intake-push.sh).
+step xlab-scripts env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .xlab -p 'test_*.py'
 step install pnpm install --frozen-lockfile
 step typecheck pnpm -r typecheck
 step build pnpm build
