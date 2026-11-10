@@ -2,7 +2,9 @@
 
 `applyinnovations/paperclip` builds the Paperclip that runs on the xlab
 cluster. Fork-specific files live only in `.xlab/` and `.tekton/`, so upstream
-merges rarely conflict. Upstream's GitHub workflows stay in the tree, but
+merges rarely conflict. `.tekton/` follows the xlab CI scripting standard
+([Repository pipelines](https://github.com/applyinnovations/deployments/blob/main/clusters/xlab/manifests/tekton/README.md#repository-pipelines)): it only wires Tasks and calls scripts in
+`.xlab/`, which hold the logic, run the same locally and have tests. Upstream's GitHub workflows stay in the tree, but
 GitHub Actions is disabled for this repository; CI is Tekton Pipelines-as-Code
 in the cluster.
 
