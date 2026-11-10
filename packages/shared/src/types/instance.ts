@@ -37,6 +37,13 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Sandbox providers (plugin driver keys) that agents may also run on while
+   * `executionMode` is `"kubernetes"`. Kubernetes stays allowed and stays the
+   * default; an agent or instance default environment on a listed provider
+   * keeps it. Ignored when execution is unrestricted.
+   */
+  allowedSandboxProviders?: string[];
 }
 
 export interface InstanceExperimentalSettings {

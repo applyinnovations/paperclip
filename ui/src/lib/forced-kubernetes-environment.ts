@@ -35,6 +35,30 @@ export interface ForcedKubernetesEnvironment {
    * defaulting to local).
    */
   kubernetesEnvironment: Environment | null;
+  /**
+   * Active environments on the sandbox providers the policy also allows
+   * (`allowedSandboxProviders`). An agent may select one of these instead of
+   * the Kubernetes default; empty when not forced or none is configured.
+   */
+  allowedEnvironments: Environment[];
+}
+
+/**
+ * True iff the environment is an active sandbox on a provider the forced
+ * policy allows besides Kubernetes. Mirrors the server-side
+ * `isAllowedAdditionalSandboxEnvironment`.
+ */
+export function isAllowedAdditionalSandboxEnvironment(
+  environment: Environment,
+  allowedSandboxProviders: readonly string[],
+): boolean {
+  if (environment.driver !== "sandbox" || environment.status !== "active") return false;
+  const provider = environment.config?.provider;
+  return (
+    typeof provider === "string" &&
+    provider !== KUBERNETES_PROVIDER_KEY &&
+    allowedSandboxProviders.includes(provider)
+  );
 }
 
 /**
@@ -45,12 +69,16 @@ export interface ForcedKubernetesEnvironment {
 export function resolveForcedKubernetesEnvironment(
   executionMode: InstanceExecutionMode | undefined,
   environments: readonly Environment[],
+  allowedSandboxProviders: readonly string[] = [],
 ): ForcedKubernetesEnvironment {
   const forced = executionMode === "kubernetes";
   if (!forced) {
-    return { forced: false, kubernetesEnvironment: null };
+    return { forced: false, kubernetesEnvironment: null, allowedEnvironments: [] };
   }
   const kubernetesEnvironment =
     environments.find((environment) => isKubernetesSandboxEnvironment(environment)) ?? null;
-  return { forced: true, kubernetesEnvironment };
+  const allowedEnvironments = environments.filter((environment) =>
+    isAllowedAdditionalSandboxEnvironment(environment, allowedSandboxProviders),
+  );
+  return { forced: true, kubernetesEnvironment, allowedEnvironments };
 }

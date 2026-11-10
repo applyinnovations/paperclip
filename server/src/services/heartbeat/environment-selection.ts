@@ -6,7 +6,10 @@ import type { ExecutionWorkspace, IssueExecutionWorkspaceSettings, ProjectExecut
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
-import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
+import {
+  isAllowedAdditionalSandboxEnvironment,
+  isExecutionForcedToKubernetes,
+} from "../execution-allowlist.js";
 import { parseExecutionPolicyBootstrapEnv } from "../execution-policy-bootstrap.js";
 import {
   parseIssueExecutionWorkspaceSettings,
@@ -199,6 +202,8 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   > = requestedExecutionWorkspaceMode;
   const executionPolicy = {
     executionMode: resolvedInstanceSettings.general.executionMode,
+    allowedSandboxProviders:
+      resolvedInstanceSettings.general.allowedSandboxProviders ?? [],
     // Backstop behind the resolver's local→managed redirect: the run-time
     // allowlist below fails any run that still resolved to a `local`
     // environment under managed-sandbox-only, so no selection path or
@@ -209,7 +214,25 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   const executionForcedToKubernetes =
     isExecutionForcedToKubernetes(executionPolicy);
   let selectedEnvironmentId = environmentResolution.environmentId;
-  if (executionForcedToKubernetes) {
+  // Under the forced policy an environment the agent, issue or instance
+  // selected explicitly keeps the run only when it is on a sandbox provider
+  // the policy also allows; everything else goes to Kubernetes.
+  const resolvedEnvironment =
+    executionForcedToKubernetes &&
+    selectedEnvironmentId &&
+    selectedEnvironmentId !== localEnvironment.id
+      ? await environmentsSvc.getById(selectedEnvironmentId)
+      : null;
+  const keepsAllowedSandboxEnvironment =
+    resolvedEnvironment !== null &&
+    isAllowedAdditionalSandboxEnvironment(executionPolicy, {
+      driver: resolvedEnvironment.driver,
+      provider:
+        typeof resolvedEnvironment.config?.provider === "string"
+          ? resolvedEnvironment.config.provider
+          : null,
+    });
+  if (executionForcedToKubernetes && !keepsAllowedSandboxEnvironment) {
     let kubernetesEnvironment =
       await environmentsSvc.findKubernetesEnvironment(agent.companyId);
     if (!kubernetesEnvironment) {

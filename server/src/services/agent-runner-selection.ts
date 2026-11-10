@@ -9,6 +9,7 @@ import { forbidden, unprocessable } from "../errors.js";
 import { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import { localAgentRunnerTarget } from "../lib/agent-runner-platform.js";
+import { isAllowedAdditionalSandboxEnvironment } from "./execution-allowlist.js";
 
 export type RunnerTarget = { driver: string; platform?: string; architecture?: string; libc?: "glibc" | "musl" | "unknown"; glibcVersion?: string };
 export const AGENT_RUNNER_SSH_PLATFORM_COMMAND = "uname -s; uname -m; if paperclip_glibc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null) && [ -n \"$paperclip_glibc_version\" ]; then printf 'glibc\\n%s\\n' \"$paperclip_glibc_version\"; else case \"$(ldd --version 2>&1)\" in *musl*) printf 'musl\\n' ;; *) printf 'unknown\\n' ;; esac; fi";
@@ -276,7 +277,10 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     environment = await envs.findManagedSandboxEnvironment(companyId);
     if (!environment) throw unprocessable("The managed sandbox is unavailable. Restore Paperclip Computer and retry.", { code: "managed_sandbox_unavailable" });
   }
-  if (settings.general?.executionMode === "kubernetes") {
+  if (settings.general?.executionMode === "kubernetes" && !(environment && isAllowedAdditionalSandboxEnvironment(settings.general, {
+    driver: environment.driver,
+    provider: typeof environment.config?.provider === "string" ? environment.config.provider : null,
+  }))) {
     environment = await envs.findKubernetesEnvironment(companyId);
     if (!environment) return { driver: "sandbox" };
   }

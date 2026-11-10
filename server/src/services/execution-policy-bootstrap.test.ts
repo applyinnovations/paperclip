@@ -30,6 +30,7 @@ function env(overrides: Record<string, string | undefined>): ExecutionPolicyBoot
 
 const bootstrap: ExecutionPolicyBootstrap = {
   executionMode: "kubernetes",
+  allowedSandboxProviders: ["mac-lanes"],
   kubernetesConfig: { inCluster: true, backend: "job" },
 };
 
@@ -132,6 +133,37 @@ describe("parseExecutionPolicyBootstrapEnv", () => {
       ),
     ).toThrow(/PAPERCLIP_K8S_RPC_TIMEOUT_MS/);
   });
+
+  it("allows no other sandbox provider unless one is listed", () => {
+    const parsed = parseExecutionPolicyBootstrapEnv(env({ PAPERCLIP_EXECUTION_MODE: "kubernetes" }));
+    expect(parsed?.allowedSandboxProviders).toEqual([]);
+  });
+
+  it("parses PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS", () => {
+    const parsed = parseExecutionPolicyBootstrapEnv(
+      env({
+        PAPERCLIP_EXECUTION_MODE: "kubernetes",
+        PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS: "mac-lanes, e2b,mac-lanes",
+      }),
+    );
+    expect(parsed?.allowedSandboxProviders).toEqual(["mac-lanes", "e2b"]);
+  });
+
+  it("refuses kubernetes or a malformed key in the allowed providers", () => {
+    for (const value of ["kubernetes", "Mac Lanes", "../x"]) {
+      expect(() =>
+        parseExecutionPolicyBootstrapEnv(
+          env({ PAPERCLIP_EXECUTION_MODE: "kubernetes", PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS: value }),
+        ),
+      ).toThrow(/PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS/);
+    }
+  });
+
+  it("refuses allowed providers without the kubernetes execution mode", () => {
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS: "mac-lanes" })),
+    ).toThrow(/PAPERCLIP_EXECUTION_ALLOWED_SANDBOX_PROVIDERS/);
+  });
 });
 
 describe("applyExecutionPolicyBootstrap", () => {
@@ -149,6 +181,10 @@ describe("applyExecutionPolicyBootstrap", () => {
 
     expect(result).toEqual({ executionMode: "kubernetes", companiesConfigured: 3 });
     expect(ensureKubernetesEnvironment).toHaveBeenCalledTimes(3);
+    expect(updateGeneral).toHaveBeenCalledWith({
+      executionMode: "kubernetes",
+      allowedSandboxProviders: ["mac-lanes"],
+    });
   });
 
   it("throws when at least one company fails, after attempting every company", async () => {

@@ -88,4 +88,16 @@ describe("resolveForcedKubernetesEnvironment", () => {
     expect(result.forced).toBe(true);
     expect(result.kubernetesEnvironment).toBeNull();
   });
+
+  it("offers active environments on the allowed sandbox providers besides Kubernetes", () => {
+    const macLanes = makeEnvironment({ id: "ml-1", driver: "sandbox", config: { provider: "mac-lanes" } });
+    const archived = makeEnvironment({ id: "ml-2", driver: "sandbox", status: "archived", config: { provider: "mac-lanes" } });
+    const fakeSandbox = makeEnvironment({ id: "fake-1", driver: "sandbox", config: { provider: "fake" } });
+    const envs = [localEnv, k8sEnv, macLanes, archived, fakeSandbox];
+    const result = resolveForcedKubernetesEnvironment("kubernetes", envs, ["mac-lanes"]);
+    expect(result.kubernetesEnvironment?.id).toBe("k8s-1");
+    expect(result.allowedEnvironments.map((environment) => environment.id)).toEqual(["ml-1"]);
+    expect(resolveForcedKubernetesEnvironment("kubernetes", envs).allowedEnvironments).toEqual([]);
+    expect(resolveForcedKubernetesEnvironment("any", envs, ["mac-lanes"]).allowedEnvironments).toEqual([]);
+  });
 });
