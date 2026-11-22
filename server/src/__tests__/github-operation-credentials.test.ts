@@ -571,6 +571,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
             githubIdentity: { userId: "4242", login: "paperclip-xlab-now[bot]" },
             identitySource: "app" as const,
           },
+          expiresAt: "2026-01-01T01:00:00.000Z",
+          appId: "1",
+          installationId: "2",
         })),
       };
       const unconnected = await seed();

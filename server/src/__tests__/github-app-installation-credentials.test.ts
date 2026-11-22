@@ -136,7 +136,8 @@ describe("GitHub App installation tokens", () => {
 describe("git remote credential resolution order", () => {
   const remote = "https://github.com/applyinnovations/xlab-deployments.git";
   const noSecrets = { getByName: async () => null, resolveSecretValue: async () => "" };
-  const available = { resolve: async () => ({ status: "available" as const, credential: { token: "ghs_app", source: "github_app" as const, secretName: null } }) };
+  const available = { resolve: async () => ({ status: "available" as const, credential: { token: "ghs_app", source: "github_app" as const, secretName: null },
+    expiresAt: "2026-01-01T01:00:00.000Z", appId: "1", installationId: "2" }) };
 
   it("prefers a company secret, then the GitHub App, before the server environment token", async () => {
     const withSecret = createGitRemoteAuthProvider(null as never, COMPANY, undefined, {
