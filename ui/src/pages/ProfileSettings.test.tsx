@@ -214,7 +214,7 @@ describe("ProfileSettings", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <ProfileSettings />
+          <MemoryRouter><ProfileSettings /></MemoryRouter>
         </QueryClientProvider>,
       );
     });

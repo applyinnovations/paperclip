@@ -513,14 +513,14 @@ describe("server-owned Codex runner selection", () => {
   it("keeps a selected environment on a sandbox provider the forced policy also allows", async () => {
     state.settings = { general: { executionMode: "kubernetes", allowedSandboxProviders: ["mac-lanes"] } };
     state.getEnvironment.mockResolvedValue({ id: "mac", driver: "sandbox", status: "active", config: { provider: "mac-lanes" } });
-    expect(await resolveAgentRunnerTargetForCompany({} as never, "company", "mac")).toEqual({ driver: "sandbox" });
+    expect(await resolveAgentRunnerTargetForCompany({} as never, "company", "mac")).toEqual({ driver: "sandbox", executionMode: "kubernetes" });
     expect(state.kubernetesEnvironment).not.toHaveBeenCalled();
     expect(state.sandboxQualification).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: "mac" }), "company");
   });
   it("forces Kubernetes for a selected sandbox provider the policy does not list", async () => {
     state.settings = { general: { executionMode: "kubernetes", allowedSandboxProviders: ["mac-lanes"] } };
     state.getEnvironment.mockResolvedValue({ id: "other", driver: "sandbox", status: "active", config: { provider: "e2b" } });
-    expect(await resolveAgentRunnerTargetForCompany({} as never, "company", "other")).toEqual({ driver: "sandbox" });
+    expect(await resolveAgentRunnerTargetForCompany({} as never, "company", "other")).toEqual({ driver: "sandbox", executionMode: "kubernetes" });
     expect(state.kubernetesEnvironment).toHaveBeenCalledWith("company");
   });
   it("retains company checks for an existing forced Kubernetes environment", async () => {
