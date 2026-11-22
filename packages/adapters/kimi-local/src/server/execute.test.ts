@@ -15,6 +15,7 @@ const resolveCommandForLogsMock = vi.hoisted(() => vi.fn(async () => "kimi"));
 const runProcessMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
+  adapterExecutionTargetCommandEnv: (_target: unknown, env: Record<string, string>) => ({ ...process.env, ...env }),
   adapterExecutionTargetIsRemote: () => false,
   adapterExecutionTargetRemoteCwd: (_target: unknown, cwd: string) => cwd,
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown, _cwd: string) => target,

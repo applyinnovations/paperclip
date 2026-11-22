@@ -8,7 +8,6 @@ import {
   asString,
   asStringArray,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -18,6 +17,7 @@ import {
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -164,7 +164,7 @@ export async function testEnvironment(
   });
   command = finalSandboxCommand.command;
   env = finalSandboxCommand.env;
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = adapterExecutionTargetCommandEnv(target, env);
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);
     checks.push({

@@ -21,6 +21,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asNumber,
@@ -306,8 +307,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const kimiEffort = resolveKimiThinkingEffort(configuredEffort);
     if (kimiEffort) env.KIMI_MODEL_THINKING_EFFORT = kimiEffort;
   }
-  const runtimeEnv = buildKimiRuntimeEnv(env);
-  const billingType = resolveKimiBillingType(runtimeEnv);
+  const billingType = resolveKimiBillingType(buildKimiRuntimeEnv(env));
+  const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, buildKimiHeadlessEnv(env));
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),

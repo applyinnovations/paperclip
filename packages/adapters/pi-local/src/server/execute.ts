@@ -26,6 +26,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -380,18 +381,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
+    // Install and resolve on the target with the adapter env alone when the
+    // target is remote; the server env above is for local spawning only.
+    const targetCommandEnv = executionTargetIsRemote
+      ? adapterExecutionTargetCommandEnv(executionTarget, env)
+      : runtimeEnv;
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
       installCommand: ctx.runtimeCommandSpec?.installCommand,
       detectCommand: ctx.runtimeCommandSpec?.detectCommand,
       cwd,
-      env: runtimeEnv,
+      env: targetCommandEnv,
       timeoutSec,
       graceSec,
       onLog,
     });
-    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
+    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, targetCommandEnv, {
       installCommand: SANDBOX_INSTALL_COMMAND,
       timeoutSec,
     });

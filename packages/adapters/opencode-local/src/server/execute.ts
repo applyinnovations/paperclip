@@ -26,6 +26,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -337,11 +338,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, preparedRuntimeConfig.env);
     const adapterExecutionTimeout = resolveAdapterExecutionTargetTimeout(
       executionTarget,
       asNumber(config.timeoutSec, 0),

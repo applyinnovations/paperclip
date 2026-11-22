@@ -9,7 +9,6 @@ import {
   asNumber,
   asStringArray,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -18,6 +17,7 @@ import {
   runAdapterExecutionTargetProcess,
   resolveAdapterExecutionTargetCwd,
   resolveAdapterExecutionTargetCommandForLogs,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   detectClaudeLoginRequired,
@@ -150,7 +150,7 @@ export async function testEnvironment(
       helloProbeTimeoutSec: asNumber(config.helloProbeTimeoutSec, targetIsSandbox ? 90 : 45),
     })),
   );
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = adapterExecutionTargetCommandEnv(target, env);
   let localRuntimeCommand: string | null = null;
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

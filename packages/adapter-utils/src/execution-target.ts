@@ -78,6 +78,7 @@ import {
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
+  ensurePathInEnv,
   resolveCommandForLogs,
   runChildProcess,
   type RunProcessResult,
@@ -394,7 +395,7 @@ export interface AdapterExecutionTargetProcessSessionBridgeHandle {
   stop(): Promise<void>;
 }
 
-export { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+export { sanitizeRemoteExecutionEnv, serverProcessEnvKeysIn } from "./remote-execution-env.js";
 
 // Four-hour wall-clock backstop for sandbox-backed adapter runs. Keep this
 // execution limit independent of the earlier informational silence warnings
@@ -480,6 +481,23 @@ export function adapterExecutionTargetIsRemote(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
   return target?.kind === "remote";
+}
+
+/**
+ * The env an adapter uses to install, resolve and probe its command on
+ * `target`. A local target gets the server env joined with the adapter env, as
+ * a locally spawned child would. A remote target gets the adapter env alone:
+ * the server's own environment never goes to a remote target, and the target
+ * keeps its own login PATH.
+ */
+export function adapterExecutionTargetCommandEnv(
+  target: AdapterExecutionTarget | null | undefined,
+  env: Record<string, string | undefined>,
+): Record<string, string> {
+  const merged = target?.kind === "remote" ? { ...env } : ensurePathInEnv({ ...process.env, ...env });
+  return Object.fromEntries(
+    Object.entries(merged).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 export function adapterExecutionTargetUsesManagedHome(

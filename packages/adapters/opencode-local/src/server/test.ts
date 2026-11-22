@@ -13,7 +13,6 @@ import {
   asString,
   asStringArray,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -25,6 +24,7 @@ import {
   resolveAdapterExecutionTargetCwd,
   prepareAdapterExecutionTargetRuntime,
   overrideAdapterExecutionTargetRemoteCwd,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable, requireOpenCodeModelId } from "./models.js";
 import { parseOpenCodeJsonl } from "./parse.js";
@@ -209,7 +209,7 @@ export async function testEnvironment(
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
     }
-    const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env }));
+    const runtimeEnv = normalizeEnv(adapterExecutionTargetCommandEnv(runtimeTarget, preparedRuntimeConfig.env));
 
     const cwdInvalid = checks.some((check) => check.code === "opencode_cwd_invalid");
     if (cwdInvalid) {

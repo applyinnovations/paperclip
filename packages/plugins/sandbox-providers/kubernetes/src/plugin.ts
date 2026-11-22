@@ -879,7 +879,12 @@ const plugin = definePlugin({
       // OpenCode config, plus helper settings like small_model/provider routing) never
       // reaches the harness, which falls back to its in-image HOME config -> wrong or
       // partial behaviour.
-      const execCommand = wrapCommandWithEnv(baseExecCommand, params.env);
+      // The env goes over the exec's stdin, never into its argv (see wrapCommandWithEnv).
+      const execWithEnv = wrapCommandWithEnv(
+        baseExecCommand,
+        params.env,
+        typeof params.stdin === "string" ? params.stdin : undefined,
+      );
 
       // Remaining share of the caller's budget after the readiness wait (floor
       // of 5s so an exec attempt is still made when readiness consumed most of
@@ -896,8 +901,8 @@ const plugin = definePlugin({
           namespace,
           podName,
           "agent",
-          execCommand,
-          typeof params.stdin === "string" ? params.stdin : undefined,
+          execWithEnv.command,
+          execWithEnv.stdin,
           remainingTimeoutMs,
         );
       } catch (err) {

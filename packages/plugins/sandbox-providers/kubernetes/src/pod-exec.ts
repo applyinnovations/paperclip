@@ -34,24 +34,51 @@ export function shQuote(segment: string): string {
   return `'${segment.replace(/'/g, "'\\''")}'`;
 }
 
-// Wrap a command so the given env vars are exported before it runs. The Kubernetes
-// exec API has no env field, so the only way to give an exec'd process additional
-// env is to run it under a shell that exports the vars and then `exec`s the real
-// command. PATH is deliberately skipped (the caller's PATH is the orchestrator's,
-// not the sandbox image's, and overriding it would break command resolution), and
-// only valid shell identifiers are exported. Returns the original command unchanged
+// Reads one base64 line of `export K='v'` statements from stdin, applies it, and
+// execs the real command (`"$@"`) on the rest of stdin. The script is fixed: it
+// never contains an env value. Exit 125 means the env line could not be applied.
+const ENV_FROM_STDIN_SCRIPT = [
+  "IFS= read -r paperclip_env_b64 || exit 125",
+  "paperclip_env_sh=$(printf '%s' \"$paperclip_env_b64\" | base64 -d) || exit 125",
+  "eval \"$paperclip_env_sh\" || exit 125",
+  "unset paperclip_env_b64 paperclip_env_sh",
+  "exec \"$@\"",
+].join("\n");
+
+export interface CommandWithEnv {
+  command: string[];
+  stdin: string | undefined;
+}
+
+// Wrap a command so the given env vars are set before it runs. The Kubernetes
+// exec API has no env field, so an exec'd process can only get extra env from a
+// shell that sets it and then `exec`s the real command.
+//
+// Env values never go into the exec argv. The argv travels in the exec request
+// URI, which the kube-apiserver audit log records, and is visible in the pod's
+// process table. The values travel on the exec's stdin instead: one base64 line
+// ahead of the caller's stdin, read and applied by a fixed script.
+//
+// PATH is deliberately skipped (the caller's PATH is the orchestrator's, not the
+// sandbox image's, and overriding it would break command resolution), and only
+// valid shell identifiers are applied. Returns the command and stdin unchanged
 // when there is nothing to apply.
 export function wrapCommandWithEnv(
   command: string[],
   env: Record<string, string> | undefined | null,
-): string[] {
+  stdin?: string,
+): CommandWithEnv {
   const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
     ([key, value]) =>
       typeof value === "string" && key !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
   );
-  if (entries.length === 0) return command;
-  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)};`).join(" ");
-  return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
+  if (entries.length === 0) return { command, stdin };
+  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)}`).join("\n");
+  const envLine = `${Buffer.from(exports, "utf-8").toString("base64")}\n`;
+  return {
+    command: ["/bin/sh", "-c", ENV_FROM_STDIN_SCRIPT, "paperclip-env", ...command],
+    stdin: envLine + (stdin ?? ""),
+  };
 }
 
 export async function execInPod(
