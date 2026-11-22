@@ -216,8 +216,8 @@ run("OIDC through Better Auth and migrated PostgreSQL", () => {
     expect(await db.select().from(instanceUserRoles)).toHaveLength(0);
     const session = cookies(response);
     expect(session).toContain("session_token");
-    expect(response.headers["set-cookie"].join(";")).toContain("HttpOnly");
-    expect(response.headers["set-cookie"].join(";")).toContain("SameSite=Lax");
+    expect([response.headers["set-cookie"]].flat().join(";")).toContain("HttpOnly");
+    expect([response.headers["set-cookie"]].flat().join(";")).toContain("SameSite=Lax");
     const actor = await request(api).get("/actor").set("cookie", session);
     expect(actor.body).toMatchObject({ type: "board", source: "session", isInstanceAdmin: false, companyIds: [] });
     expect((await request(api).get("/company").set("cookie", session)).status).toBe(403);

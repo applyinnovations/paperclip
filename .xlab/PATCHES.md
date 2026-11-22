@@ -3,7 +3,7 @@
 Everything `xlab` carries on top of its upstream release. One row per change;
 remove a row when upstream ships the change and the intake merge replaces ours.
 
-Base: upstream [`v2026.1023.0`](https://github.com/paperclipai/paperclip/releases/tag/v2026.1023.0).
+Base: upstream [`v2026.1117.0`](https://github.com/paperclipai/paperclip/releases/tag/v2026.1117.0).
 
 | Change | Branch | Why we carry it | Upstream status |
 | --- | --- | --- | --- |
