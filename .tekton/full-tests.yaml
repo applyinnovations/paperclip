@@ -32,6 +32,13 @@ spec:
     - pipelineTaskName: checks
       podTemplate:
         hostUsers: false
+      stepSpecs:
+        # Measured peak over the 14 days to 22 Nov 2026: RSS 8.3 GiB, working
+        # set 9.0 GiB. Request what it uses so it is not packed onto a small node.
+        - name: run
+          computeResources:
+            requests: { cpu: "1", memory: 10Gi }
+            limits: { cpu: "12", memory: 24Gi }
     - pipelineTaskName: publish-cache
       serviceAccountName: nix-cache-publisher
   pipelineSpec:
