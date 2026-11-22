@@ -5,6 +5,13 @@ export interface AdapterDefaults {
   envKeys: string[];
   allowFqdns: string[];
   probeCommand: string[];
+  /**
+   * Hosts the adapter's subscription sign-in command (`claude setup-token`,
+   * `codex login --device-auth`) calls from inside the sandbox. Browser-only
+   * hosts (the authorize page the user opens) are not listed: the sandbox never
+   * calls them. Allowed by FQDN in `cilium` egress mode; see the README.
+   */
+  loginAllowFqdns?: string[];
   /** Non-secret env injected as the base layer for the Job (process-env wins on top). */
   defaultEnv?: Record<string, string>;
 }
@@ -14,12 +21,17 @@ const REGISTRY: Record<string, AdapterDefaults> = {
     runtimeImage: "ghcr.io/paperclipai/agent-runtime-claude:v1",
     envKeys: ["ANTHROPIC_API_KEY"],
     allowFqdns: ["api.anthropic.com"],
+    // OAuth token exchange for `claude setup-token`; its profile and role calls
+    // go to api.anthropic.com, which allowFqdns already covers.
+    loginAllowFqdns: ["platform.claude.com"],
     probeCommand: ["claude", "--version"],
   },
   codex_local: {
     runtimeImage: "ghcr.io/paperclipai/agent-runtime-codex:v1",
     envKeys: ["OPENAI_API_KEY"],
     allowFqdns: ["api.openai.com"],
+    // Device code and token endpoints for `codex login --device-auth`.
+    loginAllowFqdns: ["auth.openai.com"],
     probeCommand: ["codex", "--version"],
   },
   gemini_local: {
@@ -64,6 +76,7 @@ function fromRegistryEntry(entry: AdapterRegistryEntry): AdapterDefaults {
     runtimeImage: entry.runtimeImage,
     envKeys: entry.envKeys ?? [],
     allowFqdns: entry.allowFqdns ?? [],
+    loginAllowFqdns: entry.loginAllowFqdns ?? [],
     probeCommand: entry.probeCommand ?? [],
     defaultEnv: entry.defaultEnv,
   };

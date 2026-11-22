@@ -73,7 +73,7 @@ Common optional fields:
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
-| `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
+| `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. On `sandbox-cr` this sets the Sandbox `shutdownTime`; a caller's earlier deadline (a sign-in lease) shortens it. |
 
 Full JSON Schema in `src/manifest.ts`.
 
@@ -93,6 +93,33 @@ Keep provider-level egress defaults narrow, then grant only the destinations a t
 ```
 
 The provider creates a workload-owned policy selected by the task run label, so the additional destinations do not become reachable from other concurrent agent pods. Cilium mode enforces FQDNs directly. Standard NetworkPolicy mode cannot express FQDNs, so an FQDN grant permits public IPv4 TCP 80/443 for that run while excluding private, loopback, link-local, CGNAT, and multicast ranges. Network failures that look policy-related include the grant path in stderr, and the sandbox exposes the effective policy through `PAPERCLIP_NETWORK_EGRESS_*` environment variables.
+
+## Subscription sign-in (login PTY)
+
+The driver advertises `supportsLoginPty`, so Paperclip's provider-generic sign-in flows can create a Claude (`claude setup-token`) or ChatGPT (`codex login --device-auth`) subscription connection in the company's own sandbox. The login runs on a terminal exec (`tty=true`) in a fresh Sandbox pod, never in the Paperclip server or plugin worker process.
+
+- **Command:** the server sends a closed command key and a session home of the exact shape `/tmp/paperclip-adapter-login/<uuid>`, never a command string. The plugin maps the key to a fixed command and runs `["/bin/sh", "-c", "exec <command>"]`; Codex gets `CODEX_HOME=<session home>` through `env`. The session home is created with `mkdir -m 700 -p` first. The browser code reaches the command over the exec stdin channel, never a command line.
+- **Lifetime:** when the server asks for a deadline (`requestedExpiresAt`, sent by the Claude flow), the Sandbox `shutdownTime` is the earlier of that deadline and `podActivityDeadlineSec`, and the lease returns it as `expiresAt`. A deadline that has already passed is refused before anything is created. The plugin also stops the command at the earliest of the open request's deadline (newer servers send one) and that expiry.
+- **Backend:** `sandbox-cr` only. The `job` backend has no exec channel, attests no expiry and refuses the terminal.
+- **Worker state:** the open request names only the provider lease, so the worker resolves the pod from the lease it acquired or resumed. After a worker restart an unfinished login fails closed; start it again.
+- **Credential read:** Codex writes `auth.json` (mode 0600) in the session home; the server reads it back with one `node -e` exec through the normal execute path. Claude prints its token on the terminal.
+
+### Runtime image requirements
+
+The adapter's runtime image must provide `/bin/sh`, `mkdir`, and the CLI on the container `PATH` (the exec does not source login profiles): `claude` for `claude_local`, `codex` for `codex_local`. The Codex credential read also needs `node`. The command runs as the pod user (UID 1000) with `HOME=/home/paperclip`; `/tmp` is a writable `emptyDir`.
+
+### Sign-in egress
+
+The browser opens the provider's authorize page on the user's machine; the sandbox only calls the token endpoints:
+
+| Adapter | `loginAllowFqdns` default | Also needed (already in `allowFqdns`) |
+|---|---|---|
+| `claude_local` | `platform.claude.com` | `api.anthropic.com` |
+| `codex_local` | `auth.openai.com` | none |
+
+In `cilium` mode these hosts are added to the run's scoped policy (below). The sandbox-provider acquire does not say whether a lease is for a login, so they apply to every lease of that adapter unless the server marks the lease `purpose: "run"`. In `standard` mode FQDNs cannot be enforced; the hosts are reachable to the same extent as the adapter's other FQDNs (the public-IPv4 fallback, or your `egressAllowCidrs`). With an adapter registry (`adapters`, replace semantics) set `loginAllowFqdns` on the entry; an entry without it allows no sign-in hosts.
+
+Running an agent on the subscription afterwards needs the provider's runtime hosts as well (for Codex, `chatgpt.com` and `auth.openai.com` for token refresh). Add them with `egressAllowFqdns`, a task grant, or the registry entry's `allowFqdns`.
 
 ## What gets created in your cluster
 

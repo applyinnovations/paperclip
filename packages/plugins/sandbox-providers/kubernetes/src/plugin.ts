@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, type PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -27,7 +27,7 @@ import { createKubeConfig, makeKubeClients } from "./kube-client.js";
 import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
-import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
+import { buildSandboxCrManifest, resolveSandboxShutdownMs } from "./sandbox-cr-builder.js";
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
@@ -36,7 +36,9 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
+import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
+import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
+import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
 import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
@@ -201,8 +203,51 @@ async function resolveSyncPodExec(
   return { exec, timeoutMs };
 }
 
+// Login pseudo-terminals (see login-pty-sessions.ts) and the context their
+// output and exit notifications go through.
+const loginPtySessions = createLoginPtySessions();
+let pluginContext: PluginContext | null = null;
+
+// The host gives a login PTY open 30 s. Waiting for the pod uses most of that and
+// leaves room for the session-home exec and the terminal attach.
+const LOGIN_PTY_READY_TIMEOUT_MS = 20_000;
+const LOGIN_PTY_HOME_EXEC_TIMEOUT_MS = 5_000;
+
+/** Waits for the lease's Sandbox pod and binds the two execs a login needs to it. */
+async function resolveLoginPodExec(target: LoginLeaseTarget): Promise<LoginPodExec> {
+  const kc = createKubeConfig({
+    inCluster: target.config.inCluster,
+    kubeconfig: target.config.kubeconfig,
+  });
+  const clients = makeKubeClients(kc);
+  if (!readySandboxesByLease.has(target.providerLeaseId)) {
+    await sandboxCrOrchestrator.waitForCompletion(clients, target.namespace, target.providerLeaseId, {
+      timeoutMs: LOGIN_PTY_READY_TIMEOUT_MS,
+      pollMs: 1000,
+    });
+    readySandboxesByLease.add(target.providerLeaseId);
+  }
+  const podName =
+    target.podName ??
+    (await sandboxCrOrchestrator.findPod(clients, target.namespace, target.providerLeaseId));
+  if (!podName) {
+    throw new Error("Kubernetes login PTY could not resolve the Sandbox pod name.");
+  }
+  return {
+    run: async (argv) => {
+      const result = await execInPod(
+        kc, target.namespace, podName, "agent", argv, undefined, LOGIN_PTY_HOME_EXEC_TIMEOUT_MS,
+        64 * 1024, 64 * 1024,
+      );
+      return { exitCode: result.exitCode };
+    },
+    openPty: (argv) => openPodPty(kc, target.namespace, podName, "agent", argv),
+  };
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
+    pluginContext = ctx;
     ctx.logger.info("Kubernetes sandbox provider plugin ready");
   },
 
@@ -297,10 +342,18 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams & {
       adapterType?: string;
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      // Newer hosts say whether the lease is for a run or a login.
+      purpose?: "run" | "login";
     },
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
     const namespace = deriveTenantNamespace(config, params.companyId);
+    // Validate the caller's deadline before anything is created in the cluster.
+    const shutdown = resolveSandboxShutdownMs({
+      nowMs: Date.now(),
+      podActivityDeadlineSec: config.podActivityDeadlineSec,
+      requestedExpiresAt: params.requestedExpiresAt,
+    });
 
     // The adapter for THIS run is the agent's adapter (params.adapterType) when
     // supplied, so one environment can serve mixed harnesses; otherwise fall back
@@ -382,6 +435,7 @@ const plugin = definePlugin({
           runtimeClassName: config.runtimeClassName,
           imagePullSecrets: config.imagePullSecrets,
           activeDeadlineSec: config.podActivityDeadlineSec,
+          shutdownTime: new Date(shutdown.shutdownMs).toISOString(),
         })
       : buildJobManifest({
           namespace,
@@ -400,6 +454,16 @@ const plugin = definePlugin({
 
     const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
     const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
+    // The adapter's sign-in hosts join this run's scoped policy in cilium mode,
+    // where FQDN rules are enforced (standard mode cannot enforce them; see
+    // validateConfig). The sandbox-provider acquire does not say whether a lease
+    // is for a login, so they apply unless the host says the lease is a run.
+    const loginAllowFqdns =
+      config.egressMode === "cilium" && params.purpose !== "run" ? adapterDefaults.loginAllowFqdns ?? [] : [];
+    const scopedPolicyGrant = {
+      allowFqdns: [...new Set([...scopedNetworkEgress.allowFqdns, ...loginAllowFqdns])],
+      allowCidrs: scopedNetworkEgress.allowCidrs,
+    };
     const scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
       {
         clients,
@@ -415,7 +479,7 @@ const plugin = definePlugin({
           controller: false,
           blockOwnerDeletion: false,
         },
-        grant: scopedNetworkEgress,
+        grant: scopedPolicyGrant,
       },
       () => orchestrator.release(clients, namespace, jobName),
     );
@@ -463,9 +527,26 @@ const plugin = definePlugin({
       nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
     };
 
+    // Only the Sandbox shutdown time is an absolute, controller-enforced
+    // deadline. A Job's activeDeadlineSeconds counts from when it starts, so a
+    // job lease attests no expiry and a caller with a deadline fails closed.
+    const attestedExpiresAt =
+      isSandboxCrBackend && shutdown.requested ? new Date(shutdown.shutdownMs).toISOString() : undefined;
+    loginPtySessions.rememberLease({
+      providerLeaseId: jobName,
+      companyId: params.companyId,
+      environmentId: params.environmentId,
+      config,
+      namespace,
+      podName,
+      backend: config.backend,
+      expiresAtMs: isSandboxCrBackend ? shutdown.shutdownMs : null,
+    });
+
     return {
       providerLeaseId: jobName,
       metadata: leaseMetadata as unknown as Record<string, unknown>,
+      ...(attestedExpiresAt ? { expiresAt: attestedExpiresAt } : {}),
     };
   },
 
@@ -522,6 +603,17 @@ const plugin = definePlugin({
       // resumed lease can skip its readiness poll.
       readySandboxesByLease.add(params.providerLeaseId);
     }
+
+    loginPtySessions.rememberLease({
+      providerLeaseId: params.providerLeaseId,
+      companyId: params.companyId,
+      environmentId: params.environmentId,
+      config,
+      namespace,
+      podName: check.podName,
+      backend: leaseBackend,
+      expiresAtMs: null,
+    });
 
     const leaseMetadata: KubernetesLeaseMetadata = {
       namespace,
@@ -598,6 +690,7 @@ const plugin = definePlugin({
     // so unrelated concurrent leases keep their in-flight buffers intact.
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
+    await loginPtySessions.forgetLease(params.providerLeaseId);
 
     try {
       await releaseOrchestrator.release(clients, namespace, params.providerLeaseId);
@@ -636,6 +729,7 @@ const plugin = definePlugin({
     // cluster says — the lease is dead either way.
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
+    await loginPtySessions.forgetLease(params.providerLeaseId);
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
@@ -1036,6 +1130,42 @@ const plugin = definePlugin({
       remoteDir,
       timeoutMs,
     });
+  },
+
+  // Login pseudo-terminal for the provider-generic sign-in flow. The fixed
+  // command runs on a terminal exec in the lease's Sandbox pod, never in the
+  // server or worker process. Output and exit go through `ctx.loginPty`. A lease
+  // this worker did not acquire or resume, a lease of another company or
+  // environment, and a job-backend lease fail closed.
+  async onLoginPtyOpen(params) {
+    return await loginPtySessions.open(params, {
+      openSession: async (target, request) =>
+        openKubernetesLoginPtySession(await resolveLoginPodExec(target), {
+          loginCommandKey: request.loginCommandKey,
+          sessionHome: request.sessionHome,
+        }),
+      output: (hostRouteId, workerSessionId, chunk) =>
+        pluginContext?.loginPty.output(hostRouteId, workerSessionId, chunk),
+      exit: (hostRouteId, workerSessionId, exitCode) =>
+        pluginContext?.loginPty.exit(hostRouteId, workerSessionId, exitCode),
+    });
+  },
+
+  async onLoginPtyInput(params) {
+    loginPtySessions.input(params);
+  },
+
+  async onLoginPtyStop(params) {
+    loginPtySessions.stop(params);
+  },
+
+  // Idempotent: acknowledges a route that is already closed or never opened.
+  async onLoginPtyClose(params) {
+    return await loginPtySessions.close(params);
+  },
+
+  async onShutdown() {
+    await loginPtySessions.closeAll();
   },
 });
 

@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.kubernetes-sandbox-provider";
-const PLUGIN_VERSION = "0.1.0-alpha.1";
+const PLUGIN_VERSION = "0.1.0-alpha.2";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -23,6 +23,9 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Kubernetes",
       description:
         "Dispatches agent runs in per-tenant Kubernetes namespaces. Default backend (sandbox-cr, alpha) uses kubernetes-sigs/agent-sandbox for multi-command exec; fallback backend (job) uses stable batch/v1 Job for clusters without agent-sandbox installed.",
+      // Subscription sign-in (`claude setup-token`, `codex login --device-auth`)
+      // runs on a terminal exec in the lease's Sandbox pod. sandbox-cr backend only.
+      supportsLoginPty: true,
       configSchema: {
         type: "object",
         properties: {

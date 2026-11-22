@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildSandboxCrManifest as buildRawSandboxCrManifest, type BuildSandboxCrManifestInput } from "../../src/sandbox-cr-builder.js";
+import {
+  buildSandboxCrManifest as buildRawSandboxCrManifest,
+  resolveSandboxShutdownMs,
+  type BuildSandboxCrManifestInput,
+} from "../../src/sandbox-cr-builder.js";
 import type { SandboxCrManifestView } from "./manifest-views.js";
 
 const buildSandboxCrManifest = (input: BuildSandboxCrManifestInput) =>
@@ -137,5 +141,44 @@ describe("buildSandboxCrManifest", () => {
   it("does not set imagePullSecrets when not provided", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.spec.podTemplate.spec.imagePullSecrets).toBeUndefined();
+  });
+});
+
+describe("Sandbox shutdown time", () => {
+  const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+
+  it("uses an explicit shutdownTime over the activeDeadlineSec default", () => {
+    const cr = buildRawSandboxCrManifest({
+      ...baseInput,
+      activeDeadlineSec: 3600,
+      shutdownTime: "2026-01-01T00:10:00.000Z",
+    }) as { spec: { shutdownTime: string } };
+    expect(cr.spec.shutdownTime).toBe("2026-01-01T00:10:00.000Z");
+  });
+
+  it("is the configured lifetime when no deadline is requested", () => {
+    expect(resolveSandboxShutdownMs({ nowMs, podActivityDeadlineSec: 3600 })).toEqual({
+      shutdownMs: nowMs + 3_600_000,
+      requested: false,
+    });
+  });
+
+  it("is the earlier of the configured lifetime and the requested deadline, rounded down to a second", () => {
+    expect(
+      resolveSandboxShutdownMs({ nowMs, podActivityDeadlineSec: 3600, requestedExpiresAt: "2026-01-01T00:10:00.900Z" }),
+    ).toEqual({ shutdownMs: Date.parse("2026-01-01T00:10:00.000Z"), requested: true });
+    expect(
+      resolveSandboxShutdownMs({ nowMs, podActivityDeadlineSec: 60, requestedExpiresAt: "2026-01-01T00:10:00.000Z" }),
+    ).toEqual({ shutdownMs: nowMs + 60_000, requested: true });
+  });
+
+  it("rejects a requested deadline that has passed", () => {
+    expect(() =>
+      resolveSandboxShutdownMs({ nowMs, podActivityDeadlineSec: 3600, requestedExpiresAt: "2025-12-31T23:59:59.000Z" }),
+    ).toThrow(/already passed/);
+  });
+
+  it("ignores an unparseable requested deadline", () => {
+    expect(resolveSandboxShutdownMs({ nowMs, podActivityDeadlineSec: 3600, requestedExpiresAt: "soon" }).requested).toBe(false);
   });
 });

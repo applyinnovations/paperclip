@@ -30,6 +30,33 @@ export interface BuildSandboxCrManifestInput {
   runtimeClassName?: string;
   imagePullSecrets?: string[];
   activeDeadlineSec?: number;
+  /**
+   * Absolute shutdown time (RFC 3339). When set it overrides the
+   * `activeDeadlineSec`-relative default, so a caller with its own deadline
+   * (a login lease) can bound the Sandbox at or before it and attest that time.
+   */
+  shutdownTime?: string;
+}
+
+/**
+ * The Sandbox shutdown time for a new lease: the configured lifetime, cut to the
+ * caller's deadline when it is earlier. Rounded down to whole seconds, because
+ * the API server stores the time at second precision; the attested expiry is
+ * then exactly what the controller enforces, never later.
+ */
+export function resolveSandboxShutdownMs(input: {
+  nowMs: number;
+  podActivityDeadlineSec: number;
+  requestedExpiresAt?: string | null;
+}): { shutdownMs: number; requested: boolean } {
+  const defaultMs = input.nowMs + input.podActivityDeadlineSec * 1000;
+  const requestedMs = input.requestedExpiresAt ? Date.parse(input.requestedExpiresAt) : Number.NaN;
+  const requested = Number.isFinite(requestedMs);
+  if (requested && requestedMs <= input.nowMs) {
+    throw new Error("Kubernetes lease: the requested expiry has already passed.");
+  }
+  const shutdownMs = requested ? Math.min(defaultMs, requestedMs) : defaultMs;
+  return { shutdownMs: Math.floor(shutdownMs / 1000) * 1000, requested };
 }
 
 export function buildSandboxCrManifest(
@@ -50,7 +77,9 @@ export function buildSandboxCrManifest(
     },
     spec: {
       // The controller reaps an orphan even if Paperclip cannot release it.
-      shutdownTime: new Date(Date.now() + (input.activeDeadlineSec ?? 3600) * 1000).toISOString(),
+      shutdownTime:
+        input.shutdownTime ??
+        new Date(Date.now() + (input.activeDeadlineSec ?? 3600) * 1000).toISOString(),
       shutdownPolicy: "Delete",
       podTemplate: {
         metadata: {

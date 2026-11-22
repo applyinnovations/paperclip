@@ -24,6 +24,13 @@ describe("adapterRegistrySchema", () => {
     expect(parsed[0].runtimeImage).toBeUndefined();
   });
 
+  it("accepts the optional sign-in egress allow-list", () => {
+    const parsed = adapterRegistrySchema.parse([
+      { adapterType: "codex_local", loginAllowFqdns: ["auth.openai.com"] },
+    ]);
+    expect(parsed[0].loginAllowFqdns).toEqual(["auth.openai.com"]);
+  });
+
   it("rejects an entry with no adapterType", () => {
     expect(() => adapterRegistrySchema.parse([{ enabled: true }])).toThrow();
   });

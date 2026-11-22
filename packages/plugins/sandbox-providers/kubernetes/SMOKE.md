@@ -116,6 +116,22 @@ Expected:
 - Job `pc-{ulid}` and its child Pod
 - Secret `pc-{ulid}-env` with `ownerReferences` pointing at the Job
 
+### 7b. Subscription sign-in (sandbox-cr backend)
+
+Needs an agent runtime image with the `claude` or `codex` CLI on `PATH` (and `node` for Codex), and, in `cilium` mode, egress to the sign-in hosts listed in the README.
+
+1. In the UI, add a Claude or ChatGPT subscription connection and pick the `k8s-sandbox` environment.
+2. While the prompt is shown, check the sign-in Sandbox and its deadline:
+
+   ```bash
+   kubectl --context kind-paperclip get sandboxes.agents.x-k8s.io -n paperclip-smoke \
+     -o custom-columns=NAME:.metadata.name,SHUTDOWN:.spec.shutdownTime
+   ```
+
+   For Claude, `SHUTDOWN` is no later than the sign-in session deadline.
+3. Complete the sign-in in the browser and paste the code. Expected: the connection is created, and the sign-in Sandbox is deleted when the session ends.
+4. Negative check: switch the environment to `backend: "job"` and start a sign-in. Expected: it fails without opening a terminal.
+
 ### 8. Tear down
 
 ```bash
