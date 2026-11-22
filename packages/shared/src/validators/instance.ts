@@ -22,6 +22,9 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+// A sandbox provider key (plugin driverKey), e.g. "mac-lanes".
+const sandboxProviderKeySchema = z.string().max(100).regex(/^[a-z0-9][a-z0-9._-]*$/);
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
@@ -31,6 +34,8 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Sandbox providers also allowed under executionMode "kubernetes".
+  allowedSandboxProviders: z.array(sandboxProviderKeySchema).max(16).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

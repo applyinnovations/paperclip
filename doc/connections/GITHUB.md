@@ -75,6 +75,131 @@ If an unapproved enrollment link expires, return to setup and select
 live pending enrollment or replaces an expired one; this does not revoke or
 repeat an existing instance approval.
 
+### Operator-owned GitHub App
+
+A self-hosted operator can use their own GitHub App instead of enrolling with
+Paperclip Cloud. The server reads the App private key from a file and mints a
+one-hour installation access token for git, `gh` and checkouts; agents only
+receive that token through the brokered launchers, never the key. Tokens are
+cached per App installation and refreshed ten minutes before expiry. Tokens are
+never logged.
+
+There are two configuration forms. Use one of them, not both: if
+`PAPERCLIP_GITHUB_APPS_FILE` and any `PAPERCLIP_GITHUB_APP_*` variable are both
+set, the server refuses to start.
+
+#### One App per company (recommended for several companies)
+
+Give each company its own GitHub App, installed only on that company's
+repositories. GitHub then sees a different bot identity per company, and
+repository rules can tell companies apart (for example, a ruleset that lets
+only one company's App bypass required reviews). Set
+`PAPERCLIP_GITHUB_APPS_FILE` to a JSON file:
+
+```json
+{
+  "apps": [
+    {
+      "companyId": "a9d886a3-e526-461c-95d6-d2d0d6b6c722",
+      "appId": "5462605",
+      "installationId": "175009740",
+      "privateKeyFile": "/var/run/paperclip-github-apps/apply/private-key.pem",
+      "webhookSecretFile": "/var/run/paperclip-github-apps/apply/webhook-secret",
+      "repositories": ["xlab-deployments"]
+    }
+  ]
+}
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `companyId` | yes | Paperclip company UUID. Each company appears at most once |
+| `appId` | yes | GitHub App ID (string or integer). Each App appears at most once |
+| `installationId` | yes | The App's installation on the company's account. Each appears at most once |
+| `privateKeyFile` | yes | Absolute path to the App private key (PEM), e.g. a mounted secret |
+| `webhookSecretFile` | no | Absolute path to the App webhook secret, for host-side webhook verification |
+| `repositories` | no | Repository names (no owner) to scope each token to |
+
+The file holds only IDs and paths. Keys and webhook secrets stay in their own
+files. The server validates the file and reads every key and webhook secret at
+startup. It refuses to start on any error: unreadable or invalid JSON, an
+unknown key, a malformed ID, a company, App or installation listed twice, a
+relative path, an unreadable or non-PEM private key, or an empty webhook
+secret. The file is read once; restart the server after you change it. Key
+files are read again whenever a token is minted, so a rotated key needs no
+restart.
+
+A company that is not in the file has no App. It falls through the identity
+resolution order below exactly as before.
+
+#### One App for an allow-list of companies
+
+| Variable | Meaning |
+| --- | --- |
+| `PAPERCLIP_GITHUB_APP_ID` | App ID |
+| `PAPERCLIP_GITHUB_APP_INSTALLATION_ID` | Installation to mint tokens for |
+| `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE` | Path to the App private key (PEM), e.g. a mounted secret |
+| `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | Comma-separated companies allowed to use it |
+| `PAPERCLIP_GITHUB_APP_REPOSITORIES` | Optional repository names to scope each token to |
+
+This form is unchanged. All allow-listed companies share one bot identity and
+one token. A partial configuration, unreadable key or missing installation
+fails closed when a token is needed; the server logs a warning at startup but
+still starts. This form has no webhook secret.
+
+#### Behaviour common to both forms
+
+The App applies only to companies with no managed GitHub connection, and only
+to runs whose trust policy allows GitHub credentials. Commits are attributed to
+`<app-slug>[bot]`.
+
+#### GitHub App permissions
+
+Create each App with these repository permissions:
+
+| Permission | Access | Used by |
+| --- | --- | --- |
+| Metadata | Read | Required by GitHub for every App |
+| Contents | Read and write | Clone, fetch and push |
+| Pull requests | Read and write | Open, update and review pull requests |
+| Issues | Read and write | GitHub plugin: issue and comment sync (forthcoming) |
+| Checks | Read | GitHub plugin: CI status on pull requests (forthcoming) |
+| Commit statuses | Read | GitHub plugin: legacy CI status (forthcoming) |
+
+Grant **Workflows** write only if agents must change `.github/workflows/`.
+Install the App only on the company's own repositories (**Only select
+repositories**).
+
+#### Webhooks (forthcoming GitHub plugin)
+
+A Paperclip GitHub plugin will receive App webhooks and sync GitHub with
+Paperclip. It is not available yet. When it is:
+
+1. In the App settings, enable **Active** under **Webhook**.
+2. Set the **Webhook URL** to
+   `https://<paperclip-host>/api/plugins/<pluginId>/webhooks/<endpointKey>`.
+   The plugin documents its `pluginId` and `endpointKey`.
+3. Generate a random **Webhook secret**. Store it in a secret file and set
+   `webhookSecretFile` for the App.
+4. Subscribe to these events: **Pull request**, **Pull request review**,
+   **Pull request review comment**, **Issues**, **Issue comment**, **Push**,
+   **Check suite**, **Check run** and **Status**. The final list is set by the
+   plugin.
+
+The plugin never reads App private keys or webhook secrets. Plugins use two
+host services, each behind its own capability:
+
+- `ctx.githubApp.getInstallationToken()` (`github.app.token`) returns a
+  short-lived installation token for the current invocation's company, or
+  `null` when that company has no App. A request for any other company is
+  denied.
+- `ctx.githubApp.verifyWebhook({ headers, rawBody })`
+  (`github.app.webhooks.verify`) checks `X-Hub-Signature-256` on the host
+  against the App named by `X-GitHub-Hook-Installation-Target-ID`. It returns
+  the App's company only when the signature is valid and the delivery is for
+  the configured installation. The plugin must deduplicate on
+  `X-GitHub-Delivery`, because a valid signature does not prevent replay.
+
 ## Identity resolution
 
 Fresh setup does not reuse an archived personal connection found by name and
@@ -90,8 +215,10 @@ and webhook binding uses the same order:
 2. The active personal GitHub grant owned by the run's `responsibleUserId`.
 3. For automated work without a responsible user, a personal grant only when
    an existing standing delegation names the agent.
-4. Legacy `GH_TOKEN`/`GITHUB_TOKEN` only when no managed GitHub connection is
-   configured for the company.
+4. When no managed GitHub connection is configured for the company: a company
+   `GITHUB_TOKEN`/`GH_TOKEN` secret for server-side checkouts, then the
+   operator's own GitHub App (below), then the legacy server
+   `GH_TOKEN`/`GITHUB_TOKEN`.
 
 An unavailable or ambiguous managed identity fails visibly. It never falls
 through to another person, an organization credential, or a legacy token.

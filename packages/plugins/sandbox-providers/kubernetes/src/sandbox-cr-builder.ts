@@ -11,9 +11,8 @@
  * non-root, drop ALL caps, read-only rootFS, Tini PID 1, seccomp
  * RuntimeDefault, fsGroupChangePolicy OnRootMismatch, automountSAToken=false.
  *
- * NOTE: paperclip-server runs OUTSIDE the cluster, so we cannot set ownerReferences
- * on the Sandbox CR (the owner would need to be an in-cluster resource). The
- * release path is explicit delete via sandboxCrOrchestrator.release().
+ * Lease release explicitly deletes the Sandbox; the native shutdown deadline
+ * also bounds its lifetime if the Paperclip server cannot release it.
  */
 
 export interface BuildSandboxCrManifestInput {
@@ -30,6 +29,7 @@ export interface BuildSandboxCrManifestInput {
   };
   runtimeClassName?: string;
   imagePullSecrets?: string[];
+  activeDeadlineSec?: number;
 }
 
 export function buildSandboxCrManifest(
@@ -40,16 +40,18 @@ export function buildSandboxCrManifest(
     "paperclip.io/role": "agent",
   };
   return {
-    apiVersion: "agents.x-k8s.io/v1alpha1",
+    apiVersion: "agents.x-k8s.io/v1beta1",
     kind: "Sandbox",
     metadata: {
       name: input.sandboxName,
       namespace: input.namespace,
       labels: { ...input.labels },
-      // No ownerReferences: paperclip-server is out-of-cluster. Release is
-      // explicit delete.
+      // The lease lifecycle owns deletion; its absolute deadline also reaps orphans.
     },
     spec: {
+      // The controller reaps an orphan even if Paperclip cannot release it.
+      shutdownTime: new Date(Date.now() + (input.activeDeadlineSec ?? 3600) * 1000).toISOString(),
+      shutdownPolicy: "Delete",
       podTemplate: {
         metadata: {
           labels: podLabels,

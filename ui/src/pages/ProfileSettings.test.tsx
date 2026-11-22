@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sanitizeAssetNamespace } from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
@@ -98,7 +99,7 @@ describe("ProfileSettings", () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
-      root.render(<QueryClientProvider client={queryClient}><ProfileSettings /></QueryClientProvider>);
+      root.render(<QueryClientProvider client={queryClient}><MemoryRouter><ProfileSettings /></MemoryRouter></QueryClientProvider>);
     });
     await flushReact();
     expect(container.textContent).toContain("Jane Example");
@@ -116,7 +117,7 @@ describe("ProfileSettings", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <ProfileSettings />
+          <MemoryRouter><ProfileSettings /></MemoryRouter>
         </QueryClientProvider>,
       );
     });
@@ -171,7 +172,7 @@ describe("ProfileSettings", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <ProfileSettings />
+          <MemoryRouter><ProfileSettings /></MemoryRouter>
         </QueryClientProvider>,
       );
     });

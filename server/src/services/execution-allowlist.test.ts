@@ -115,6 +115,30 @@ describe("evaluateExecutionAllowlist", () => {
     });
   });
 
+  describe('executionMode "kubernetes" with allowedSandboxProviders', () => {
+    const policy = { executionMode: "kubernetes" as const, allowedSandboxProviders: ["mac-lanes"] };
+    const macLanesEnv: ExecutionEnvironmentCandidate = { driver: "sandbox", provider: "mac-lanes" };
+
+    it("allows a listed sandbox provider", () => {
+      expect(evaluateExecutionAllowlist(policy, macLanesEnv).allowed).toBe(true);
+    });
+
+    it("still allows kubernetes", () => {
+      expect(evaluateExecutionAllowlist(policy, kubernetesEnv).allowed).toBe(true);
+    });
+
+    it("denies an unlisted sandbox provider", () => {
+      expect(evaluateExecutionAllowlist(policy, fakeSandboxEnv).allowed).toBe(false);
+    });
+
+    it("never widens to local or ssh, even when listed by name", () => {
+      const wide = { executionMode: "kubernetes" as const, allowedSandboxProviders: ["local", "ssh"] };
+      expect(evaluateExecutionAllowlist(wide, localEnv).allowed).toBe(false);
+      expect(evaluateExecutionAllowlist(wide, sshEnv).allowed).toBe(false);
+      expect(evaluateExecutionAllowlist(wide, { driver: "local", provider: "local" }).allowed).toBe(false);
+    });
+  });
+
   describe("isExecutionForcedToKubernetes helper", () => {
     it("reflects the policy", async () => {
       const { isExecutionForcedToKubernetes } = await import("./execution-allowlist.js");

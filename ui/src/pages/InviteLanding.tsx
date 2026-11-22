@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AGENT_ADAPTER_TYPES } from "@paperclipai/shared";
 import type { AgentAdapterType, JoinRequest } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
+import { OidcSignIn } from "@/components/OidcSignIn";
 import { CompanyPatternIcon } from "@/components/CompanyPatternIcon";
 import { useCompany } from "@/context/CompanyContext";
 import { Link, useNavigate, useParams } from "@/lib/router";
@@ -235,6 +236,8 @@ export function InviteLandingPage() {
     queryKey: queryKeys.health,
     queryFn: () => healthApi.get(),
   });
+  // OIDC-only instances refuse every password endpoint; offer single sign-on alone.
+  const passwordLoginDisabled = healthQuery.data?.passwordLoginDisabled === true;
   const sessionQuery = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
@@ -666,6 +669,16 @@ export function InviteLandingPage() {
                   {acceptMutation.isPending ? "Working..." : joinButtonLabel}
                 </Button>
               </div>
+            ) : requiresHumanAccount && passwordLoginDisabled ? (
+              <div className="space-y-5">
+                <div>
+                  <h2 className="text-lg font-semibold">Sign in to continue</h2>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    {`Sign in with single sign-on. After that, you'll come right back here to accept the invite for ${companyDisplayName}.`}
+                  </p>
+                </div>
+                <OidcSignIn callbackURL={`/invite/${encodeURIComponent(token)}`} />
+              </div>
             ) : requiresHumanAccount ? (
               <div className="space-y-5">
                 <div>
@@ -809,6 +822,8 @@ export function InviteLandingPage() {
                         : "Create account and continue"}
                   </Button>
                 </form>
+
+                <OidcSignIn callbackURL={`/invite/${encodeURIComponent(token)}`} />
 
                 <p className="text-xs leading-5 text-zinc-500">
                   {authMode === "sign_up"

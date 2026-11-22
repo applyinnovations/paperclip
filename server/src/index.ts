@@ -194,6 +194,8 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, resolveLocalRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { checkGitHubAppsConfigAtStartup } from "./services/github-app-config.js";
+import { checkRunMcpServersConfigAtStartup } from "./services/run-mcp-servers.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -774,6 +776,23 @@ async function startServerWithDatabaseTeardown(
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
+
+  if (config.authDisablePasswordLogin && config.deploymentMode !== "authenticated") {
+    throw new Error("PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true requires authenticated deployment mode and OIDC sign-in.");
+  }
+
+  // Per-company GitHub Apps fail closed: a bad mapping or unreadable key stops startup.
+  const githubApps = await checkGitHubAppsConfigAtStartup();
+  if (githubApps.status === "warning") {
+    logger.warn({ error: githubApps.error }, "GitHub App configuration is invalid; GitHub App credentials are unavailable");
+  } else if (githubApps.status === "enabled") {
+    logger.info({ source: githubApps.source, apps: githubApps.apps }, "GitHub App credentials configured");
+  }
+  // Run-scoped MCP server tokens fail closed: a bad file or unreadable client secret stops startup.
+  const runMcpServers = await checkRunMcpServersConfigAtStartup();
+  if (runMcpServers.status === "enabled") {
+    logger.info({ servers: runMcpServers.servers }, "Run-scoped MCP servers configured");
+  }
   
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
@@ -849,6 +868,12 @@ async function startServerWithDatabaseTeardown(
       "Authenticated mode auth origin configuration",
     );
     const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
+    if (config.authDisablePasswordLogin) {
+      // Await OIDC discovery now: with password sign-in disabled, a provider that
+      // cannot initialize must stop startup rather than leave no sign-in method.
+      await auth.ready();
+      logger.info("Password sign-in is disabled; OIDC is the only interactive sign-in method");
+    }
     betterAuthHandler = createBetterAuthHandler(auth);
     resolveSession = (req) => resolveBetterAuthSession(auth, req);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
@@ -987,6 +1012,7 @@ async function startServerWithDatabaseTeardown(
     authPublicBaseUrl: config.authPublicBaseUrl,
     chatWebhookPublicBaseUrl: config.chatWebhookPublicBaseUrl,
     authReady,
+    passwordLoginDisabled: config.authDisablePasswordLogin,
     companyDeletionEnabled: config.companyDeletionEnabled,
     announcements: { enabled: config.announcementsEnabled, feedUrl: config.announcementsFeedUrl },
     pluginMigrationDb: pluginMigrationDb as any,

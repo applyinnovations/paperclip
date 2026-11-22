@@ -34,6 +34,8 @@ export type HealthStatus = {
   deploymentExposure?: "private" | "public";
   localAiLoginSupported?: boolean;
   authReady?: boolean;
+  /** OIDC-only sign-in: the server refuses every email/password endpoint. */
+  passwordLoginDisabled?: boolean;
   bootstrapStatus?: "ready" | "bootstrap_pending";
   bootstrapInviteActive?: boolean;
   /** The unclaimed Cloud app is ready; this response did not probe SQL. */

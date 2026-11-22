@@ -6,6 +6,7 @@ import { authApi } from "@/api/auth";
 import { useAccountBoundMutation } from "@/hooks/useAccountBoundMutation";
 import { assetsApi } from "@/api/assets";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
+import { healthApi } from "@/api/health";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -16,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { describeError } from "@/api/errors";
+import { OidcSignIn } from "@/components/OidcSignIn";
 
 function deriveInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -37,6 +39,13 @@ export function ProfileSettings() {
     queryFn: () => authApi.getSession(),
   });
   const sessionView = useQueryView(sessionQuery);
+  // Linking confirms a local password, which OIDC-only instances refuse.
+  const healthQuery = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const passwordLoginDisabled = healthQuery.data?.passwordLoginDisabled === true;
 
   useEffect(() => {
     setBreadcrumbs([
@@ -174,6 +183,7 @@ export function ProfileSettings() {
       ) : null}
 
       <section className="space-y-8">
+        {passwordLoginDisabled ? null : <OidcSignIn link />}
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
           <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />
           <div className="absolute inset-0 bg-(image:--gradient-extract-7)" />
