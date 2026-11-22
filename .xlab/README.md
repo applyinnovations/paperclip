@@ -37,9 +37,65 @@ stays reachable from it.
    test user under a child reaper) rather than editing upstream's tests.
    When a test fails only in our CI, fix that environment first.
 3. Add or update the change's row in [PATCHES.md](PATCHES.md).
+   `tekton-xlab / fork-guard-` (below) fails a PR that changes anything
+   outside `.xlab/`, `.tekton/` and `OWNERS` without changing it.
 4. If the change is general-purpose, offer it upstream and link the PR. Once
    upstream ships it, the next intake merge carries upstream's version; remove
    ours and its row.
+
+## fork-guard: patches stay generic
+
+Every carried patch must be something upstream could merge: generic,
+upstream-quality, and knowing nothing about this deployment. A system checks
+that, not a reviewer's memory: `.tekton/fork-guard.yaml` runs
+`.xlab/fork_guard.py check` on every pull request into `xlab` as
+`tekton-xlab / fork-guard-`. The script and its deny-list come from a
+separate checkout of the target branch, never the pull request's, so a pull
+request cannot loosen the check it is held to; a change to either applies
+from the PR after the one that merges it.
+
+Relative to the PR's merge base with `xlab`, it fails when the PR:
+
+1. **Changes a migration.** Any added, edited or deleted path under
+   `packages/db/src/migrations/` (SQL, `meta/_journal.json`, snapshots) must
+   then be byte-identical (same blob and mode, or absent in both) to that path
+   in the newest upstream stable release (`vX.Y.Z` tag of
+   `paperclipai/paperclip`) the PR's head contains. The fork never authors a
+   migration: fork state belongs in config, env or plugin storage. An intake
+   merge brings upstream's migrations unchanged and passes; a resolution that
+   edits one, or a migration copied from upstream `master` before it is
+   released, fails.
+2. **Adds a deployment name.** An added line (or added file name) outside
+   `.xlab/`, `.tekton/` and `OWNERS` containing a term from
+   [fork-guard-denylist.txt](fork-guard-denylist.txt), as a whole word in any
+   case (`XlabLogin` and `id.xlab.now` match; `UxLab`, `checkboxLabel` and
+   `replayable` do not). Lines that upstream's release has in the same file
+   are not counted, so an intake of upstream's own "a playable video" passes.
+   Only added lines count: existing fixtures that still carry our names do
+   not block, until they are cleaned up.
+3. **Changes the fork without recording it.** Any change outside `.xlab/`,
+   `.tekton/` and `OWNERS` needs `.xlab/PATCHES.md` changed in the same PR
+   (add, update or remove the change's row). An upstream intake, a PR whose
+   head contains an upstream release `xlab` does not, is exempt: the merge
+   brings upstream's changes, and the intake PR is reviewed by its labels.
+
+Run it locally before opening the PR (it fetches upstream's tags into
+`refs/fork-guard/upstream-tags/`; `FORK_GUARD_NO_FETCH=1` skips that):
+
+```sh
+python3 .xlab/fork_guard.py check origin/xlab HEAD
+```
+
+`report` lists every deny-list match in a tree (default `HEAD`) outside
+`.xlab/`, `.tekton/` and `OWNERS` that upstream's release does not have, for
+the cleanup of existing fixtures. It never fails:
+
+```sh
+python3 .xlab/fork_guard.py report origin/xlab
+```
+
+Tests: `.xlab/test_fork_guard.py` (run with the other `.xlab` tests in every
+PR's checks).
 
 ## Taking upstream
 

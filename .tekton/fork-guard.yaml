@@ -1,0 +1,118 @@
+# Check "tekton-xlab / fork-guard-" on pull requests into xlab: carried
+# patches stay generic (.xlab/fork_guard.py; rules in .xlab/README.md).
+# The script and its deny-list come from the target branch (clone-base), not
+# the pull request, so a pull request cannot loosen the check it is held to.
+# Sandboxed Nix with python3 from the target branch's .xlab flake pin; no
+# credentials beyond PaC's read-only clone token, which only the clone tasks
+# see.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: fork-guard-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+spec:
+  params:
+    - name: revision
+      value: "{{ revision }}"
+    - name: target-branch
+      value: "{{ target_branch }}"
+  taskRunTemplate:
+    serviceAccountName: default
+    podTemplate:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+  taskRunSpecs:
+    - pipelineTaskName: guard
+      podTemplate:
+        hostUsers: false
+      stepSpecs:
+        # git diff and python3 over one pull request: well under the Task's
+        # default request.
+        - name: run
+          computeResources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "4", memory: 4Gi }
+  timeouts:
+    pipeline: 20m
+  pipelineSpec:
+    params:
+      - name: revision
+        type: string
+      - name: target-branch
+        type: string
+    workspaces:
+      - name: source
+      - name: git-auth
+    tasks:
+      - name: clone
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+          - name: additionalRefspecs
+            value: +refs/heads/$(params.target-branch):refs/remotes/origin/ci-base
+          # Full history: the merge base with the target branch and which
+          # upstream releases HEAD contains.
+          - { name: depth, value: "0" }
+        workspaces:
+          - { name: output, workspace: source, subPath: pr }
+          - { name: basic-auth, workspace: git-auth }
+      # The target branch's .xlab/: the script that judges the pull request.
+      - name: clone-base
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: refs/heads/$(params.target-branch) }
+          - { name: sparseCheckoutPatterns, value: /.xlab/ }
+        workspaces:
+          - { name: output, workspace: source, subPath: base }
+          - { name: basic-auth, workspace: git-auth }
+      - name: guard
+        timeout: 10m
+        runAfter: [clone, clone-base]
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
+        params:
+          - { name: WORKING_DIR, value: pr }
+          - name: SCRIPT
+            value: >-
+              nix shell --inputs-from "path:$PWD/../base/.xlab" nixpkgs#python3 --command
+              python3 -I ../base/.xlab/fork_guard.py check origin/ci-base HEAD
+        workspaces:
+          - { name: source, workspace: source }
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: scratch-local
+          resources:
+            requests:
+              storage: 20Gi
+    - name: git-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
