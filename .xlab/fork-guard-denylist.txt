@@ -1,0 +1,17 @@
+# Deployment-specific names that must not appear outside .xlab/ and .tekton/.
+# Read by .xlab/fork_guard.py from the pull request's target branch, so a pull
+# request cannot loosen the list it is checked against.
+#
+# One term per line; '#' starts a comment. Matching ignores case. A term
+# matches only as a whole word: the characters around it must not be letters
+# or digits, except at a camelCase boundary (so "XlabLogin" and "isXlab" match,
+# "UxLab", "checkboxLabel" and "replayable" do not). A space in a term matches
+# any run of spaces, '-', '_' or '.'.
+xlab
+xlab.now
+applyinnovations
+apply innovations
+applyinnovations.com.au
+calile
+kinesislabs
+playable
