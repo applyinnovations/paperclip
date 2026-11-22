@@ -1,0 +1,120 @@
+# Weekly full test suite on xlab (about 2 hours on one pod; upstream spreads
+# it over ~25 jobs), triggered on Sundays (UTC) through the PaC incoming
+# webhook by deployments' nightly-cron-trigger. Not a required check;
+# failures show on the xlab commit. Pull requests, including upstream
+# intake ones, test only what differs from tested source (.xlab/ci.sh).
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: test-full-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[incoming]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+spec:
+  params:
+    - name: revision
+      value: "{{ revision }}"
+  taskRunTemplate:
+    serviceAccountName: default
+    podTemplate:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      nodeSelector:
+        storage.xlab.now/fast-local: "true"
+  timeouts:
+    pipeline: 250m
+  taskRunSpecs:
+    - pipelineTaskName: checks
+      podTemplate:
+        hostUsers: false
+      stepSpecs:
+        # Measured peak over the 14 days to 22 Nov 2026: RSS 8.3 GiB, working
+        # set 9.0 GiB. Request what it uses so it is not packed onto a small node.
+        - name: run
+          computeResources:
+            requests: { cpu: "1", memory: 10Gi }
+            limits: { cpu: "12", memory: 24Gi }
+    - pipelineTaskName: publish-cache
+      serviceAccountName: nix-cache-publisher
+  pipelineSpec:
+    params:
+      - name: revision
+        type: string
+    workspaces:
+      - name: source
+      - name: git-auth
+      - name: nix-cache-export
+    tasks:
+      - name: clone
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+        workspaces:
+          - { name: output, workspace: source }
+          - { name: basic-auth, workspace: git-auth }
+      - name: checks
+        timeout: 240m
+        runAfter: [clone]
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
+        params:
+          - name: SCRIPT
+            value: nix develop ./.xlab --command .xlab/ci.sh
+        workspaces:
+          - { name: source, workspace: source }
+          - { name: nix-cache-export, workspace: nix-cache-export }
+    # Scheduled runs publish what the checks exported to the shared Nix cache.
+    finally:
+      - name: publish-cache
+        taskRef:
+          resolver: cluster
+          params:
+            - name: kind
+              value: task
+            - name: name
+              value: nix-cache-publish-v1
+            - name: namespace
+              value: tekton-pipelines
+        workspaces:
+          - name: nix-cache-export
+            workspace: nix-cache-export
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: scratch-local
+          resources:
+            requests:
+              storage: 20Gi
+    - name: git-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
+    # The checks' cache export (store paths the Nix cache lacks, written only
+    # on scheduled runs) for publish-cache. The checks keep their own Nix store.
+    - name: nix-cache-export
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: scratch-local
+          resources:
+            requests:
+              storage: 10Gi

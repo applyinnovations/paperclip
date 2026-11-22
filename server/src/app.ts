@@ -53,6 +53,7 @@ import { agentObservabilityRoutes } from "./routes/agent-observability.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { taskWorkspaceRoutes } from "./routes/task-workspaces.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
+import { runMcpRoutes } from "./routes/run-mcp.js";
 import { emailChannelService } from "./services/email-channels.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
@@ -196,6 +197,7 @@ import {
 } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  resolveSelfHostedAutoInstallKeys,
   BUNDLED_PLUGIN_CATALOG,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
@@ -459,6 +461,8 @@ export async function createApp(
     authPublicBaseUrl?: string;
     chatWebhookPublicBaseUrl?: string;
     authReady: boolean;
+    /** OIDC-only sign-in; reported by `/api/health` so the UI hides password forms. */
+    passwordLoginDisabled?: boolean;
     companyDeletionEnabled: boolean;
     announcements?: { enabled: boolean; feedUrl: string };
     instanceId?: string;
@@ -492,6 +496,7 @@ export async function createApp(
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     authReady: opts.authReady,
+    passwordLoginDisabled: opts.passwordLoginDisabled,
     companyDeletionEnabled: opts.companyDeletionEnabled,
     databaseBackupHealth: opts.databaseBackupHealth,
     isWarmStandby,
@@ -658,11 +663,16 @@ export async function createApp(
     res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? ""), req.actor));
   });
   const managedAutoInstallKeys = resolveManagedBundledPluginKeys(opts.managedPluginAutoInstall);
+  // A self-hosted operator may select bundled and distribution plugins with
+  // PAPERCLIP_PLUGIN_AUTO_INSTALL; the selection then also gates which
+  // distribution plugins may activate, as a managed list does.
+  const selfHostedAutoInstallKeys =
+    managedAutoInstallKeys === null ? resolveSelfHostedAutoInstallKeys(process.env) : null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
-    managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
+    managedAutoInstallKeys ?? selfHostedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
     {
       catalogRoot: bundledCatalogRoot,
       env: process.env,
@@ -795,6 +805,7 @@ export async function createApp(
   api.use(assetRoutes(db, opts.storageService));
   api.use(agentProfileAvatarRoutes(db, opts.storageService));
   api.use(projectToolRoutes(db));
+  api.use(runMcpRoutes(db));
   api.use(taskWorkspaceRoutes(db));
   api.use(projectRoutes(db));
   api.use(caseRoutes(db, opts.storageService));
@@ -948,7 +959,7 @@ export async function createApp(
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
-      assertPackageActivation: bundledPackageResolver?.assertActivation ?? distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
+      assertPackageActivation: bundledPackageResolver?.assertActivation ?? distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys ?? selfHostedAutoInstallKeys),
       resolvePackageRoot: bundledPackageResolver?.resolve,
       prebuiltOnly: managedAutoInstallKeys !== null,
       enableLocalFilesystem: managedAutoInstallKeys === null,

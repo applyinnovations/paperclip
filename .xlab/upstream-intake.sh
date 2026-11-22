@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Plan bringing the newest upstream stable release into xlab as a merge pull
+# request. Holds no credentials and writes nothing to GitHub: it writes a plan
+# to OUT_DIR, and .tekton/upstream-intake.yaml's publish task, which holds the
+# token and runs no repository code, carries it out.
+#
+#   1. Check fork master can fast-forward to upstream master (the publisher
+#      re-checks and pushes it).
+#   2. Find upstream's newest stable release (GitHub "latest" release).
+#   3. If xlab already contains it, or a PR for it exists, plan nothing more.
+#   4. Otherwise plan branch upstream/<tag> at the release commit and a PR into
+#      xlab, auto-merged (merge commit, after the required checks pass) only
+#      when the release touches no database migration paths and no fork CI
+#      paths, merges without conflicts and upstream's own checks on the
+#      release commit all passed.
+#      Otherwise the PR is labelled for review.
+#
+#   nix develop ./.xlab --command .xlab/upstream-intake.sh OUT_DIR
+#
+# Plan files: tag (absent when there is nothing to open), body.md, labels
+# (one per line) and automerge (true or false).
+set -euo pipefail
+
+out=${1:?usage: upstream-intake.sh OUT_DIR}
+fork=${FORK:-applyinnovations/paperclip}
+upstream=${UPSTREAM:-paperclipai/paperclip}
+base=${BASE_BRANCH:-xlab}
+# Conservative: anything that can change the database schema or data counts.
+# When in doubt a path belongs here; a false positive only means a human review.
+migration_re='(^|/)(migrations?|schema)(/|$)|\.sql$|migrat|drizzle|^packages/db/'
+# The fork's CI: PaC runs .tekton/ from xlab (the default branch), and its
+# pipelines run .xlab/ and hold the intake's credentials. A release that adds
+# or changes either must never reach xlab without a person reading it.
+ci_re='^(\.tekton|\.xlab)/'
+
+mkdir -p "${out}"
+out=$(cd "${out}" && pwd)
+rm -f "${out}/tag" "${out}/body.md" "${out}/labels" "${out}/automerge"
+cd "$(git rev-parse --show-toplevel)"
+
+# Both repositories are public; the two API reads need no token.
+github_api() {
+  curl -fsS --retry 3 -H "Accept: application/vnd.github+json" "https://api.github.com/$1"
+}
+
+git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/${upstream}.git"
+git fetch --quiet origin "+refs/heads/${base}:refs/remotes/origin/${base}" "+refs/heads/master:refs/remotes/origin/master"
+git fetch --quiet --tags upstream "+refs/heads/master:refs/remotes/upstream/master"
+
+if ! git merge-base --is-ancestor origin/master upstream/master; then
+  echo "fork master has diverged from upstream master; not syncing" >&2
+  exit 1
+fi
+
+tag=$(github_api "repos/${upstream}/releases/latest" | jq -r .tag_name)
+[[ ${tag} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected release tag '${tag}'" >&2; exit 1; }
+commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+if git merge-base --is-ancestor "${commit}" "origin/${base}"; then
+  echo "${base} already contains ${tag}"
+  exit 0
+fi
+branch="upstream/${tag}"
+if [ "$(github_api "repos/${fork}/pulls?head=${fork%%/*}:${branch}&state=all" | jq length)" != 0 ]; then
+  echo "a pull request for ${tag} already exists"
+  exit 0
+fi
+
+merge_base=$(git merge-base "origin/${base}" "${commit}")
+migrations=$(git diff --name-only "${merge_base}" "${commit}" | grep -E "${migration_re}" || true)
+ci_changes=$(git diff --name-only "${merge_base}" "${commit}" | grep -E "${ci_re}" || true)
+
+# Upstream verifies a release's exact source before publishing it, and its
+# full test suite runs there, on its own runners. Trust that result instead of
+# re-running the suite: any upstream check on the release commit that did not
+# pass (or no passing check at all) means a person looks first.
+upstream_checks=""
+page=1
+while :; do
+  runs=$(github_api "repos/${upstream}/commits/${commit}/check-runs?filter=latest&per_page=100&page=${page}")
+  upstream_checks+=$(jq -r '.check_runs[] | "\(.conclusion // .status)\t\(.name)"' <<<"${runs}")$'\n'
+  [ "$(jq '.check_runs | length' <<<"${runs}")" -lt 100 ] && break
+  page=$((page + 1))
+done
+upstream_unverified=$(grep -vE $'^(success|skipped|neutral)\t|^$' <<<"${upstream_checks}" | sort -u || true)
+if ! grep -qE $'^success\t' <<<"${upstream_checks}"; then
+  upstream_unverified="no passing upstream check on ${commit}"
+fi
+
+scratch=$(mktemp -d)
+trap 'git worktree remove --force "${scratch}" >/dev/null 2>&1 || true' EXIT
+git worktree add --quiet --detach "${scratch}" "origin/${base}"
+conflicts=""
+merge_log="${scratch}.merge.log"
+if ! git -C "${scratch}" -c user.name=intake -c user.email=intake@xlab.invalid \
+    merge --no-commit --no-ff --quiet "${commit}" >"${merge_log}" 2>&1; then
+  conflicts=$(git -C "${scratch}" diff --name-only --diff-filter=U)
+  # A merge that failed without leaving conflicted files did not run (missing
+  # objects, a git error): fail rather than report "no conflicts".
+  if [ -z "${conflicts}" ]; then
+    echo "trial merge of ${tag} into ${base} failed without conflicts:" >&2
+    cat "${merge_log}" >&2
+    exit 1
+  fi
+fi
+rm -f "${merge_log}"
+
+{
+  echo "Merges upstream stable release [${tag}](https://github.com/${upstream}/releases/tag/${tag}) into \`${base}\`."
+  echo
+  if [ -n "${migrations}" ]; then
+    echo "**Database migrations: yes.** Review before merging; this PR is not auto-merged."
+    echo
+    echo '```'
+    echo "${migrations}" | head -100
+    echo '```'
+  else
+    echo "Database migrations: none detected (rule: \`${migration_re}\`)."
+  fi
+  echo
+  if [ -n "${ci_changes}" ]; then
+    echo "**Fork CI paths changed upstream:** this release adds or changes files under \`.tekton/\` or \`.xlab/\`, which run in our CI with its credentials. Review before merging; this PR is not auto-merged."
+    echo
+    echo '```'
+    echo "${ci_changes}" | head -100
+    echo '```'
+    echo
+  fi
+  if [ -n "${upstream_unverified}" ]; then
+    echo "**Upstream checks on the release commit did not all pass:** review before merging; this PR is not auto-merged."
+    echo
+    echo '```'
+    echo "${upstream_unverified}" | head -50
+    echo '```'
+  else
+    echo "Upstream checks on the release commit: all passed."
+  fi
+  echo
+  if [ -n "${conflicts}" ]; then
+    echo "**Merge conflicts with ${base}:** resolve on this branch, keeping the xlab patches."
+    echo
+    echo '```'
+    echo "${conflicts}"
+    echo '```'
+  fi
+  echo
+  echo "Opened by the nightly upstream-intake pipeline."
+} > "${out}/body.md"
+
+{
+  echo upstream
+  [ -z "${migrations}" ] || echo "needs-review: db-migration"
+  [ -z "${conflicts}" ] || echo "needs-review: conflict"
+  [ -z "${upstream_unverified}" ] || echo "needs-review: upstream-ci"
+  [ -z "${ci_changes}" ] || echo "needs-review: ci-config"
+} > "${out}/labels"
+if [ -z "${migrations}" ] && [ -z "${conflicts}" ] && [ -z "${upstream_unverified}" ] && [ -z "${ci_changes}" ]; then
+  echo true > "${out}/automerge"
+else
+  echo false > "${out}/automerge"
+fi
+echo "${tag}" > "${out}/tag"
+echo "planned ${branch} -> ${base} (automerge: $(cat "${out}/automerge"))"

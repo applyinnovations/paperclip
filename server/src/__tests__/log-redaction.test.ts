@@ -67,6 +67,17 @@ describe("log redaction", () => {
     });
   });
 
+  it.each(["q", "🐈"])("fully masks a one-character identity and its home path: %s", (userName) => {
+    const homes = [`/Users/${userName}`, `/home/${userName}`, `C:\\Users\\${userName}`];
+    const input = `user ${userName}\n${homes.map((home) => `${home}/project`).join("\n")}`;
+    const result = redactCurrentUserText(input, { userNames: [userName], homeDirs: homes });
+
+    expect(maskUserNameForLogs(userName)).toBe("*");
+    expect(result).not.toContain(userName);
+    for (const home of homes) expect(result).not.toContain(home);
+    expect(result).toContain("/project");
+  });
+
   it("skips redaction when disabled", () => {
     const input = "cwd=/Users/paperclipuser/paperclip";
     expect(redactCurrentUserText(input, { enabled: false })).toBe(input);

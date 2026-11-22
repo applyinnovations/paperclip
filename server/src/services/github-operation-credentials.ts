@@ -16,12 +16,13 @@ import {
   resolveManagedGitHubCredential,
 } from "./git-credentials.js";
 import { secretService } from "./secrets.js";
+import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
 
 export type GitHubCredentialSummary = {
   status: "available" | "absent" | "unavailable";
-  source?: "personal" | "dedicated";
+  source?: "personal" | "dedicated" | "app";
   login?: string;
   reason?: string;
   connectionId?: string;
@@ -116,7 +117,11 @@ async function saveGitHubSummary(
     .where(eq(runIdentityContexts.id, context.id));
 }
 
-/** No company secrets or ambient credentials are consulted by this path. */
+/**
+ * No company secrets or ambient credentials are consulted by this path. When no managed
+ * identity is configured for the run, an operator-configured GitHub App installation (allow-
+ * listed per company) may supply a short-lived installation token instead.
+ */
 export async function resolveGitHubOperationCredentials(
   db: Db,
   input: {
@@ -124,6 +129,9 @@ export async function resolveGitHubOperationCredentials(
     agentId: string;
     runId: string;
   },
+  deps: {
+    githubApp?: Pick<ReturnType<typeof githubAppInstallationTokenSource>, "resolve">;
+  } = {},
 ) {
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
@@ -176,9 +184,26 @@ export async function resolveGitHubOperationCredentials(
         authenticationMode: "managed",
       };
       env = buildGitAuthInvocation(resolved.credential).env;
+    } else if (!resolved.configured) {
+      const app = await (deps.githubApp ?? githubAppInstallationTokenSource()).resolve(input.companyId);
+      if (app.status === "available") {
+        summary = {
+          status: "available",
+          source: "app",
+          login: app.credential.githubIdentity?.login,
+          authenticationMode: "managed",
+        };
+        env = buildGitAuthInvocation(app.credential).env;
+      } else {
+        summary = {
+          status: app.status === "unavailable" ? "unavailable" : "absent",
+          source: app.status === "unavailable" ? "app" : "personal",
+          reason: app.status === "unavailable" ? app.error : "No GitHub identity connected",
+        };
+      }
     } else {
       summary = {
-        status: resolved.configured ? "unavailable" : "absent",
+        status: "unavailable",
         source: resolved.identitySource ?? "personal",
         reason: resolved.error ?? "No GitHub identity connected",
       };

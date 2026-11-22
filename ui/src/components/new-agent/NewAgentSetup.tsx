@@ -309,13 +309,15 @@ function Setup({
   const forced = resolveForcedKubernetesEnvironment(
     general.data?.executionMode,
     envs.data ?? [],
+    general.data?.allowedSandboxProviders,
   );
   const managedOnly = experimental.data?.enableManagedSandboxOnly === true;
   let environmentId: string | null = null;
   let environmentError: string | null = null;
   try {
     environmentId = nativeCursorCloud ? null : forced.forced
-      ? (forced.kubernetesEnvironment?.id ?? null)
+      ? (forced.allowedEnvironments.find((environment) => environment.id === environmentOverride)?.id
+        ?? forced.kubernetesEnvironment?.id ?? null)
       : resolveAdapterTestEnvironmentId({
           agentDefaultEnvironmentId: environmentOverride || null,
           instanceDefaultEnvironmentId:

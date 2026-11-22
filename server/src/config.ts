@@ -74,6 +74,11 @@ export interface Config extends StorageConfig {
   authPublicBaseUrl: string | undefined;
   chatWebhookPublicBaseUrl: string | undefined;
   authDisableSignUp: boolean;
+  /**
+   * OIDC-only sign-in: every email/password endpoint is refused and startup
+   * fails unless OIDC is configured and reachable. Environment-only, like OIDC.
+   */
+  authDisablePasswordLogin: boolean;
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
@@ -123,6 +128,17 @@ export interface Config extends StorageConfig {
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
   announcementsFeedUrl: string;
+}
+
+/**
+ * Security switches must not be silently ignored on a typo such as `ture` or
+ * `1`: accept only `true` or `false` (any case), unset or empty meaning false.
+ */
+export function parseStrictBooleanEnv(name: string, raw: string | undefined): boolean {
+  const value = raw?.trim().toLowerCase();
+  if (!value || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error(`${name} must be "true" or "false".`);
 }
 
 function detectTailnetBindHost(): string | undefined {
@@ -236,6 +252,10 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     disableSignUpFromEnv !== undefined
       ? disableSignUpFromEnv === "true"
       : (fileConfig?.auth?.disableSignUp ?? false);
+  const authDisablePasswordLogin = parseStrictBooleanEnv(
+    "PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN",
+    process.env.PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN,
+  );
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;
   const allowedHostnamesFromEnv = allowedHostnamesFromEnvRaw
     ? allowedHostnamesFromEnvRaw
@@ -377,6 +397,7 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
       process.env.PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL,
     ),
     authDisableSignUp,
+    authDisablePasswordLogin,
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,

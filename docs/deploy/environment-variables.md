@@ -5,6 +5,29 @@ summary: Full environment variable reference
 
 All environment variables that Paperclip uses for server configuration.
 
+## OpenID Connect sign-in
+
+OIDC requires `authenticated` deployment mode and an explicit
+`PAPERCLIP_AUTH_PUBLIC_BASE_URL`. See [OIDC setup and recovery](https://github.com/paperclipai/paperclip/blob/master/doc/OIDC.md).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PAPERCLIP_AUTH_OIDC_ISSUER` | (unset) | Exact HTTPS provider issuer. Discovery uses its `.well-known/openid-configuration`. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_ID` | (unset) | Dedicated confidential client ID. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_SECRET_FILE` | (unset) | Mounted client secret file. Set this or `CLIENT_SECRET`, never both. |
+| `PAPERCLIP_AUTH_OIDC_CLIENT_SECRET` | (unset) | Client secret injected through the environment. |
+| `PAPERCLIP_AUTH_OIDC_PROVIDER_ID` | `oidc` | Stable lowercase provider ID; callback is `/api/auth/callback/<id>`. |
+| `PAPERCLIP_AUTH_OIDC_DISPLAY_NAME` | `OpenID Connect` | Public sign-in button label. |
+| `PAPERCLIP_AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` or `client_secret_post`. |
+| `PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN` | `false` | `true` makes OIDC the only sign-in method: the server refuses all email/password sign-in, sign-up, reset, change and verify endpoints. Requires OIDC; startup fails without it. Link administrator accounts first. |
+
+Restart after changes. OIDC follows `PAPERCLIP_AUTH_DISABLE_SIGN_UP`, including
+for invitees. Existing accounts require password-confirmed linking in Profile
+settings; email matching does not link accounts or grant company/admin access.
+Password sign-in remains available unless `PAPERCLIP_AUTH_DISABLE_PASSWORD_LOGIN=true`
+(see [OIDC-only sign-in](https://github.com/paperclipai/paperclip/blob/master/doc/OIDC.md#oidc-only-sign-in)).
+Logout revokes the local session only.
+
 ## Server Configuration
 
 | Variable | Default | Description |
@@ -178,6 +201,36 @@ also hides the control and floors value-changing writes.
 Unknown field names are logged and ignored (mixed-version fleet safe).
 Malformed JSON or an invalid value for a known field refuses startup — policy
 configuration fails closed.
+
+## GitHub App
+
+See [Operator-owned GitHub App](https://github.com/paperclipai/paperclip/blob/master/doc/connections/GITHUB.md#operator-owned-github-app).
+Use either the file or the single-App variables. Setting both refuses startup.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_GITHUB_APPS_FILE` | (unset) | Path to a JSON file that maps each company to its own GitHub App: `{"apps":[{"companyId","appId","installationId","privateKeyFile","webhookSecretFile"?,"repositories"?}]}`. Keys and webhook secrets stay in their own files. Any error (duplicate company, App or installation, malformed ID, unreadable or invalid key) refuses startup |
+| `PAPERCLIP_GITHUB_APP_ID` | (unset) | Single shared App: App ID |
+| `PAPERCLIP_GITHUB_APP_INSTALLATION_ID` | (unset) | Single shared App: installation ID |
+| `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE` | (unset) | Single shared App: path to the private key (PEM) |
+| `PAPERCLIP_GITHUB_APP_COMPANY_IDS` | (unset) | Single shared App: comma-separated company IDs allowed to use it |
+| `PAPERCLIP_GITHUB_APP_REPOSITORIES` | (unset) | Single shared App: optional repository names to scope tokens to |
+
+## Run-scoped MCP servers
+
+Operator-run MCP servers that allowed agents use through this server. A run
+of a listed company whose agent URL key is listed gets an MCP server at
+`/api/run-mcp/<name>`, authenticated with the run's own agent JWT (Claude and
+Codex local adapters). Each request rechecks that the run is active and the
+agent allowed, then goes to the upstream `url` with an access token the
+server obtains with OAuth client credentials and refreshes before expiry.
+Agents never see the client secret or the upstream token, and access ends
+with the run. Native Paperclip Runner sessions (`paperclip_runner`) do not
+receive these servers.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_RUN_MCP_SERVERS_FILE` | (unset) | Path to a JSON file: `{"servers":[{"name","url","companyIds","agents","tokenUrl","clientId","clientSecretFile","scope"}]}`. `name` is the MCP server name agents see; `agents` is a required allowlist of agent URL keys (the agent name lowercased with dashes, e.g. `cycle-time-engineer`; renaming an agent changes its key); `tokenUrl` must be HTTPS; every scope in `scope` must be granted. Unknown keys, malformed values, duplicate names, or an unreadable or empty secret file refuse startup |
 
 ## Secrets
 

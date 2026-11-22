@@ -1,6 +1,6 @@
 /**
  * SandboxOrchestrator implementation backed by the kubernetes-sigs/agent-sandbox
- * Sandbox CRD (agents.x-k8s.io/v1alpha1).
+ * Sandbox CRD (agents.x-k8s.io/v1beta1).
  *
  * The Sandbox CR creates a long-lived pod that paperclip-server can exec into
  * for multi-command adapter-install workflows — the key architectural win over
@@ -25,7 +25,7 @@ import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
-const SANDBOX_VERSION = "v1alpha1";
+const SANDBOX_VERSION = "v1beta1";
 const SANDBOX_PLURAL = "sandboxes";
 
 export class SandboxCrTimeoutError extends Error {
@@ -42,14 +42,25 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Map a Sandbox CR status.phase value to our SandboxStatus shape.
- * Sandbox phases: Pending | Ready | Terminating | Failed
+ * Map the controller's Ready condition to our lease status. Retain phase
+ * fallback for older responses, but never let it override a current condition.
  */
 function mapSandboxPhase(
   cr: Record<string, unknown>,
 ): SandboxStatus {
   const status = (cr.status as Record<string, unknown>) ?? {};
-  const phase = (status.phase as string) ?? "Pending";
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  const conditions = Array.isArray(status.conditions)
+    ? status.conditions as Array<{ type?: string; status?: string; reason?: string; message?: string; observedGeneration?: number }>
+    : [];
+  const ready = conditions.find((condition) => condition.type === "Ready");
+  const failed = conditions.find((condition) => condition.type === "Failed" && condition.status === "True");
+  const stale = typeof metadata.generation === "number" && typeof ready?.observedGeneration === "number"
+    && ready.observedGeneration < metadata.generation;
+  let phase = (status.phase as string) ?? "Pending";
+  if (metadata.deletionTimestamp) phase = "Terminating";
+  else if (failed) phase = "Failed";
+  else if (ready) phase = ready.status === "True" && !stale ? "Ready" : "Pending";
 
   switch (phase) {
     case "Ready":
@@ -70,7 +81,6 @@ function mapSandboxPhase(
         reason: "Terminating",
       };
     case "Failed": {
-      const conditions = (status.conditions as { type?: string; reason?: string; message?: string }[]) ?? [];
       const failedCond = conditions.find((c) => c.type === "Failed");
       return {
         phase: "Failed",
@@ -90,6 +100,8 @@ function mapSandboxPhase(
         active: 0,
         succeeded: 0,
         failed: 0,
+        ...(ready?.reason ? { reason: ready.reason } : {}),
+        ...(ready?.message ? { message: ready.message } : {}),
       };
   }
 }
@@ -265,24 +277,16 @@ export async function waitForSandboxReady(
       name,
     }) as Record<string, unknown>;
 
-    const status = (cr.status as Record<string, unknown>) ?? {};
-    // agent-sandbox v1alpha1 uses status.conditions[type=Ready,status=True],
-    // not status.phase. Fall back to phase for forward-compat.
-    const conditions = Array.isArray(status.conditions) ? status.conditions as Array<Record<string, unknown>> : [];
-    const readyCondition = conditions.find((c) => c.type === "Ready");
-    const failedCondition = conditions.find((c) => c.type === "Failed" || (c.type === "Ready" && c.status === "False" && typeof c.reason === "string" && /failed/i.test(c.reason)));
-    const phase = (status.phase as string) ?? "";
-
-    if (readyCondition?.status === "True" || phase === "Ready") {
-      return mapSandboxPhase(cr);
+    const mapped = mapSandboxPhase(cr);
+    if (mapped.phase === "Running" && mapped.active === 1) {
+      return mapped;
     }
-    if (failedCondition?.status === "True" || phase === "Failed") {
-      const mapped = mapSandboxPhase(cr);
+    if (mapped.phase === "Failed") {
       throw new Error(
-        `Sandbox ${namespace}/${name} failed: ${mapped.reason ?? (failedCondition?.reason as string) ?? "unknown reason"} — ${mapped.message ?? (failedCondition?.message as string) ?? ""}`,
+        `Sandbox ${namespace}/${name} failed: ${mapped.reason ?? "unknown reason"} — ${mapped.message ?? ""}`,
       );
     }
-    if (phase === "Terminating") {
+    if (mapped.reason === "Terminating") {
       // A Sandbox being torn down will never transition to Ready. Polling
       // until the deadline would burn the full timeoutMs (potentially
       // 30+ minutes) before throwing a generic timeout. Fail fast instead

@@ -17,7 +17,7 @@ import { localAgentRunnerTarget } from "../lib/agent-runner-platform.js";
 import { normalizeClaudeRunnerOptions, type AgentConfigurationWarning } from "@paperclipai/shared";
 import { usesManagedCloudSandboxImage } from "./sandbox-snapshot-qualification.js";
 import { environmentCustomImageTemplateMatchesBaseConfig } from "./environment-custom-image-runtime.js";
-import type { ExecutionPolicy } from "./execution-allowlist.js";
+import { isAllowedAdditionalSandboxEnvironment, type ExecutionPolicy } from "./execution-allowlist.js";
 import { pluginEnvironmentRunnerTaskDriver } from "./plugin-runner-ai-connection.js";
 
 export type RunnerTarget = {
@@ -485,7 +485,10 @@ async function resolveAgentEnvironmentForCompany(db: Db, companyId: string, defa
       code: "managed_sandbox_unavailable", ...(executionMode ? { executionMode } : {}),
     });
   }
-  if (settings.general?.executionMode === "kubernetes") {
+  if (settings.general?.executionMode === "kubernetes" && !(environment && isAllowedAdditionalSandboxEnvironment(settings.general, {
+    driver: environment.driver,
+    provider: typeof environment.config?.provider === "string" ? environment.config.provider : null,
+  }))) {
     environment = await envs.findKubernetesEnvironment(companyId);
     if (!environment) return { environment: null, driver: "sandbox", executionMode };
   }
