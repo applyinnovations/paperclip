@@ -50,6 +50,8 @@ const {
 } = mocks;
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
+  adapterExecutionTargetCommandEnv: (_target: unknown, env: Record<string, string>) =>
+    (mocks.state.isRemote ? { ...env } : { ...process.env, ...env }),
   adapterExecutionTargetIsRemote: () => mocks.state.isRemote,
   adapterExecutionTargetRemoteCwd: (_target: unknown, cwd: string) =>
     mocks.state.isRemote ? "/remote/workspace" : cwd,

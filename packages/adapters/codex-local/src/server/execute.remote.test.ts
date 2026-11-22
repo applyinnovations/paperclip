@@ -81,6 +81,7 @@ describe("codex remote execution", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;
@@ -89,6 +90,8 @@ describe("codex remote execution", () => {
   });
 
   it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
+    const serverOnlySentinel = "server-only-sentinel-codex-execute";
+    vi.stubEnv("PAPERCLIP_TEST_SERVER_ONLY_SECRET", serverOnlySentinel);
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -208,6 +211,13 @@ describe("codex remote execution", () => {
     expect(call?.[3].env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:4310");
     expect(call?.[3].env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
+    // The server's own env never reaches the remote target: not in the run
+    // env, and not in the env the command checks use.
+    expect(JSON.stringify(call?.[3].env)).not.toContain(serverOnlySentinel);
+    expect(ensureCommandResolvable).toHaveBeenCalled();
+    for (const resolveCall of ensureCommandResolvable.mock.calls as unknown as Array<[string, string, Record<string, string>]>) {
+      expect(JSON.stringify(resolveCall[2])).not.toContain(serverOnlySentinel);
+    }
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({

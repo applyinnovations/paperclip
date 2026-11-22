@@ -111,6 +111,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
+import { withoutServerProcessEnv } from "./remote-command-env.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -4456,7 +4457,7 @@ export function environmentRuntimeService(
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
       }
-      return await driver.execute(input);
+      return await driver.execute(withoutServerProcessEnv(driver.driver, input, logger));
     },
 
     supportsSync(input: EnvironmentDriverLeaseInput): boolean {

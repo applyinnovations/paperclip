@@ -20,6 +20,7 @@ import {
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverPiModelsCached } from "./models.js";
 import { parsePiJsonl } from "./parse.js";
@@ -128,7 +129,11 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }));
+  const runtimeEnv = normalizeEnv(
+    target?.kind === "remote"
+      ? adapterExecutionTargetCommandEnv(target, env)
+      : ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }),
+  );
 
   const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
   if (cwdInvalid) {

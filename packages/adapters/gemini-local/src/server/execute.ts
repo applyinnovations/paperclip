@@ -27,6 +27,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -328,8 +329,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const runtimeEnv = buildGeminiRuntimeEnv(env);
-  const billingType = resolveGeminiBillingType(runtimeEnv);
+  const billingType = resolveGeminiBillingType(buildGeminiRuntimeEnv(env));
+  const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, buildGeminiHeadlessEnv(env));
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),

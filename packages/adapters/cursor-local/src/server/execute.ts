@@ -26,6 +26,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -443,7 +444,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ),
   );
   const billingType = resolveCursorBillingType(effectiveEnv);
-  const runtimeEnv = ensurePathInEnv(effectiveEnv);
+  const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, env);
   await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
     installCommand: SANDBOX_INSTALL_COMMAND,
     timeoutSec,

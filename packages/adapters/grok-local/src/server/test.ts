@@ -7,7 +7,6 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -18,6 +17,7 @@ import {
   isAdapterExecutionTargetUnavailableError,
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -194,7 +194,7 @@ export async function testEnvironment(
         });
       }
     }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = adapterExecutionTargetCommandEnv(target, env);
 
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

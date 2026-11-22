@@ -4760,7 +4760,9 @@ export async function ensureCommandResolvable(
   } = {},
 ) {
   if (options.remoteExecution) {
-    const resolvedSsh = await resolveCommandPath("ssh", process.cwd(), env);
+    // The ssh client runs on the server, so resolve it with the server env
+    // joined with the caller's: a remote-target env carries no server PATH.
+    const resolvedSsh = await resolveCommandPath("ssh", process.cwd(), ensurePathInEnv({ ...process.env, ...env }));
     if (resolvedSsh) return;
     throw new Error('Command not found in PATH: "ssh"');
   }

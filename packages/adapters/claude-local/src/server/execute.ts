@@ -26,6 +26,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -317,11 +318,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
-  const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+  const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, env);
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),

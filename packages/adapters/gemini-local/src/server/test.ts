@@ -9,7 +9,6 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -20,6 +19,7 @@ import {
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { detectGeminiAuthRequired, detectGeminiQuotaExhausted, parseGeminiJsonl } from "./parse.js";
@@ -123,7 +123,7 @@ export async function testEnvironment(
   if (targetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = adapterExecutionTargetCommandEnv(target, env);
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,
     target,

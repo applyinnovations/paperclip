@@ -222,3 +222,42 @@ describe("claude CLI model compatibility check", () => {
     expect(versionCall[3]).toEqual(["--version"]);
   });
 });
+
+describe("claude remote test keeps the server env off the target", () => {
+  const SENTINEL = "server-only-sentinel-claude-test";
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ["sandbox", sandboxTarget],
+    ["ssh", sshTarget],
+  ])("passes no server env value to the %s target", async (_label, executionTarget) => {
+    vi.stubEnv("PAPERCLIP_TEST_SERVER_ONLY_SECRET", SENTINEL);
+    probeResult.value = { exitCode: 0, stdout: "", stderr: "" };
+
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "claude_local",
+      config: { model: "claude-opus-5-5", engine: "cli", command: "claude", env: { AGENT_SETTING: "kept" } },
+      executionTarget,
+      environmentName: "Remote",
+    });
+
+    const resolveCalls = ensureAdapterExecutionTargetCommandResolvable.mock.calls as unknown as Array<[string, unknown, string, Record<string, string>]>;
+    expect(resolveCalls.length).toBeGreaterThan(0);
+    for (const [, , , env] of resolveCalls) {
+      expect(env.AGENT_SETTING).toBe("kept");
+      expect(JSON.stringify(env)).not.toContain(SENTINEL);
+    }
+    const runCalls = runAdapterExecutionTargetProcess.mock.calls as unknown as Array<[string, unknown, string, string[], { env: Record<string, string> }]>;
+    for (const [, , , , options] of runCalls) {
+      expect(JSON.stringify(options.env)).not.toContain(SENTINEL);
+    }
+    const installCalls = maybeRunSandboxInstallCommand.mock.calls as unknown as Array<[{ env?: Record<string, string> }]>;
+    for (const [input] of installCalls) {
+      expect(JSON.stringify(input.env ?? {})).not.toContain(SENTINEL);
+    }
+  });
+});

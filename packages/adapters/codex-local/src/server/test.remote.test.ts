@@ -610,4 +610,28 @@ describe("codex remote environment diagnostics", () => {
     expect(stat.isSymbolicLink()).toBe(false);
     expect(await fs.readFile(path.join(externalHome, "auth.json"), "utf8")).toBe(external);
   });
+
+  it("passes no server env value to a sandbox target's command checks and probes", async () => {
+    const sentinel = "server-only-sentinel-codex-test";
+    vi.stubEnv("PAPERCLIP_TEST_SERVER_ONLY_SECRET", sentinel);
+
+    await testEnvironment({
+      companyId: "company-1",
+      adapterType: "codex_local",
+      config: { engine: "cli", command: "codex", env: { AGENT_SETTING: "kept" } },
+      executionTarget: sandboxTarget(),
+      environmentName: "QA Daytona",
+    });
+
+    const resolveCalls = ensureAdapterExecutionTargetCommandResolvable.mock.calls as unknown as Array<[string, unknown, string, Record<string, string>]>;
+    expect(resolveCalls.length).toBeGreaterThan(0);
+    for (const [, , , env] of resolveCalls) {
+      expect(env.AGENT_SETTING).toBe("kept");
+      expect(JSON.stringify(env)).not.toContain(sentinel);
+    }
+    const runCalls = runAdapterExecutionTargetProcess.mock.calls as unknown as Array<[string, unknown, string, string[], { env: Record<string, string> }]>;
+    for (const [, , , , options] of runCalls) {
+      expect(JSON.stringify(options.env)).not.toContain(sentinel);
+    }
+  });
 });

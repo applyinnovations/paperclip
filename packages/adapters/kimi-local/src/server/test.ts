@@ -10,7 +10,6 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -21,6 +20,7 @@ import {
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveKimiExecutionEngineForRun, testKimiAcpEnvironment } from "./acp.js";
@@ -169,7 +169,7 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = adapterExecutionTargetCommandEnv(target, env);
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,
     target,

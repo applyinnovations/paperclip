@@ -19,6 +19,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -29,7 +30,6 @@ import {
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   ensureAbsoluteDirectory,
-  ensurePathInEnv,
   joinPromptSections,
   materializePaperclipSkillCopy,
   parseObject,
@@ -484,7 +484,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const runtimeEnv = ensurePathInEnv(effectiveEnv);
+    const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, env);
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
       installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
       timeoutSec,

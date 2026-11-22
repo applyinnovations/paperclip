@@ -81,6 +81,8 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
+const SERVER_ONLY_SENTINEL = "server-only-sentinel-claude-execute";
+
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
 
@@ -98,6 +100,7 @@ describe("claude remote execution", () => {
   it("prepares the workspace, syncs Claude runtime assets, and restores workspace changes for remote SSH execution", async () => {
     vi.stubEnv("CLAUDE_CODE_USE_BEDROCK", "1");
     vi.stubEnv("ANTHROPIC_MODEL", "host-only-model");
+    vi.stubEnv("PAPERCLIP_TEST_SERVER_ONLY_SECRET", SERVER_ONLY_SENTINEL);
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -223,6 +226,14 @@ describe("claude remote execution", () => {
     expect(call?.[3].env.RANDOM_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
     expect(call?.[3].env.OTHER_ENV).toBe(workspaceDir);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
+    // The server's own env never reaches the remote target: not in the run
+    // env, and not in the env the command checks use.
+    expect(JSON.stringify(call?.[3].env)).not.toContain(SERVER_ONLY_SENTINEL);
+    expect(call?.[3].env.ANTHROPIC_MODEL).toBeUndefined();
+    expect(ensureCommandResolvable).toHaveBeenCalled();
+    for (const resolveCall of ensureCommandResolvable.mock.calls as unknown as Array<[string, string, Record<string, string>]>) {
+      expect(JSON.stringify(resolveCall[2])).not.toContain(SERVER_ONLY_SENTINEL);
+    }
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({

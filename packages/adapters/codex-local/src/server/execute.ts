@@ -36,6 +36,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  adapterExecutionTargetCommandEnv,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -45,7 +46,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
@@ -1073,11 +1073,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Confining Codex with ${scopes} scope.\n`,
       );
     }
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv(effectiveEnv)).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    const runtimeEnv = adapterExecutionTargetCommandEnv(executionTarget, env);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,

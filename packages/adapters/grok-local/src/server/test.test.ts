@@ -7,6 +7,8 @@ const prepareRuntimeMock = vi.hoisted(() => vi.fn());
 const stageGrokHomeMock = vi.hoisted(() => vi.fn(async () => "/tmp/staged-grok-home"));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
+  adapterExecutionTargetCommandEnv: (target: { kind?: string } | null | undefined, env: Record<string, string>) =>
+    (target?.kind === "remote" ? { ...env } : { ...process.env, ...env }),
   describeAdapterExecutionTarget: () => "local",
   ensureAdapterExecutionTargetCommandResolvable: ensureCommandMock,
   ensureAdapterExecutionTargetDirectory: ensureDirectoryMock,
