@@ -31,6 +31,7 @@ const mockSecretService = vi.hoisted(() => ({
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
   releaseLease: vi.fn(),
+  updateLeaseMetadata: vi.fn(),
   listBoundCompanyIds: vi.fn(async () => [] as string[]),
   findManagedSandboxEnvironment: vi.fn(async () => null as Record<string, unknown> | null),
   findKubernetesEnvironment: vi.fn(async () => null as Record<string, unknown> | null),
@@ -1068,6 +1069,76 @@ describe("agent test-environment route", () => {
       lease: expect.objectContaining({ id: "lease-1" }),
       status: "released",
     });
+  });
+
+  it("persists the realized sandbox directory on the Test lease for native file sync", async () => {
+    const acquiredLease = {
+      id: "lease-1",
+      provider: "kubernetes",
+      providerLeaseId: "provider-lease-1",
+      metadata: { sandboxProviderPlugin: true, namespace: "tenant-1" },
+    };
+    mockEnvironmentRuntime.acquireRunLease.mockResolvedValueOnce({
+      lease: acquiredLease,
+      leaseContext: { executionWorkspaceId: null, executionWorkspaceMode: null },
+    });
+    mockEnvironmentRuntime.realizeWorkspace.mockResolvedValueOnce({ cwd: "/workspace" });
+    mockEnvironmentService.updateLeaseMetadata.mockImplementationOnce(
+      async (id: string, metadata: Record<string, unknown>) => ({ ...acquiredLease, id, metadata }),
+    );
+    mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/workspace",
+      providerKey: "kubernetes",
+      runner: { execute: vi.fn() },
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({
+        adapterConfig: {},
+        environmentId: "11111111-1111-4111-8111-111111111111",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockEnvironmentService.updateLeaseMetadata).toHaveBeenCalledWith("lease-1", {
+      sandboxProviderPlugin: true,
+      namespace: "tenant-1",
+      remoteCwd: "/workspace",
+    });
+    // The runner's native sync reads the lease, so the target must carry the
+    // persisted lease, not only the merged target metadata.
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lease: expect.objectContaining({
+          metadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+        }),
+        leaseMetadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+      }),
+    );
+  });
+
+  it("leaves the Test lease unchanged when it already carries the realized directory", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/home/user/paperclip-workspace",
+      providerKey: "fake-plugin",
+      runner: { execute: vi.fn() },
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({
+        adapterConfig: {},
+        environmentId: "11111111-1111-4111-8111-111111111111",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockEnvironmentService.updateLeaseMetadata).not.toHaveBeenCalled();
   });
 
   it("releases the lease as failed and returns a diagnostic when realizeWorkspace throws", async () => {
