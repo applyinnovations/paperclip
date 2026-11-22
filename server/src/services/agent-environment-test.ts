@@ -345,6 +345,22 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
           typeof realized.cwd === "string" && realized.cwd.trim().length > 0
             ? realized.cwd.trim()
             : null;
+        // Native sandbox file sync reads its confinement root from the lease
+        // metadata's `remoteCwd`, not from the target. Persist the realized
+        // directory on the Test lease, as a run does, so the probe's asset
+        // upload (for example the managed Claude config) can use native sync.
+        if (
+          realizedCwd &&
+          testEnvironment.driver === "sandbox" &&
+          leaseRecord.lease.metadata?.remoteCwd !== realizedCwd
+        ) {
+          const updated = await environmentsSvc.updateLeaseMetadata(leaseRecord.lease.id, {
+            ...(leaseRecord.lease.metadata ?? {}),
+            remoteCwd: realizedCwd,
+          });
+          if (!updated) throw new Error("Environment test lease disappeared");
+          leaseRecord.lease = updated;
+        }
       }
     } catch (err) {
       await releaseLease("failed");
