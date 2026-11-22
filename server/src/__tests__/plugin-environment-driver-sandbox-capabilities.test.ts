@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { listReadyPluginEnvironmentDrivers } from "../services/plugin-environment-driver.js";
+import { pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import kubernetesManifest from "../../../packages/plugins/sandbox-providers/kubernetes/src/manifest.js";
+import {
+  listReadyPluginEnvironmentDrivers,
+  resolvePluginSandboxProviderDriverByKey,
+} from "../services/plugin-environment-driver.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const mockRegistry = vi.hoisted(() => ({
@@ -76,5 +80,24 @@ describe("listReadyPluginEnvironmentDrivers sandbox capability projection", () =
       persistentProcessSessions: false,
     });
     expect(drivers[0]?.supportsReusableLeases).toBe(true);
+  });
+
+  // The sign-in routes gate on `resolveProviderSupportsLoginPty`, which reads
+  // `supportsLoginPty` from the driver the by-key resolver returns. This runs the
+  // shipped Kubernetes manifest through the manifest validator and both readers.
+  it("test_kubernetes_manifest_is_login_pty_capable", async () => {
+    const parsed = pluginManifestV1Schema.parse(kubernetesManifest) as PaperclipPluginManifestV1;
+    const row = { id: "plugin-kubernetes", pluginKey: parsed.id, status: "ready", manifestJson: parsed };
+    mockRegistry.list.mockResolvedValue([row]);
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      getWorker: vi.fn(() => ({ status: "running" })),
+    } as unknown as PluginWorkerManager;
+
+    const resolved = await resolvePluginSandboxProviderDriverByKey({ db: {} as never, driverKey: "kubernetes" });
+    expect(resolved?.driver.supportsLoginPty).toBe(true);
+
+    const drivers = await listReadyPluginEnvironmentDrivers({ db: {} as never, workerManager });
+    expect(drivers.find((driver) => driver.driverKey === "kubernetes")?.supportsLoginPty).toBe(true);
   });
 });

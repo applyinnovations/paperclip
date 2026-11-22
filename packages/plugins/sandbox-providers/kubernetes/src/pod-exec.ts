@@ -442,3 +442,152 @@ export async function execInPodStreaming(
       });
   });
 }
+
+/**
+ * One live pseudo-terminal (PTY) exec in a pod container. The shape matches the
+ * `LoginPtySession` the plugin SDK login transport consumes.
+ */
+export interface PodPty {
+  /** Registers the one output listener. Output that arrived earlier is delivered first. */
+  onData(listener: (chunk: string) => void): void;
+  /** Writes raw input bytes to the terminal. */
+  write(data: string): void;
+  /** Resolves with the command exit code, or null when the exec ended without one. */
+  wait(): Promise<{ exitCode: number | null }>;
+  /** Interrupts the command and closes the exec stream. Safe to call more than once. */
+  kill(): void;
+  /** Closes the exec stream. Safe to call more than once. */
+  close(): Promise<void>;
+}
+
+export interface OpenPodPtyOptions {
+  /** Terminal width in columns (default 120). */
+  cols?: number;
+  /** Terminal height in rows (default 30). */
+  rows?: number;
+}
+
+// The end-of-text byte. On a terminal the line discipline turns it into SIGINT
+// for the foreground process group, which is the only stop signal the exec API
+// can deliver without a second exec.
+const PTY_INTERRUPT = "\u0003";
+
+type ClosableWebSocket = WebSocketLike & {
+  addEventListener?(type: "close", listener: () => void): void;
+  on?(event: "close", listener: () => void): void;
+};
+
+/**
+ * Runs `command` in the container on a real terminal (`tty=true`) and returns it
+ * as a {@link PodPty}.
+ *
+ * With a terminal the API server merges stderr into stdout, so the exec opens no
+ * stderr channel. The stdout stream advertises `columns` and `rows`, which makes
+ * the client send the terminal size on the resize channel before any output.
+ * Stdin is a PassThrough the caller writes to; it is never ended, because the
+ * client closes the whole socket when stdin ends.
+ *
+ * The exit code comes from the status channel. A socket that closes without a
+ * status frame (a dropped connection, a deleted pod) resolves `wait()` with
+ * `null`, so a caller never waits forever. `kill()` sends an interrupt and closes
+ * the socket; closing a terminal exec hangs up the command's terminal.
+ */
+export async function openPodPty(
+  kc: KubeConfig,
+  namespace: string,
+  podName: string,
+  containerName: string,
+  command: string[],
+  options: OpenPodPtyOptions = {},
+): Promise<PodPty> {
+  const exec = new Exec(kc);
+  const stdout = Object.assign(new PassThrough(), {
+    columns: options.cols ?? 120,
+    rows: options.rows ?? 30,
+  });
+  const stdin = new PassThrough();
+
+  // Decode as a stream so a multibyte character split across two frames stays
+  // whole, and buffer until the caller registers its listener so no early
+  // output (the login prompt) is lost.
+  const decoder = new TextDecoder("utf-8");
+  let listener: ((chunk: string) => void) | null = null;
+  let buffered = "";
+  const emit = (text: string) => {
+    if (text.length === 0) return;
+    if (listener) listener(text);
+    else buffered += text;
+  };
+  stdout.on("data", (chunk: Buffer) => emit(decoder.decode(chunk, { stream: true })));
+
+  let settle!: (result: { exitCode: number | null }) => void;
+  const exited = new Promise<{ exitCode: number | null }>((resolve) => {
+    settle = resolve;
+  });
+  let settled = false;
+  const finish = (exitCode: number | null) => {
+    if (settled) return;
+    settled = true;
+    emit(decoder.decode());
+    settle({ exitCode });
+  };
+
+  const ws = (await exec.exec(
+    namespace,
+    podName,
+    containerName,
+    command,
+    stdout,
+    null,
+    stdin,
+    true,
+    (status) => {
+      if (status.status === "Success") {
+        finish(0);
+        return;
+      }
+      const causes = status.details?.causes ?? [];
+      const exitCodeCause = causes.find(
+        (c: { reason?: string; message?: string }) => c.reason === "ExitCode",
+      );
+      const code = exitCodeCause?.message ? Number(exitCodeCause.message) : Number.NaN;
+      finish(Number.isInteger(code) ? code : null);
+    },
+  )) as unknown as ClosableWebSocket;
+
+  const onSocketClose = () => finish(null);
+  if (typeof ws.addEventListener === "function") ws.addEventListener("close", onSocketClose);
+  else if (typeof ws.on === "function") ws.on("close", onSocketClose);
+
+  let closed = false;
+  const closeSocket = () => {
+    if (closed) return;
+    closed = true;
+    try { ws.close(); } catch { /* already closed */ }
+  };
+
+  return {
+    onData(next) {
+      listener = next;
+      if (buffered.length > 0) {
+        const pending = buffered;
+        buffered = "";
+        next(pending);
+      }
+    },
+    write(data) {
+      if (closed || settled) return;
+      stdin.write(data);
+    },
+    wait() {
+      return exited;
+    },
+    kill() {
+      if (!closed && !settled) stdin.write(PTY_INTERRUPT);
+      closeSocket();
+    },
+    async close() {
+      closeSocket();
+    },
+  };
+}

@@ -7,6 +7,7 @@ export const adapterRegistryEntrySchema = z
     runtimeImage: z.string().optional(),
     envKeys: z.array(z.string()).optional(),
     allowFqdns: z.array(z.string()).optional(),
+    loginAllowFqdns: z.array(z.string()).optional(),
     probeCommand: z.array(z.string()).optional(),
     defaultEnv: z.record(z.string(), z.string()).optional(),
   })

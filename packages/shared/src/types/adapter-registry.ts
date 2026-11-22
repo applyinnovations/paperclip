@@ -18,6 +18,11 @@ export interface AdapterRegistryEntry {
   envKeys?: string[];
   /** k8s-sandbox-only: egress FQDN allow-list for the agent pod. */
   allowFqdns?: string[];
+  /**
+   * k8s-sandbox-only: extra egress FQDNs the adapter's subscription sign-in
+   * command calls from the sandbox (for example an OAuth token endpoint).
+   */
+  loginAllowFqdns?: string[];
   /** k8s-sandbox-only: liveness/probe command. */
   probeCommand?: string[];
   /**

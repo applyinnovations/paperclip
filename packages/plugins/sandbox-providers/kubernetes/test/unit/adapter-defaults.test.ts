@@ -147,3 +147,23 @@ describe("resolveRunAdapterType", () => {
     expect(resolveRunAdapterType("  pi_local  ", "opencode_local")).toBe("pi_local");
   });
 });
+
+describe("loginAllowFqdns", () => {
+  it("lists the sign-in token hosts for the subscription adapters only", () => {
+    expect(getAdapterDefaults("claude_local").loginAllowFqdns).toEqual(["platform.claude.com"]);
+    expect(getAdapterDefaults("codex_local").loginAllowFqdns).toEqual(["auth.openai.com"]);
+    expect(getAdapterDefaults("opencode_local").loginAllowFqdns ?? []).toEqual([]);
+  });
+
+  it("comes from a configured registry entry, empty when the entry omits it", () => {
+    expect(
+      getAdapterDefaults("codex_local", [
+        { adapterType: "codex_local", enabled: true, runtimeImage: "img", loginAllowFqdns: ["login.example.com"] },
+      ]).loginAllowFqdns,
+    ).toEqual(["login.example.com"]);
+    expect(
+      getAdapterDefaults("codex_local", [{ adapterType: "codex_local", enabled: true, runtimeImage: "img" }])
+        .loginAllowFqdns,
+    ).toEqual([]);
+  });
+});
