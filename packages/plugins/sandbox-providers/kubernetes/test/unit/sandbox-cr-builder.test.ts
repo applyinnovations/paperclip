@@ -96,6 +96,10 @@ describe("buildSandboxCrManifest", () => {
     expect(
       volumes.every((v: { emptyDir?: unknown }) => v.emptyDir !== undefined),
     ).toBe(true);
+    // HOME and XDG dirs live under /tmp in a run; 2Gi evicted agents (APP-128).
+    expect(
+      volumes.find((v: { name: string }) => v.name === "tmp").emptyDir.sizeLimit,
+    ).toBe("8Gi");
   });
 
   it("envFrom references the per-run secret", () => {

@@ -90,6 +90,32 @@ export function wrapCommandWithEnv(
   };
 }
 
+type ExecStatus = {
+  status?: string;
+  message?: string;
+  reason?: string;
+  details?: { causes?: { reason?: string; message?: string }[] };
+};
+
+/**
+ * Map an exec status frame to an exit code, plus a diagnostic line when the
+ * failure did not come from the command. A `Failure` with no `ExitCode` cause
+ * means the exec itself failed: the container is gone (the pod was evicted or
+ * OOM-killed), or the runtime refused the exec. The command wrote nothing, so
+ * without this line the caller sees a bare "exit code 1" with empty output.
+ */
+export function exitFromExecStatus(status: ExecStatus): { exitCode: number; diagnostic: string | null } {
+  if (status.status === "Success") return { exitCode: 0, diagnostic: null };
+  const exitCodeCause = (status.details?.causes ?? []).find((c) => c.reason === "ExitCode");
+  const code = exitCodeCause?.message ? Number(exitCodeCause.message) : Number.NaN;
+  if (Number.isInteger(code)) return { exitCode: code, diagnostic: null };
+  const detail = [status.reason, status.message].filter((part) => typeof part === "string" && part.length > 0).join(": ");
+  return {
+    exitCode: 1,
+    diagnostic: `Kubernetes exec failed without a command exit code (${detail || "no status message"}); the sandbox container may have been evicted or killed.\n`,
+  };
+}
+
 export async function execInPod(
   kc: KubeConfig,
   namespace: string,
@@ -261,18 +287,9 @@ export async function execInPod(
         stdinStream,
         false, // tty=false: keep stdout/stderr on separate channels
         (status) => {
-          if (status.status === "Success") {
-            pendingExitCode = 0;
-          } else {
-            const causes = status.details?.causes ?? [];
-            const exitCodeCause = causes.find(
-              (c: { reason?: string; message?: string }) =>
-                c.reason === "ExitCode",
-            );
-            pendingExitCode = exitCodeCause?.message
-              ? Number(exitCodeCause.message)
-              : 1;
-          }
+          const exit = exitFromExecStatus(status);
+          pendingExitCode = exit.exitCode;
+          if (exit.diagnostic) stderrData += exit.diagnostic;
           tryFinish();
         },
       );
@@ -442,15 +459,9 @@ export async function execInPodStreaming(
       stdinStream,
       false, // tty=false: keep stdout/stderr on separate channels
       (status) => {
-        if (status.status === "Success") {
-          pendingExitCode = 0;
-        } else {
-          const causes = status.details?.causes ?? [];
-          const exitCodeCause = causes.find(
-            (c: { reason?: string; message?: string }) => c.reason === "ExitCode",
-          );
-          pendingExitCode = exitCodeCause?.message ? Number(exitCodeCause.message) : 1;
-        }
+        const exit = exitFromExecStatus(status);
+        pendingExitCode = exit.exitCode;
+        if (exit.diagnostic) stderrData += exit.diagnostic;
         tryFinish();
       },
     );

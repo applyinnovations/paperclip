@@ -90,7 +90,9 @@ export function buildJobManifest(input: BuildJobManifestInput): Record<string, u
             { name: "workspace", emptyDir: { sizeLimit: "8Gi" } },
             { name: "home", emptyDir: { sizeLimit: "1Gi" } },
             { name: "cache", emptyDir: { sizeLimit: "1Gi" } },
-            { name: "tmp", emptyDir: { sizeLimit: "2Gi" } },
+            // The run points HOME, XDG_* and provider homes under /tmp, so package
+            // stores and build caches land here; 2Gi evicted agents mid-run.
+            { name: "tmp", emptyDir: { sizeLimit: "8Gi" } },
           ],
         },
       },
