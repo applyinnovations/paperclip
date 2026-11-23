@@ -16,22 +16,22 @@ import { buildHostServices } from "../services/plugin-host-services.js";
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const PEM = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
 
-const APPLY = "a9d886a3-e526-461c-95d6-d2d0d6b6c722";
-const CALILE = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
-const PLAYABLE = "7c2a5d4e-8f60-4b1a-a3c2-1d9e8f7a6b55";
+const COMPANY_A = "a9d886a3-e526-461c-95d6-d2d0d6b6c722";
+const COMPANY_B = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
+const COMPANY_C = "7c2a5d4e-8f60-4b1a-a3c2-1d9e8f7a6b55";
 const CONFIG_PATH = "/etc/paperclip/github-apps.json";
 const KEY_PATH = "/etc/paperclip/github-approvals/private-key.pem";
 
 const APPROVALS = {
-  appId: "5883576",
-  installationId: "184903118",
+  appId: "123456",
+  installationId: "7890123",
   owner: "acme",
   privateKeyFile: KEY_PATH,
-  companies: { [APPLY]: ["deployments", "Infrastructure"], [CALILE]: ["calile"] },
+  companies: { [COMPANY_A]: ["deployments", "Infrastructure"], [COMPANY_B]: ["web-app"] },
 };
 const FILE = {
   apps: [
-    { companyId: APPLY, appId: "5462605", installationId: "175009740", privateKeyFile: "/var/run/apply.pem" },
+    { companyId: COMPANY_A, appId: "5462605", installationId: "175009740", privateKeyFile: "/var/run/apply.pem" },
   ],
   approvalsApp: APPROVALS,
 };
@@ -55,7 +55,7 @@ function githubStub(options: { tokenStatus?: number } = {}) {
       method: init?.method ?? "GET",
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
     });
-    if (url.endsWith("/app/installations/184903118/access_tokens")) {
+    if (url.endsWith("/app/installations/7890123/access_tokens")) {
       if (options.tokenStatus) return json(options.tokenStatus, { message: "-----BEGIN RSA PRIVATE KEY----- echo" });
       minted += 1;
       return json(201, { token: `ghs_approvals_${minted}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() });
@@ -77,8 +77,8 @@ describe("approvals App configuration", () => {
     const result = parseGitHubApprovalsApp(FILE);
     expect(result.status).toBe("enabled");
     if (result.status !== "enabled") return;
-    expect(result.config).toMatchObject({ appId: "5883576", installationId: "184903118", owner: "acme" });
-    expect([...result.config.companies.get(APPLY)!]).toEqual(["deployments", "Infrastructure"]);
+    expect(result.config).toMatchObject({ appId: "123456", installationId: "7890123", owner: "acme" });
+    expect([...result.config.companies.get(COMPANY_A)!]).toEqual(["deployments", "Infrastructure"]);
   });
 
   it.each([
@@ -87,7 +87,7 @@ describe("approvals App configuration", () => {
     ["a relative key path", { ...APPROVALS, privateKeyFile: "key.pem" }, /privateKeyFile/],
     ["a bad owner", { ...APPROVALS, owner: "a/b" }, /owner/],
     ["a non-UUID company", { ...APPROVALS, companies: { nope: ["x"] } }, /company UUID/],
-    ["owner-qualified repositories", { ...APPROVALS, companies: { [APPLY]: ["acme/x"] } }, /without owners/],
+    ["owner-qualified repositories", { ...APPROVALS, companies: { [COMPANY_A]: ["acme/x"] } }, /without owners/],
   ])("rejects %s", (_name, approvalsApp, error) => {
     const result = parseGitHubApprovalsApp({ approvalsApp });
     expect(result.status).toBe("invalid");
@@ -103,7 +103,7 @@ describe("approvals App configuration", () => {
     expect(readGitHubApprovalsAppConfig({})).toEqual({ status: "disabled" });
     await expect(
       checkGitHubApprovalsAppAtStartup(env, { readConfigFile: readConfigFile(FILE), readSecretFile: async () => PEM }),
-    ).resolves.toEqual({ status: "enabled", appId: "5883576", companies: 2 });
+    ).resolves.toEqual({ status: "enabled", appId: "123456", companies: 2 });
     const unreadable = await checkGitHubApprovalsAppAtStartup(env, {
       readConfigFile: readConfigFile(FILE),
       readSecretFile: async () => {
@@ -135,7 +135,7 @@ describe("approvals token source", () => {
 
   it("mints a token scoped to one repository with exactly the gate permissions", async () => {
     const { stub, tokens } = source();
-    const result = await tokens.resolve(APPLY, "Acme/infrastructure");
+    const result = await tokens.resolve(COMPANY_A, "Acme/infrastructure");
     expect(result).toMatchObject({ status: "available", token: "ghs_approvals_1", repository: "acme/Infrastructure" });
     expect(stub.calls[0]).toMatchObject({
       method: "POST",
@@ -146,19 +146,19 @@ describe("approvals token source", () => {
 
   it("caches per repository and never shares a token across repositories", async () => {
     const { stub, tokens } = source();
-    const a = await tokens.resolve(APPLY, "acme/deployments");
-    const b = await tokens.resolve(APPLY, "acme/deployments");
-    const c = await tokens.resolve(APPLY, "acme/infrastructure");
+    const a = await tokens.resolve(COMPANY_A, "acme/deployments");
+    const b = await tokens.resolve(COMPANY_A, "acme/deployments");
+    const c = await tokens.resolve(COMPANY_A, "acme/infrastructure");
     expect(a.status === "available" && b.status === "available" && a.token === b.token).toBe(true);
     expect(c.status === "available" && a.status === "available" && c.token !== a.token).toBe(true);
     expect(stub.calls).toHaveLength(2);
   });
 
   it.each([
-    ["another company's repository", CALILE, "acme/deployments"],
-    ["a company without an allowlist", PLAYABLE, "acme/deployments"],
-    ["another owner", APPLY, "evil/deployments"],
-    ["a malformed name", APPLY, "deployments"],
+    ["another company's repository", COMPANY_B, "acme/deployments"],
+    ["a company without an allowlist", COMPANY_C, "acme/deployments"],
+    ["another owner", COMPANY_A, "evil/deployments"],
+    ["a malformed name", COMPANY_A, "deployments"],
   ])("denies %s without calling GitHub", async (_name, companyId, repository) => {
     const { stub, tokens } = source();
     await expect(tokens.resolve(companyId, repository)).resolves.toMatchObject({ status: "denied" });
@@ -166,16 +166,16 @@ describe("approvals token source", () => {
   });
 
   it("is not configured without an approvals App, and fails closed on a broken one", async () => {
-    await expect(source(githubStub(), { apps: FILE.apps }).tokens.resolve(APPLY, "acme/deployments")).resolves.toEqual({
+    await expect(source(githubStub(), { apps: FILE.apps }).tokens.resolve(COMPANY_A, "acme/deployments")).resolves.toEqual({
       status: "not_configured",
     });
     const broken = source(githubStub(), { ...FILE, approvalsApp: { ...APPROVALS, appId: "x" } });
-    await expect(broken.tokens.resolve(APPLY, "acme/deployments")).resolves.toMatchObject({ status: "unavailable" });
+    await expect(broken.tokens.resolve(COMPANY_A, "acme/deployments")).resolves.toMatchObject({ status: "unavailable" });
   });
 
   it("never echoes GitHub's error body", async () => {
     const { tokens } = source(githubStub({ tokenStatus: 403 }));
-    const result = await tokens.resolve(APPLY, "acme/deployments");
+    const result = await tokens.resolve(COMPANY_A, "acme/deployments");
     expect(result.status).toBe("unavailable");
     expect(JSON.stringify(result)).not.toMatch(/PRIVATE KEY/);
   });
@@ -198,20 +198,20 @@ describe("plugin approvals token host service", () => {
 
   it("returns only a token for the invocation company's allowlisted repository", async () => {
     const result = await handlers(["github.approvals.token"])["githubApp.getApprovalsToken"](
-      { repository: "acme/calile" },
-      scope(CALILE),
+      { repository: "acme/web-app" },
+      scope(COMPANY_B),
     );
-    expect(result).toMatchObject({ appId: "5883576", repository: "acme/calile", companyId: CALILE });
+    expect(result).toMatchObject({ appId: "123456", repository: "acme/web-app", companyId: COMPANY_B });
     expect(JSON.stringify(result)).not.toMatch(/PRIVATE KEY|eyJ/);
   });
 
   it("refuses another company, a repository not allowlisted, and calls without the capability", async () => {
     const call = handlers(["github.approvals.token"])["githubApp.getApprovalsToken"];
-    await expect(call({ repository: "acme/calile", companyId: CALILE }, scope(APPLY))).rejects.toThrow(/scoped to company/);
-    await expect(call({ repository: "acme/calile" }, scope(APPLY))).rejects.toThrow(/not allowlisted/);
-    await expect(call({ repository: "" }, scope(APPLY))).rejects.toThrow(/requires a repository/);
+    await expect(call({ repository: "acme/web-app", companyId: COMPANY_B }, scope(COMPANY_A))).rejects.toThrow(/scoped to company/);
+    await expect(call({ repository: "acme/web-app" }, scope(COMPANY_A))).rejects.toThrow(/not allowlisted/);
+    await expect(call({ repository: "" }, scope(COMPANY_A))).rejects.toThrow(/requires a repository/);
     await expect(
-      handlers(["github.app.token"])["githubApp.getApprovalsToken"]({ repository: "acme/calile" }, scope(CALILE)),
+      handlers(["github.app.token"])["githubApp.getApprovalsToken"]({ repository: "acme/web-app" }, scope(COMPANY_B)),
     ).rejects.toThrow(/github\.approvals\.token/);
   });
 });
