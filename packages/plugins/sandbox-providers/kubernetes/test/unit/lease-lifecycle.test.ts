@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   checkLeaseResumable,
+  describeUnhealthyPod,
   destroyLeaseResources,
   isKubeNotFoundError,
 } from "../../src/lease-lifecycle.js";
@@ -344,5 +345,43 @@ describe("destroyLeaseResources", () => {
         secretName: null,
       }),
     ).rejects.toThrow("forbidden");
+  });
+});
+
+describe("describeUnhealthyPod", () => {
+  const withPod = (read: () => Promise<unknown>) => ({ core: { readNamespacedPod: vi.fn(read) } }) as never;
+
+  it("reports the kubelet eviction reason and message of a Failed pod", async () => {
+    // The shape the kubelet leaves on a sandbox pod evicted for /tmp use (APP-17).
+    const clients = withPod(async () => ({
+      status: {
+        phase: "Failed",
+        reason: "Evicted",
+        message: 'Usage of EmptyDir volume "tmp" exceeds the limit "2Gi". ',
+        containerStatuses: [{ name: "agent", state: { terminated: { reason: "Error", exitCode: 137 } } }],
+      },
+    }));
+    await expect(describeUnhealthyPod(clients, "ns", "pc-pod")).resolves.toBe(
+      'sandbox pod pc-pod is Failed (Evicted: Usage of EmptyDir volume "tmp" exceeds the limit "2Gi".); container agent terminated (Error, exit 137)',
+    );
+  });
+
+  it("reports a pod that is terminating", async () => {
+    const clients = withPod(async () => ({ metadata: { deletionTimestamp: "2026-11-23T04:47:45Z" }, status: { phase: "Running" } }));
+    await expect(describeUnhealthyPod(clients, "ns", "pc-pod")).resolves.toBe("sandbox pod pc-pod is Running and terminating");
+  });
+
+  it("reports a pod that no longer exists, and a failed lookup, without throwing", async () => {
+    await expect(describeUnhealthyPod(withPod(async () => { throw notFound(); }), "ns", "pc-pod"))
+      .resolves.toBe("sandbox pod pc-pod no longer exists");
+    await expect(describeUnhealthyPod(withPod(async () => { throw new Error("apiserver down"); }), "ns", "pc-pod"))
+      .resolves.toBe("sandbox pod pc-pod state unavailable: apiserver down");
+  });
+
+  it("returns null for a healthy Running pod", async () => {
+    const clients = withPod(async () => ({
+      status: { phase: "Running", containerStatuses: [{ name: "agent", state: { running: {} } }] },
+    }));
+    await expect(describeUnhealthyPod(clients, "ns", "pc-pod")).resolves.toBeNull();
   });
 });
