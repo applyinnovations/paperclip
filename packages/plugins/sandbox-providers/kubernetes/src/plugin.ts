@@ -3,6 +3,7 @@ import { definePlugin, type PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
+  PluginEnvironmentTerminationReceipt,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
   PluginEnvironmentLease,
@@ -40,7 +41,7 @@ import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from ".
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
+import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -201,6 +202,27 @@ async function resolveSyncPodExec(
       timeoutMs: io.timeoutMs ?? timeoutMs,
     });
   return { exec, timeoutMs };
+}
+
+// How long a release or destroy waits to confirm the lease's workload and pod
+// are gone. Pods get a 30 s termination grace period by default.
+const TERMINATION_CONFIRM_TIMEOUT_MS = 60_000;
+
+/**
+ * The termination receipt for a released or destroyed lease: `destroyed` once
+ * its workload and pod are confirmed gone. If they are still terminating at the
+ * deadline there is no receipt, and the host retries the release, which then
+ * confirms. A receipt must never stand for a delete request alone.
+ */
+async function terminationReceiptOnceGone(
+  clients: ReturnType<typeof makeKubeClients>,
+  input: { namespace: string; name: string; backend: "sandbox-cr" | "job"; podName: string | null },
+): Promise<PluginEnvironmentTerminationReceipt | void> {
+  const gone = await confirmLeaseResourcesGone(clients, {
+    ...input,
+    timeoutMs: TERMINATION_CONFIRM_TIMEOUT_MS,
+  });
+  if (gone) return { providerLeaseId: input.name, state: "destroyed" };
 }
 
 // Login pseudo-terminals (see login-pty-sessions.ts) and the context their
@@ -689,7 +711,7 @@ const plugin = definePlugin({
 
   async onEnvironmentReleaseLease(
     params: PluginEnvironmentReleaseLeaseParams,
-  ): Promise<void> {
+  ): Promise<PluginEnvironmentTerminationReceipt | void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
     const namespace =
@@ -725,11 +747,19 @@ const plugin = definePlugin({
         ?? (err as { code?: number; statusCode?: number }).statusCode;
       if (code !== 404) throw err;
     }
+    return terminationReceiptOnceGone(clients, {
+      namespace,
+      name: params.providerLeaseId,
+      backend: leaseBackend,
+      podName: typeof params.leaseMetadata?.podName === "string" && params.leaseMetadata.podName
+        ? params.leaseMetadata.podName
+        : null,
+    });
   },
 
   async onEnvironmentDestroyLease(
     params: PluginEnvironmentDestroyLeaseParams,
-  ): Promise<void> {
+  ): Promise<PluginEnvironmentTerminationReceipt | void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
     const namespace =
@@ -770,6 +800,12 @@ const plugin = definePlugin({
       backend: leaseBackend,
       podName,
       secretName,
+    });
+    return terminationReceiptOnceGone(clients, {
+      namespace,
+      name: params.providerLeaseId,
+      backend: leaseBackend,
+      podName,
     });
   },
 

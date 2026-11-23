@@ -13,10 +13,18 @@ const h = vi.hoisted(() => ({
   openPodPty: vi.fn(),
 }));
 
-vi.mock("../../src/kube-client.js", () => ({
-  createKubeConfig: vi.fn(() => ({})),
-  makeKubeClients: vi.fn(() => ({})),
-}));
+// Released leases read back as gone (404), so a release can confirm termination.
+vi.mock("../../src/kube-client.js", () => {
+  const gone = async () => { throw Object.assign(new Error("not found"), { code: 404 }); };
+  return {
+    createKubeConfig: vi.fn(() => ({})),
+    makeKubeClients: vi.fn(() => ({
+      custom: { getNamespacedCustomObject: gone },
+      core: { readNamespacedPod: gone },
+      batch: { readNamespacedJobStatus: gone },
+    })),
+  };
+});
 vi.mock("../../src/tenant-orchestrator.js", () => ({ ensureTenant: vi.fn(async () => undefined) }));
 vi.mock("../../src/secret-manager.js", () => ({ createPerRunSecret: vi.fn(async () => undefined) }));
 vi.mock("../../src/sandbox-cr-orchestrator.js", async (importActual) => {
