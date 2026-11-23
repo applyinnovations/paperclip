@@ -97,18 +97,24 @@ ${options.brokerFile ? String.raw`
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
-    const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    // The broker URL is the control plane's direct address. A target that
+    // can't reach it (one outside the control plane's network) still reaches
+    // the run's API URL, which on a remote target is the callback bridge, and
+    // the bridge forwards this route. So a broker that can't be reached at all
+    // falls back to the API URL.
+    const bases = [...new Set([env.PAPERCLIP_GITHUB_BROKER_URL, env.PAPERCLIP_API_URL].filter(Boolean))];
     const askBroker = !isLocalGit(process.argv.slice(2));
     try {
     let response;
-    if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
-      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
+    if (askBroker && bases.length && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
       // Busy (409) responses and transport failures keep separate budgets, and
       // the body is read inside the retry so a failed read is retried too.
-      let transportFailures = 0, conflicts = 0, result;
+      // A base with a fallback after it gets one transport attempt.
+      let transportFailures = 0, conflicts = 0, result, baseIndex = 0;
       for (;;) {
+        const url = bases[baseIndex].replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
         try {
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
@@ -125,6 +131,7 @@ ${options.brokerFile ? String.raw`
           result = response.ok ? await response.json() : null;
           break;
         } catch (error) {
+          if (baseIndex < bases.length - 1) { baseIndex += 1; continue; }
           transportFailures += 1;
           if (transportFailures >= 3) throw error;
           await new Promise(resolve => setTimeout(resolve, 500 * transportFailures));
