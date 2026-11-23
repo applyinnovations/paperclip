@@ -32,6 +32,56 @@ export function isKubeNotFoundError(err: unknown): boolean {
   return code === 404;
 }
 
+type PodStateView = {
+  metadata?: { deletionTimestamp?: unknown };
+  status?: {
+    phase?: string;
+    reason?: string;
+    message?: string;
+    containerStatuses?: {
+      name?: string;
+      state?: { terminated?: { reason?: string; exitCode?: number; message?: string } };
+    }[];
+  };
+};
+
+/**
+ * Describe why a lease's pod can no longer run commands, or return null when it
+ * looks healthy (Running, not terminating, no terminated container). Used to
+ * explain an exec failure: a sandbox evicted for ephemeral-storage use fails
+ * every later exec, and the eviction message (e.g. `Usage of EmptyDir volume
+ * "tmp" exceeds the limit "2Gi"`) is the only place the real cause is recorded.
+ * Never throws: a failed lookup is reported as text.
+ */
+export async function describeUnhealthyPod(
+  clients: KubeClients,
+  namespace: string,
+  podName: string,
+): Promise<string | null> {
+  let pod: PodStateView;
+  try {
+    pod = await clients.core.readNamespacedPod({ namespace, name: podName }) as PodStateView;
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return `sandbox pod ${podName} no longer exists`;
+    return `sandbox pod ${podName} state unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  const phase = pod.status?.phase ?? "unknown";
+  const terminating = Boolean(pod.metadata?.deletionTimestamp);
+  const terminated = (pod.status?.containerStatuses ?? [])
+    .filter((c) => c.state?.terminated)
+    .map((c) => {
+      const t = c.state!.terminated!;
+      return `container ${c.name ?? "?"} terminated (${[t.reason, typeof t.exitCode === "number" ? `exit ${t.exitCode}` : null, t.message].filter(Boolean).join(", ")})`;
+    });
+  if (phase === "Running" && !terminating && terminated.length === 0 && !pod.status?.reason) return null;
+  const reason = [pod.status?.reason, pod.status?.message].filter(Boolean).join(": ");
+  return [
+    `sandbox pod ${podName} is ${phase}${terminating ? " and terminating" : ""}`
+      + (reason ? ` (${reason.trim()})` : ""),
+    ...terminated,
+  ].join("; ");
+}
+
 async function ignoreNotFound(promise: Promise<unknown>): Promise<void> {
   try {
     await promise;

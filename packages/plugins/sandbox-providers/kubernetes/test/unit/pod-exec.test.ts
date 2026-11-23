@@ -8,6 +8,9 @@ import type { PassThrough } from "node:stream";
 // accumulation cap without a real cluster.
 type StatusCb = (status: {
   status: string;
+  reason?: string;
+  message?: string;
+  code?: number;
   details?: { causes?: { reason?: string; message?: string }[] };
 }) => void;
 
@@ -40,7 +43,7 @@ vi.mock("@kubernetes/client-node", () => {
   return { Exec };
 });
 
-const { execInPod, execInPodStreaming } = await import("../../src/pod-exec.js");
+const { describeExecStatusFailure, execInPod, execInPodStreaming } = await import("../../src/pod-exec.js");
 
 const KC = {} as never;
 
@@ -234,5 +237,65 @@ describe("execInPodStreaming", () => {
         timeoutMs: 5_000,
       }),
     ).rejects.toThrow(/disk guard/i);
+  });
+});
+
+// APP-17: an exec into a sandbox whose container is no longer running (the
+// kubelet evicted it, or it is stopping) gets a Failure status with no ExitCode
+// cause. That used to come back as a fabricated `exit 1` with empty stderr, so
+// sync-out failed as a bare "transfer failed (exit 1)".
+describe("execInPodStreaming exec failures without an exit code", () => {
+  it("rejects with the apiserver reason and message instead of inventing exit 1", async () => {
+    scriptedExec = (stdout, stderr, statusCb) => {
+      stdout.end();
+      stderr.end();
+      statusCb({
+        status: "Failure",
+        reason: "InternalError",
+        code: 500,
+        message: "Internal error occurred: error executing command in container: container is not running",
+      });
+    };
+    const sink = new Writable({ write(_c, _e, cb) { cb(); } });
+    await expect(
+      execInPodStreaming(KC, "ns", "pc-pod", "agent", ["/bin/sh", "-c", ":"], { stdout: sink, timeoutMs: 5_000 }),
+    ).rejects.toThrow(
+      "execInPodStreaming: the exec failed without a command exit code (pod=pc-pod, container=agent): InternalError, code 500: Internal error occurred: error executing command in container: container is not running",
+    );
+  });
+
+  it("still resolves a real non-zero exit code from the ExitCode cause, with stderr", async () => {
+    scriptedExec = (stdout, stderr, statusCb) => {
+      stdout.end();
+      stderr.write(Buffer.from("tar: ./a: file changed as we read it\n"));
+      stderr.end();
+      statusCb({
+        status: "Failure",
+        reason: "NonZeroExitCode",
+        message: "command terminated with non-zero exit code: exit status 1",
+        details: { causes: [{ reason: "ExitCode", message: "1" }] },
+      });
+    };
+    const sink = new Writable({ write(_c, _e, cb) { cb(); } });
+    const result = await execInPodStreaming(KC, "ns", "pc-pod", "agent", ["/bin/sh", "-c", ":"], {
+      stdout: sink,
+      timeoutMs: 5_000,
+    });
+    expect(result).toEqual({ exitCode: 1, stderr: "tar: ./a: file changed as we read it\n" });
+  });
+});
+
+describe("describeExecStatusFailure", () => {
+  it("names the status when the apiserver gave no reason", () => {
+    expect(describeExecStatusFailure({ status: "Failure" })).toBe("status Failure with no reason");
+  });
+
+  it("includes non-ExitCode causes and bounds the text", () => {
+    expect(describeExecStatusFailure({
+      status: "Failure",
+      reason: "BadRequest",
+      details: { causes: [{ reason: "ExitCode", message: "3" }, { reason: "FieldValueInvalid", message: "bad container" }] },
+    })).toBe("BadRequest: FieldValueInvalid: bad container");
+    expect(describeExecStatusFailure({ status: "Failure", message: "x".repeat(5000) }).length).toBe(1025);
   });
 });

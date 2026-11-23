@@ -99,6 +99,31 @@ const MAX_SYNC_OUTPUT_BYTES = 8 * 1024 * 1024 * 1024;
 // a pod that floods stderr cannot grow the host accumulator without limit.
 const SYNC_STDERR_CAP_BYTES = 1024 * 1024;
 
+// How much of the pod's stderr a sync failure message carries. The exec keeps
+// up to SYNC_STDERR_CAP_BYTES, but an error message (which lands in run events
+// and server logs) only needs the tail, where tar and the script print the cause.
+export const SYNC_ERROR_STDERR_TAIL_CHARS = 2048;
+
+/**
+ * Build the error message for a sync exec that exited non-zero: the label, exit
+ * code, bytes streamed back (outbound), and a bounded tail of the pod's stderr,
+ * or an explicit "(no stderr)" so an empty stream is distinguishable from a
+ * dropped one.
+ */
+export function formatSyncExecFailure(
+  label: string,
+  exitCode: number,
+  stderr: string | undefined,
+  bytesReceived?: number,
+): string {
+  const trimmed = (stderr ?? "").trim();
+  const tail = trimmed.length > SYNC_ERROR_STDERR_TAIL_CHARS
+    ? `…${trimmed.slice(-SYNC_ERROR_STDERR_TAIL_CHARS)}`
+    : trimmed;
+  const bytes = typeof bytesReceived === "number" ? `, ${bytesReceived} bytes received` : "";
+  return `Kubernetes ${label} failed (exit ${exitCode}${bytes}): ${tail || "(no stderr)"}`;
+}
+
 function scratchName(suffix = ""): string {
   return `${SCRATCH_PREFIX}-${randomUUID()}${suffix}`;
 }
@@ -216,10 +241,7 @@ async function streamFileToPodStdin(input: {
       maxStderrBytes: SYNC_STDERR_CAP_BYTES,
     });
     if (result.exitCode !== 0) {
-      const detail = (result.stderr || "").trim();
-      throw new Error(
-        `Kubernetes ${input.label} failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
-      );
+      throw new Error(formatSyncExecFailure(input.label, result.exitCode, result.stderr));
     }
   } finally {
     source.destroy();
@@ -268,10 +290,7 @@ async function streamPodStdoutToFile(input: {
     });
     await flushed;
     if (result.exitCode !== 0) {
-      const detail = (result.stderr || "").trim();
-      throw new Error(
-        `Kubernetes ${input.label} failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
-      );
+      throw new Error(formatSyncExecFailure(input.label, result.exitCode, result.stderr, written));
     }
   } catch (err) {
     // Tear the sink down so a tripped guard / rejected exec never leaves the
@@ -685,10 +704,7 @@ async function runPostUploadCommands(input: {
       maxStderrBytes: SYNC_STDERR_CAP_BYTES,
     });
     if (result.exitCode !== 0) {
-      const detail = (result.stderr || "").trim();
-      throw new Error(
-        `Kubernetes post-upload command failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
-      );
+      throw new Error(formatSyncExecFailure("post-upload command", result.exitCode, result.stderr));
     }
   }
 }

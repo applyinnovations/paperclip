@@ -41,7 +41,7 @@ import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from ".
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
+import { checkLeaseResumable, confirmLeaseResourcesGone, describeUnhealthyPod, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -145,7 +145,7 @@ async function resolveSyncPodExec(
   params:
     | PluginEnvironmentSyncInParams
     | PluginEnvironmentSyncOutParams,
-): Promise<{ exec: PodStreamExec; timeoutMs: number }> {
+): Promise<{ exec: PodStreamExec; timeoutMs: number; explainFailure: (err: unknown) => Promise<Error> }> {
   const { lease } = params;
   if (!lease.providerLeaseId) {
     throw new Error("Kubernetes file sync requires a provider lease ID.");
@@ -201,7 +201,54 @@ async function resolveSyncPodExec(
       ...io,
       timeoutMs: io.timeoutMs ?? timeoutMs,
     });
-  return { exec, timeoutMs };
+  // A sync exec into a pod that was evicted or is stopping fails no matter what
+  // the transfer does. Append the pod's own state so the error names the cause.
+  const explainFailure = async (err: unknown): Promise<Error> => {
+    const base = err instanceof Error ? err : new Error(String(err));
+    const podState = await describeUnhealthyPod(clients, namespace, podName);
+    if (!podState) return base;
+    const explained = new Error(`${base.message}; ${podState}`);
+    explained.stack = base.stack;
+    return explained;
+  };
+  return { exec, timeoutMs, explainFailure };
+}
+
+/**
+ * Run one native sync direction and, on failure, rethrow with the pod's state
+ * appended and log the direction, lease, issue and error for the server log.
+ */
+async function runLoggedSync(
+  direction: "syncIn" | "syncOut",
+  params: PluginEnvironmentSyncInParams | PluginEnvironmentSyncOutParams,
+  run: (exec: PodStreamExec, timeoutMs: number) => Promise<PluginEnvironmentSyncResult>,
+): Promise<PluginEnvironmentSyncResult> {
+  const { exec, timeoutMs, explainFailure } = await resolveSyncPodExec(params);
+  const startedAt = Date.now();
+  try {
+    const result = await run(exec, timeoutMs);
+    pluginContext?.logger.info("Kubernetes sandbox file sync completed", {
+      direction,
+      issueId: params.issueId ?? null,
+      environmentId: params.environmentId,
+      providerLeaseId: params.lease.providerLeaseId ?? null,
+      durationMs: Date.now() - startedAt,
+      filesTransferred: result.operations.reduce((n, op) => n + op.filesTransferred, 0),
+      bytesTransferred: result.operations.reduce((n, op) => n + op.bytesTransferred, 0),
+    });
+    return result;
+  } catch (err) {
+    const explained = await explainFailure(err);
+    pluginContext?.logger.error("Kubernetes sandbox file sync failed", {
+      direction,
+      issueId: params.issueId ?? null,
+      environmentId: params.environmentId,
+      providerLeaseId: params.lease.providerLeaseId ?? null,
+      durationMs: Date.now() - startedAt,
+      error: explained.message,
+    });
+    throw explained;
+  }
 }
 
 // The default working directory of a Sandbox lease: created by the agent user
@@ -1214,13 +1261,12 @@ const plugin = definePlugin({
     params: PluginEnvironmentSyncInParams,
   ): Promise<PluginEnvironmentSyncResult> {
     const remoteDir = resolveSyncRemoteDir(params.lease);
-    const { exec, timeoutMs } = await resolveSyncPodExec(params);
-    return await performSyncIn({
+    return await runLoggedSync("syncIn", params, (exec, timeoutMs) => performSyncIn({
       exec,
       operations: params.operations,
       remoteDir,
       timeoutMs,
-    });
+    }));
   },
 
   // Opt-in native outbound transfer. See onEnvironmentSyncIn.
@@ -1228,13 +1274,12 @@ const plugin = definePlugin({
     params: PluginEnvironmentSyncOutParams,
   ): Promise<PluginEnvironmentSyncResult> {
     const remoteDir = resolveSyncRemoteDir(params.lease);
-    const { exec, timeoutMs } = await resolveSyncPodExec(params);
-    return await performSyncOut({
+    return await runLoggedSync("syncOut", params, (exec, timeoutMs) => performSyncOut({
       exec,
       operations: params.operations,
       remoteDir,
       timeoutMs,
-    });
+    }));
   },
 
   // Login pseudo-terminal for the provider-generic sign-in flow. The fixed

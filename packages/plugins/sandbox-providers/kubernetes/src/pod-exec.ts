@@ -303,6 +303,30 @@ export async function execInPod(
 }
 
 /**
+ * Render a non-Success exec V1Status (`reason`, `message`, `code`, and any
+ * non-ExitCode causes) as one bounded line for an error message.
+ */
+export function describeExecStatusFailure(status: {
+  status?: string;
+  reason?: string;
+  message?: string;
+  code?: number;
+  details?: { causes?: { reason?: string; message?: string }[] };
+}): string {
+  const parts: string[] = [];
+  if (status.reason) parts.push(status.reason);
+  if (typeof status.code === "number") parts.push(`code ${status.code}`);
+  const head = parts.join(", ");
+  const causes = (status.details?.causes ?? [])
+    .filter((c) => c.reason !== "ExitCode")
+    .map((c) => [c.reason, c.message].filter(Boolean).join(": "))
+    .filter(Boolean);
+  const text = [head, status.message, ...causes].filter(Boolean).join(": ")
+    || `status ${status.status ?? "unknown"} with no reason`;
+  return text.length > 1024 ? `${text.slice(0, 1024)}…` : text;
+}
+
+/**
  * Streaming variant of {@link execInPod} for bulk file transfer over the pod
  * exec data channel.
  *
@@ -449,7 +473,19 @@ export async function execInPodStreaming(
           const exitCodeCause = causes.find(
             (c: { reason?: string; message?: string }) => c.reason === "ExitCode",
           );
-          pendingExitCode = exitCodeCause?.message ? Number(exitCodeCause.message) : 1;
+          const exitCode = exitCodeCause?.message ? Number(exitCodeCause.message) : Number.NaN;
+          if (!Number.isInteger(exitCode)) {
+            // A Failure status with no ExitCode cause means the command never
+            // reported an exit code: the container is not running (evicted,
+            // OOM-killed, stopping) or the kubelet/runtime could not start the
+            // exec. Fail with the apiserver's own reason instead of inventing
+            // "exit 1", which reads like a command failure and hides the cause.
+            failClosed(new Error(
+              `execInPodStreaming: the exec failed without a command exit code (pod=${podName}, container=${containerName}): ${describeExecStatusFailure(status)}`,
+            ));
+            return;
+          }
+          pendingExitCode = exitCode;
         }
         tryFinish();
       },

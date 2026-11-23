@@ -632,6 +632,64 @@ describe("kubernetes onEnvironmentSyncOut (native single-exec transfer)", () => 
     expect(calls).toHaveLength(1);
     await expect(fs.stat(target)).rejects.toThrow();
   });
+
+  // APP-17: a failed sync-out must say why. The in-pod tar's stderr reaches the
+  // error, not just the exit code.
+  it.skipIf(process.getuid?.() === 0)("puts the in-pod tar stderr and the bytes received in a failed directory sync-out error", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    const src = path.join(remoteDir, "repo");
+    await fs.mkdir(src);
+    await fs.writeFile(path.join(src, "ok.txt"), "fine");
+    await fs.writeFile(path.join(src, "locked.txt"), "secret");
+    await fs.chmod(path.join(src, "locked.txt"), 0o000);
+    const { exec } = makeRealExec();
+    try {
+      await expect(
+        performSyncOut({
+          exec,
+          remoteDir,
+          timeoutMs: 30_000,
+          operations: [{ operationId: "op", files: [{ sourcePath: src, targetPath: path.join(hostOut, "repo"), kind: "directory" }] }],
+        }),
+      ).rejects.toThrow(/^Kubernetes syncOut directory transfer failed \(exit 43, \d+ bytes received\): .*locked\.txt.*Permission denied[\s\S]*tar failed$/);
+    } finally {
+      await fs.chmod(path.join(src, "locked.txt"), 0o600);
+    }
+  });
+
+  it("bounds the stderr carried in the error to its tail, and says when stderr was empty", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    await fs.mkdir(path.join(remoteDir, "repo"));
+    const run = (stderr: string) => performSyncOut({
+      exec: async (_command, io) => { io.stdout?.end(); return { exitCode: 43, stderr }; },
+      remoteDir,
+      timeoutMs: 30_000,
+      operations: [{ operationId: "op", files: [{ sourcePath: path.join(remoteDir, "repo"), targetPath: path.join(hostOut, "repo"), kind: "directory" }] }],
+    });
+    const flood = `${"noise ".repeat(5000)}THE-CAUSE`;
+    const error = await run(flood).catch((err: Error) => err);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/THE-CAUSE$/);
+    expect((error as Error).message.length).toBeLessThan(2200);
+    await expect(run("")).rejects.toThrow("Kubernetes syncOut directory transfer failed (exit 43, 0 bytes received): (no stderr)");
+  });
+
+  it("surfaces an exec that failed without an exit code (container gone) instead of a bare exit 1", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    await fs.mkdir(path.join(remoteDir, "repo"));
+    const goneError = "execInPodStreaming: the exec failed without a command exit code (pod=pc-pod, container=agent): InternalError: container is not running";
+    await expect(
+      performSyncOut({
+        exec: async () => { throw new Error(goneError); },
+        remoteDir,
+        timeoutMs: 30_000,
+        operations: [{ operationId: "op", files: [{ sourcePath: path.join(remoteDir, "repo"), targetPath: path.join(hostOut, "repo"), kind: "directory" }] }],
+      }),
+    ).rejects.toThrow(goneError);
+  });
 });
 
 // ---------------------------------------------------------------------------
