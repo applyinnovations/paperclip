@@ -8,6 +8,8 @@ import type { PassThrough } from "node:stream";
 // accumulation cap without a real cluster.
 type StatusCb = (status: {
   status: string;
+  message?: string;
+  reason?: string;
   details?: { causes?: { reason?: string; message?: string }[] };
 }) => void;
 
@@ -93,6 +95,34 @@ describe("execInPod stdout cap", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toHaveLength(4096);
+  });
+});
+
+describe("execInPod exit status", () => {
+  it("reports the command's own exit code without adding a diagnostic", async () => {
+    scriptedExec = (stdout, stderr, statusCb) => {
+      stderr.write(Buffer.from("fatal: bad object\n", "utf-8"));
+      stdout.end();
+      stderr.end();
+      statusCb({ status: "Failure", details: { causes: [{ reason: "ExitCode", message: "128" }] } });
+    };
+    const result = await execInPod(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], undefined, 5_000);
+    expect(result).toEqual({ exitCode: 128, stdout: "", stderr: "fatal: bad object\n" });
+  });
+
+  // APP-128: an evicted sandbox pod fails the exec with no ExitCode cause and no
+  // output. The status message must reach stderr, or the run error is a bare
+  // "failed with exit code 1" that hides the eviction.
+  it("puts the status message in stderr when the exec fails without an exit code", async () => {
+    scriptedExec = (stdout, stderr, statusCb) => {
+      stdout.end();
+      stderr.end();
+      statusCb({ status: "Failure", reason: "InternalError", message: 'container "agent" not found' });
+    };
+    const result = await execInPod(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], undefined, 5_000);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('InternalError: container "agent" not found');
+    expect(result.stderr).toMatch(/evicted/);
   });
 });
 
