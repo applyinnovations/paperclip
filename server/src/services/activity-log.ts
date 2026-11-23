@@ -24,6 +24,7 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
+  issue_execution_decision_recorded: "issue.execution_decision.recorded",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",

@@ -90,7 +90,6 @@ import {
   issueAccessGrants,
   issueComments,
   issueDocuments,
-  issueExecutionDecisions,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -370,6 +369,7 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import { recordIssueExecutionDecision } from "../services/issue-execution-decisions.js";
 import { buildExecutionWorkspaceAdapterConfig, parseProjectExecutionWorkspacePolicy, parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -10667,18 +10667,17 @@ export function issueRoutes(
                 ...nextExecutionState,
                 lastDecisionId: decisionId,
               };
-              await tx.insert(issueExecutionDecisions).values({
+              await recordIssueExecutionDecision(tx as unknown as Db, {
                 id: decisionId,
                 companyId: lockedIssue.companyId,
                 issueId: lockedIssue.id,
+                issueIdentifier: lockedIssue.identifier ?? null,
                 stageId: transition.decision.stageId,
                 stageType: transition.decision.stageType,
-                actorAgentId: actor.agentId ?? null,
-                actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
-                createdByRunId: actor.runId ?? null,
-              });
+                actor,
+              }, postCommitActivityPublications);
             }
           }
 
@@ -15521,18 +15520,17 @@ export function issueRoutes(
             }
 
             if (decision && decisionId) {
-              await tx.insert(issueExecutionDecisions).values({
+              await recordIssueExecutionDecision(tx as unknown as Db, {
                 id: decisionId,
                 companyId: updated.companyId,
                 issueId: updated.id,
+                issueIdentifier: updated.identifier ?? null,
                 stageId: decision.stageId,
                 stageType: decision.stageType,
-                actorAgentId: actor.agentId ?? null,
-                actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
                 body: decision.body,
-                createdByRunId: actor.runId ?? null,
-              });
+                actor,
+              }, postCommitActivityPublications);
             }
 
             if (shouldRelayStop) {
@@ -19738,18 +19736,17 @@ export function issueRoutes(
             if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {
-              await tx.insert(issueExecutionDecisions).values({
+              await recordIssueExecutionDecision(tx as unknown as Db, {
                 id: decisionId,
                 companyId: updated.companyId,
                 issueId: updated.id,
+                issueIdentifier: updated.identifier ?? null,
                 stageId: transition.decision.stageId,
                 stageType: transition.decision.stageType,
-                actorAgentId: actor.agentId ?? null,
-                actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
-                createdByRunId: actor.runId ?? null,
-              });
+                actor,
+              }, postCommitActivityPublications);
             }
 
             return { comment: insertedComment, issue: updated };

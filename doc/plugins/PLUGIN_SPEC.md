@@ -752,6 +752,7 @@ Relation and read helpers:
 - `ctx.issues.relations.removeBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.getSubtree(issueId, companyId, options)`
 - `ctx.issues.summaries.getOrchestration({ issueId, companyId, includeSubtree, billingCode })`
+- `ctx.issues.listExecutionDecisions(issueId, companyId)` (`issues.read`) returns the decisions recorded on the issue's execution-policy review and approval stages, oldest first (see §16.3)
 
 Governance helpers:
 
@@ -963,6 +964,7 @@ Minimum event set:
 - `issue.checked_out`
 - `issue.released`
 - `issue.assignment_wakeup_requested`
+- `issue.execution_decision.recorded`
 - `agent.created`
 - `agent.updated`
 - `agent.status_changed`
@@ -1016,6 +1018,27 @@ Rules:
 - Plugin events are not core domain events — they do not appear in the core activity log unless the emitting plugin explicitly logs them.
 - Plugin events follow the same at-least-once delivery semantics as core events.
 - The host must not allow plugins to emit events in the core namespace (events without the `plugin.` prefix).
+
+### 16.3 Execution-Policy Stage Decisions
+
+The host emits `issue.execution_decision.recorded` after it commits a decision on an issue's execution-policy review or approval stage: a participant approving the stage or requesting changes, whether by status update, by an approving review comment, or while resolving a recovery action. The event's entity is the issue. Its payload:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `issueId` | `string` | Issue the decision was recorded on |
+| `issueIdentifier` | `string \| null` | Issue identifier such as `PAP-123` |
+| `decisionId` | `string` | Decision record id |
+| `stageId` | `string` | Execution-policy stage id |
+| `stageType` | `"review" \| "approval"` | Stage type |
+| `outcome` | `"approved" \| "changes_requested"` | Decision outcome |
+| `actorAgentId` | `string \| null` | Deciding agent, if an agent decided |
+| `actorUserId` | `string \| null` | Deciding user, if a user decided |
+| `reviewedSha` | `string \| null` | Commit the decision names as reviewed (below) |
+| `createdAt` | `string` | ISO 8601 time the decision was recorded |
+
+The payload also carries the standard activity fields `agentId`, `runId` and `responsibleUserId`. It does not carry the decision body; read it with `ctx.issues.listExecutionDecisions`, which returns the same fields plus `body`.
+
+`reviewedSha` is read from the decision body. A reviewer names the commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. When the body has several such lines the last one governs; if it is not a valid SHA, `reviewedSha` is `null`. The parser is `parseReviewedSha` in `@paperclipai/shared`.
 
 ## 17. Scheduled Jobs
 

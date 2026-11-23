@@ -65,6 +65,7 @@ import type {
   PluginIssueRelationSummary,
   PluginIssueSubtree,
   PluginIssueAttachmentContent,
+  PluginIssueExecutionDecision,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
   PluginJobContext,
@@ -2076,6 +2077,10 @@ export interface WorkerToHostMethods {
   "issues.listComments": [
     params: { issueId: string; companyId: string },
     result: IssueComment[],
+  ];
+  "issues.listExecutionDecisions": [
+    params: { issueId: string; companyId: string },
+    result: PluginIssueExecutionDecision[],
   ];
   "issues.createComment": [
     params: {

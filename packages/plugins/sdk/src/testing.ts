@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createIssueThreadInteractionSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { createIssueThreadInteractionSchema, parseReviewedSha, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import type {
   PaperclipPluginManifestV1,
   PluginCapability,
@@ -41,6 +41,7 @@ import type {
   PluginLocalFolderEntry,
   PluginLocalFolderStatus,
   PluginAccessMember,
+  PluginIssueExecutionDecision,
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
@@ -117,6 +118,11 @@ export interface TestHarness {
     issues?: Issue[];
     issueComments?: IssueComment[];
     issueInteractions?: IssueThreadInteraction[];
+    /**
+     * Execution-policy stage decisions for `ctx.issues.listExecutionDecisions`.
+     * Omit `reviewedSha` to derive it from `body` as the host does.
+     */
+    issueExecutionDecisions?: Array<Omit<PluginIssueExecutionDecision, "reviewedSha"> & { reviewedSha?: string | null }>;
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
     agents?: Agent[];
@@ -514,6 +520,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
+  const issueExecutionDecisions = new Map<string, PluginIssueExecutionDecision[]>();
   const issueAttachments = new Map<string, IssueAttachment[]>();
   const attachmentContentById = new Map<string, string>();
   const approvals = new Map<string, Approval>();
@@ -1777,6 +1784,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           comment.deletedAt ? { ...comment, body: "", presentation: null, metadata: null } : comment
         );
       },
+      async listExecutionDecisions(issueId, companyId) {
+        requireCapability(manifest, capabilitySet, "issues.read");
+        if (!isInCompany(issues.get(issueId), companyId)) return [];
+        return (issueExecutionDecisions.get(issueId) ?? []).map((decision) => ({ ...decision }));
+      },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
         if (options?.actorUserId) {
@@ -2631,6 +2643,12 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const list = issueInteractions.get(row.issueId) ?? [];
         list.push(row);
         issueInteractions.set(row.issueId, list);
+      }
+      for (const row of input.issueExecutionDecisions ?? []) {
+        const list = issueExecutionDecisions.get(row.issueId) ?? [];
+        list.push({ ...row, reviewedSha: row.reviewedSha === undefined ? parseReviewedSha(row.body) : row.reviewedSha });
+        list.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+        issueExecutionDecisions.set(row.issueId, list);
       }
       for (const row of input.issueAttachments ?? []) {
         const { contentBase64, ...attachment } = row;

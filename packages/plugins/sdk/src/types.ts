@@ -55,6 +55,8 @@ import type {
   PrincipalPermissionGrant,
   PrincipalType,
   EnvSecretRefBinding,
+  IssueExecutionStageType,
+  IssueExecutionDecisionOutcome,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
 
@@ -1517,10 +1519,47 @@ export interface PluginIssueAttachmentContent {
 }
 
 /**
+ * Payload of the `issue.execution_decision.recorded` event: one decision a
+ * participant recorded on a review or approval stage of an issue's execution
+ * policy.
+ *
+ * The host also adds the standard activity fields (`agentId`, `runId`,
+ * `responsibleUserId`) to the event payload.
+ */
+export interface PluginIssueExecutionDecisionRecordedPayload {
+  issueId: string;
+  issueIdentifier: string | null;
+  decisionId: string;
+  stageId: string;
+  stageType: IssueExecutionStageType;
+  outcome: IssueExecutionDecisionOutcome;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  /**
+   * The commit the decision names as reviewed: the last
+   * `Reviewed-SHA: <40 lowercase hex>` line of the decision body (see
+   * `parseReviewedSha` in `@paperclipai/shared`), or `null` when the body
+   * has no valid such line.
+   */
+  reviewedSha: string | null;
+  /** ISO 8601 timestamp of when the decision was recorded. */
+  createdAt: string;
+}
+
+/**
+ * A recorded execution-policy stage decision, returned by
+ * `ctx.issues.listExecutionDecisions`. The event payload plus the decision
+ * body (the reviewer's comment).
+ */
+export interface PluginIssueExecutionDecision extends PluginIssueExecutionDecisionRecordedPayload {
+  body: string;
+}
+
+/**
  * `ctx.issues` — read and mutate issues plus comments.
  *
  * Requires:
- * - `issues.read` for read operations
+ * - `issues.read` for read operations, including `listExecutionDecisions`
  * - `issues.create` for create
  * - `issues.update` for update
  * - `issues.checkout` for checkout ownership assertions
@@ -1636,6 +1675,13 @@ export interface PluginIssuesClient {
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
+  /**
+   * List the decisions recorded on the issue's execution-policy review and
+   * approval stages, oldest first (newest last). Each carries the
+   * `reviewedSha` parsed from its body. Requires `issues.read`. Returns `[]`
+   * for an issue outside `companyId` or one the plugin cannot read.
+   */
+  listExecutionDecisions(issueId: string, companyId: string): Promise<PluginIssueExecutionDecision[]>;
   /**
    * Post a comment on an issue.
    *
