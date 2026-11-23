@@ -79,6 +79,42 @@ function parsePositiveIntMs(value: string | undefined): number | undefined {
   return parsed;
 }
 
+const QUANTITY = /^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$/;
+
+/**
+ * `PAPERCLIP_K8S_DEFAULT_RESOURCES`: JSON `{"requests": {"cpu", "memory"},
+ * "limits": {"cpu", "memory"}}` with Kubernetes quantities, for each Sandbox
+ * pod. Unknown keys or malformed quantities throw, so a typo fails the boot
+ * instead of silently leaving the plugin's defaults in place.
+ */
+function parseDefaultResources(value: string | undefined): KubernetesEnvironmentConfigInput["defaultResources"] | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("PAPERCLIP_K8S_DEFAULT_RESOURCES must be JSON.");
+  }
+  const fail = (why: string): never => {
+    throw new Error(`PAPERCLIP_K8S_DEFAULT_RESOURCES ${why}.`);
+  };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("must be an object");
+  const out: NonNullable<KubernetesEnvironmentConfigInput["defaultResources"]> = {};
+  for (const [section, entries] of Object.entries(parsed as Record<string, unknown>)) {
+    if (section !== "requests" && section !== "limits") fail(`has an unknown key "${section}"`);
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) fail(`"${section}" must be an object`);
+    const quantities: { cpu?: string; memory?: string } = {};
+    for (const [resource, quantity] of Object.entries(entries as Record<string, unknown>)) {
+      if (resource !== "cpu" && resource !== "memory") fail(`"${section}" has an unknown resource "${resource}"`);
+      if (typeof quantity !== "string" || !QUANTITY.test(quantity)) fail(`"${section}.${resource}" must be a Kubernetes quantity`);
+      quantities[resource as "cpu" | "memory"] = quantity as string;
+    }
+    out[section as "requests" | "limits"] = quantities;
+  }
+  return out;
+}
+
 function parseList(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
   const items = value
@@ -146,6 +182,9 @@ export function parseExecutionPolicyBootstrapEnv(
 
   const imageRegistry = env.PAPERCLIP_K8S_IMAGE_REGISTRY?.trim();
   if (imageRegistry) kubernetesConfig.imageRegistry = imageRegistry;
+
+  const defaultResources = parseDefaultResources(env.PAPERCLIP_K8S_DEFAULT_RESOURCES);
+  if (defaultResources) kubernetesConfig.defaultResources = defaultResources;
 
   const rpcTimeoutMs = parsePositiveIntMs(env.PAPERCLIP_K8S_RPC_TIMEOUT_MS);
   if (rpcTimeoutMs !== undefined) kubernetesConfig.timeoutMs = rpcTimeoutMs;

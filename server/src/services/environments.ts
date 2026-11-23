@@ -143,6 +143,11 @@ export interface KubernetesEnvironmentConfigInput {
    * environment config and validated by the sandbox config schema.
    */
   timeoutMs?: number;
+  /** Requests and limits for each Sandbox pod; the plugin's defaults apply when unset. */
+  defaultResources?: {
+    requests?: { cpu?: string; memory?: string };
+    limits?: { cpu?: string; memory?: string };
+  };
   adapters?: import("@paperclipai/shared").AdapterRegistryEntry[];
   [key: string]: unknown;
 }
