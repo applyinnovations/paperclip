@@ -1440,6 +1440,9 @@ export const PLUGIN_CAPABILITIES = [
   // never reach the plugin.
   "github.app.token",
   "github.app.webhooks.verify",
+  // The shared approvals App: a token scoped to one operator-allowlisted repository of the
+  // invocation's company, for posting gate results. The key never reaches the plugin.
+  "github.approvals.token",
   "environment.drivers.register",
   "local.folders",
   // Agent Tools

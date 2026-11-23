@@ -20,6 +20,12 @@ import path from "node:path";
  * The file holds only identifiers and paths; private keys and webhook secrets stay in their
  * own files (mounted secrets). Setting both forms, duplicate companies/Apps/installations,
  * unknown keys or malformed IDs are configuration errors: the server refuses to start.
+ *
+ * The file can also name one shared approvals App (`approvalsApp`, see
+ * readGitHubApprovalsAppConfig): an App separate from every company App, whose tokens only
+ * plugins with `github.approvals.token` receive, each scoped to one allowlisted repository.
+ * It is validated on its own and never stops the server: a broken entry fails each token
+ * request instead.
  */
 
 export const GITHUB_APP_ENV = {
@@ -135,11 +141,12 @@ export function parseGitHubAppsFile(document: unknown): GitHubAppsConfigResult {
     status: "invalid",
     error: `${GITHUB_APPS_FILE_ENV}: ${error}`,
   });
-  if (!isRecord(document) || !Array.isArray(document.apps)) {
-    return invalid('expected an object with an "apps" array');
-  }
-  const extraRootKeys = Object.keys(document).filter((key) => key !== "apps");
+  if (!isRecord(document)) return invalid('expected an object with an "apps" array');
+  const extraRootKeys = Object.keys(document).filter((key) => key !== "apps" && key !== "approvalsApp");
   if (extraRootKeys.length > 0) return invalid(`unknown key "${extraRootKeys[0]}"`);
+  // A file that only names the approvals App configures no company Apps.
+  if (document.apps === undefined && document.approvalsApp !== undefined) return { status: "disabled" };
+  if (!Array.isArray(document.apps)) return invalid('expected an object with an "apps" array');
   if (document.apps.length === 0) return invalid("list at least one App, or unset the variable");
 
   const apps: GitHubAppInstallationConfig[] = [];
@@ -297,4 +304,154 @@ export async function checkGitHubAppsConfigAtStartup(
     }
   }
   return { status: "enabled", source: result.config.source, apps: result.config.apps.length };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shared approvals App
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One GitHub App shared by every company, separate from the company Apps, whose only job is
+ * posting gate results (commit statuses, labels) that repository rulesets can pin to its
+ * integration id. Declared in the apps file:
+ *
+ *   "approvalsApp": {
+ *     "appId": "123", "installationId": "456", "owner": "my-org",
+ *     "privateKeyFile": "/etc/paperclip/github-approvals/private-key.pem",
+ *     "companies": { "<companyId>": ["repo-a", "repo-b"] }
+ *   }
+ *
+ * `companies` is the operator's allowlist: a plugin acting for a company only gets tokens
+ * for that company's repositories, each token scoped to one repository.
+ */
+export type GitHubApprovalsAppConfig = {
+  appId: string;
+  installationId: string;
+  /** The account the installation belongs to; repositories are `owner/name` under it. */
+  owner: string;
+  privateKeyFile: string;
+  /** companyId (lowercase) → repository names (without owner). */
+  companies: ReadonlyMap<string, ReadonlySet<string>>;
+};
+
+export type GitHubApprovalsAppConfigResult =
+  | { status: "disabled" }
+  | { status: "invalid"; error: string }
+  | { status: "enabled"; config: GitHubApprovalsAppConfig };
+
+const APPROVALS_KEYS = new Set(["appId", "installationId", "owner", "privateKeyFile", "companies"]);
+const ACCOUNT_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+
+/** Validate the `approvalsApp` entry of a parsed apps file. Absent entry => disabled. */
+export function parseGitHubApprovalsApp(document: unknown): GitHubApprovalsAppConfigResult {
+  const invalid = (error: string): GitHubApprovalsAppConfigResult => ({
+    status: "invalid",
+    error: `${GITHUB_APPS_FILE_ENV} approvalsApp: ${error}`,
+  });
+  if (!isRecord(document) || document.approvalsApp === undefined) return { status: "disabled" };
+  const entry = document.approvalsApp;
+  if (!isRecord(entry)) return invalid("must be an object");
+  const unknown = Object.keys(entry).find((key) => !APPROVALS_KEYS.has(key));
+  if (unknown) return invalid(`unknown key "${unknown}"`);
+  const appId = numericId(entry.appId);
+  if (!appId) return invalid("appId must be a positive integer");
+  const installationId = numericId(entry.installationId);
+  if (!installationId) return invalid("installationId must be a positive integer");
+  const owner = typeof entry.owner === "string" ? entry.owner.trim() : "";
+  if (!ACCOUNT_NAME.test(owner)) return invalid("owner must be a GitHub account name");
+  const privateKeyFile = absolutePath(entry.privateKeyFile);
+  if (!privateKeyFile) return invalid("privateKeyFile must be an absolute file path");
+  if (!isRecord(entry.companies)) return invalid("companies must map company UUIDs to repository names");
+  const companies = new Map<string, ReadonlySet<string>>();
+  for (const [rawCompanyId, repositories] of Object.entries(entry.companies)) {
+    const companyId = rawCompanyId.trim().toLowerCase();
+    if (!UUID.test(companyId)) return invalid(`companies key "${rawCompanyId}" must be a company UUID`);
+    if (companies.has(companyId)) return invalid(`company ${companyId} is listed twice`);
+    if (
+      !Array.isArray(repositories) ||
+      repositories.some((name) => typeof name !== "string" || !REPOSITORY_NAME.test(name))
+    ) {
+      return invalid(`companies.${companyId} must list repository names without owners`);
+    }
+    companies.set(companyId, new Set(repositories as string[]));
+  }
+  if (Array.isArray(document.apps)) {
+    const clash = document.apps.find((app) => isRecord(app) && numericId(app.appId) === appId);
+    if (clash) return invalid(`appId ${appId} is also a company App; the approvals App must be separate`);
+  }
+  return { status: "enabled", config: { appId, installationId, owner, privateKeyFile, companies } };
+}
+
+/** Read the approvals App from PAPERCLIP_GITHUB_APPS_FILE. Never throws. */
+export function readGitHubApprovalsAppConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  readConfigFile: (file: string) => string = (file) => readFileSync(file, "utf8"),
+): GitHubApprovalsAppConfigResult {
+  const file = env[GITHUB_APPS_FILE_ENV]?.trim() ?? "";
+  if (!file) return { status: "disabled" };
+  let document: unknown;
+  try {
+    document = JSON.parse(readConfigFile(file));
+  } catch {
+    return { status: "invalid", error: `${GITHUB_APPS_FILE_ENV}: cannot read ${file} as JSON` };
+  }
+  return parseGitHubApprovalsApp(document);
+}
+
+/**
+ * The repository a company may get an approvals token for, as `{ owner, name }`, or a reason
+ * it may not. Repositories are compared case-insensitively, like GitHub does.
+ */
+export function approvalsRepositoryForCompany(
+  config: GitHubApprovalsAppConfig,
+  companyId: string,
+  repository: string,
+): { status: "allowed"; owner: string; name: string } | { status: "denied"; reason: string } {
+  const [owner, name, ...rest] = repository.trim().split("/");
+  if (!owner || !name || rest.length > 0 || !REPOSITORY_NAME.test(name)) {
+    return { status: "denied", reason: "repository must be \"owner/name\"" };
+  }
+  if (owner.toLowerCase() !== config.owner.toLowerCase()) {
+    return { status: "denied", reason: `repository is not under ${config.owner}` };
+  }
+  const allowed = config.companies.get(companyId.trim().toLowerCase());
+  const match = allowed && [...allowed].find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  if (!match) return { status: "denied", reason: "repository is not allowlisted for this company" };
+  return { status: "allowed", owner: config.owner, name: match };
+}
+
+export type GitHubApprovalsAppStartupCheck =
+  | { status: "disabled" }
+  | { status: "enabled"; appId: string; companies: number }
+  | { status: "warning"; error: string };
+
+/**
+ * Check the approvals App at startup without ever stopping the server: a key-placement
+ * mistake must not take Paperclip down. A broken entry is reported here and then fails each
+ * token request with a clear error. Messages name files and IDs, never their contents.
+ */
+export async function checkGitHubApprovalsAppAtStartup(
+  env: NodeJS.ProcessEnv = process.env,
+  deps: {
+    readConfigFile?: (file: string) => string;
+    readSecretFile?: (file: string) => Promise<string>;
+  } = {},
+): Promise<GitHubApprovalsAppStartupCheck> {
+  const readSecretFile = deps.readSecretFile ?? ((file: string) => readFile(file, "utf8"));
+  const result = readGitHubApprovalsAppConfig(env, deps.readConfigFile);
+  if (result.status === "disabled") return { status: "disabled" };
+  if (result.status === "invalid") return { status: "warning", error: result.error };
+  const { config } = result;
+  let pem: string;
+  try {
+    pem = await readSecretFile(config.privateKeyFile);
+  } catch {
+    return { status: "warning", error: `approvals App ${config.appId}: cannot read private key file ${config.privateKeyFile}` };
+  }
+  try {
+    createPrivateKey(pem);
+  } catch {
+    return { status: "warning", error: `approvals App ${config.appId}: ${config.privateKeyFile} is not a PEM private key` };
+  }
+  return { status: "enabled", appId: config.appId, companies: config.companies.size };
 }

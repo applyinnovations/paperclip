@@ -84,6 +84,7 @@ import type {
   PluginAuthorizationPolicySummary,
   PluginGitHubAppInstallationToken,
   PluginGitHubAppWebhookVerification,
+  PluginGitHubApprovalsToken,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1758,6 +1759,10 @@ export interface WorkerToHostMethods {
   "githubApp.verifyWebhook": [
     params: { headers: Record<string, string | string[]>; rawBody: string },
     result: PluginGitHubAppWebhookVerification,
+  ];
+  "githubApp.getApprovalsToken": [
+    params: { repository: string; companyId?: string },
+    result: PluginGitHubApprovalsToken | null,
   ];
 
   // Activity

@@ -75,6 +75,7 @@ import {
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
 import { githubAppWebhookVerifier } from "./github-app-webhooks.js";
+import { githubApprovalsTokenSource } from "./github-approvals-token.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -771,6 +772,7 @@ export function buildHostServices(
     heartbeatRuntimeEnv?: Record<string, string | undefined>;
     githubAppTokens?: Pick<ReturnType<typeof githubAppInstallationTokenSource>, "resolve">;
     githubAppWebhooks?: ReturnType<typeof githubAppWebhookVerifier>;
+    githubApprovalsTokens?: Pick<ReturnType<typeof githubApprovalsTokenSource>, "resolve">;
   } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
@@ -1829,6 +1831,36 @@ export function buildHostServices(
           throw new Error("githubApp.verifyWebhook requires headers and rawBody");
         }
         return (options.githubAppWebhooks ?? githubAppWebhookVerifier()).verify(params);
+      },
+      async getApprovalsToken(params) {
+        // The host client handler has already pinned companyId to the invocation's company.
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const result = await (options.githubApprovalsTokens ?? githubApprovalsTokenSource()).resolve(
+          companyId,
+          params.repository,
+        );
+        if (result.status === "not_configured") return null;
+        if (result.status !== "available") {
+          await logActivity(db, {
+            companyId,
+            actorType: "plugin",
+            actorId: pluginId,
+            action: "plugin.github_approvals_token.refused",
+            entityType: "plugin",
+            entityId: pluginId,
+            details: { repository: params.repository, reason: result.error },
+          }).catch(() => undefined);
+          throw new Error(result.error);
+        }
+        return {
+          token: result.token,
+          expiresAt: result.expiresAt,
+          appId: result.appId,
+          installationId: result.installationId,
+          repository: result.repository,
+          companyId,
+        };
       },
     },
 

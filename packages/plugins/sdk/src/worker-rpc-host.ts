@@ -687,6 +687,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             rawBody: input.rawBody,
           });
         },
+        async getApprovalsToken(options) {
+          return callHost("githubApp.getApprovalsToken", {
+            repository: options.repository,
+            ...(options.companyId ? { companyId: options.companyId } : {}),
+          });
+        },
       },
 
       activity: {

@@ -158,7 +158,7 @@ export interface HostServices {
     ): Promise<string>;
   };
 
-  /** Provides `githubApp.getInstallationToken` and `githubApp.verifyWebhook`. */
+  /** Provides `githubApp.getInstallationToken`, `githubApp.verifyWebhook` and `githubApp.getApprovalsToken`. */
   githubApp: {
     getInstallationToken(
       params: { companyId: string },
@@ -167,6 +167,10 @@ export interface HostServices {
     verifyWebhook(
       params: WorkerToHostMethods["githubApp.verifyWebhook"][0],
     ): Promise<WorkerToHostMethods["githubApp.verifyWebhook"][1]>;
+    getApprovalsToken(
+      params: { repository: string; companyId: string },
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["githubApp.getApprovalsToken"][1]>;
   };
 
   /** Provides `activity.log`. */
@@ -435,6 +439,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Operator-owned GitHub Apps
   "githubApp.getInstallationToken": "github.app.token",
   "githubApp.verifyWebhook": "github.app.webhooks.verify",
+  "githubApp.getApprovalsToken": "github.approvals.token",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -819,6 +824,14 @@ export function createHostClientHandlers(
     }),
     "githubApp.verifyWebhook": gated("githubApp.verifyWebhook", async (params) => {
       return services.githubApp.verifyWebhook({ headers: params.headers, rawBody: params.rawBody });
+    }),
+    // The approvals token is also for the invocation's company, and for one repository.
+    "githubApp.getApprovalsToken": gated("githubApp.getApprovalsToken", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("githubApp.getApprovalsToken", params, context);
+      if (typeof params?.repository !== "string" || params.repository.trim() === "") {
+        throw new Error("githubApp.getApprovalsToken requires a repository");
+      }
+      return services.githubApp.getApprovalsToken({ repository: params.repository, companyId }, context);
     }),
 
     // Activity

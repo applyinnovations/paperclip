@@ -250,6 +250,7 @@ export type {
   PluginGitHubAppClient,
   PluginGitHubAppInstallationToken,
   PluginGitHubAppWebhookVerification,
+  PluginGitHubApprovalsToken,
   PluginActivityClient,
   PluginActivityLogEntry,
   PluginStateClient,
