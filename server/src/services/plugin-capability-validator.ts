@@ -132,6 +132,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "secrets.resolve": ["secrets.read-ref"],
   "githubApp.getInstallationToken": ["github.app.token"],
   "githubApp.verifyWebhook": ["github.app.webhooks.verify"],
+  "githubApp.getApprovalsToken": ["github.approvals.token"],
 
   // Agent tools
   "agent.tools.register": ["agent.tools.register"],

@@ -703,6 +703,20 @@ export interface PluginGitHubAppInstallationToken {
   companyId: string;
 }
 
+/** A short-lived token of the shared approvals App, scoped to one repository. */
+export interface PluginGitHubApprovalsToken {
+  /** Installation access token. Use it for GitHub API calls; never log or persist it. */
+  token: string;
+  /** ISO time GitHub expires the token at. The host refreshes ahead of expiry. */
+  expiresAt: string;
+  appId: string;
+  installationId: string;
+  /** The one repository the token covers, `owner/name`. */
+  repository: string;
+  /** The company the token was issued for: always the invocation's company. */
+  companyId: string;
+}
+
 /** The host's verdict on a GitHub App webhook delivery. */
 export type PluginGitHubAppWebhookVerification =
   | {
@@ -754,6 +768,16 @@ export interface PluginGitHubAppClient {
     headers: Record<string, string | string[]>;
     rawBody: string;
   }): Promise<PluginGitHubAppWebhookVerification>;
+
+  /**
+   * Get a token of the operator's shared approvals App for one repository (`owner/name`).
+   * Requires `github.approvals.token`. The token is scoped to that repository with the
+   * permissions a merge gate needs (statuses and issues write; contents, metadata and pull
+   * requests read). Resolves `null` when the operator configured no approvals App; rejects
+   * when the repository is not allowlisted for the company or GitHub refuses. As with
+   * `getInstallationToken`, a `companyId` other than the invocation's company is denied.
+   */
+  getApprovalsToken(options: { repository: string; companyId?: string }): Promise<PluginGitHubApprovalsToken | null>;
 }
 
 /**
