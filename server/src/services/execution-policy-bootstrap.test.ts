@@ -121,6 +121,34 @@ describe("parseExecutionPolicyBootstrapEnv", () => {
     expect(parsed?.kubernetesConfig.timeoutMs).toBeUndefined();
   });
 
+  it("reads PAPERCLIP_K8S_DEFAULT_RESOURCES into kubernetesConfig.defaultResources", () => {
+    const parsed = parseExecutionPolicyBootstrapEnv(
+      env({
+        PAPERCLIP_EXECUTION_MODE: "kubernetes",
+        PAPERCLIP_K8S_DEFAULT_RESOURCES: '{"requests":{"cpu":"500m","memory":"1Gi"},"limits":{"cpu":"4","memory":"4Gi"}}',
+      }),
+    );
+    expect(parsed?.kubernetesConfig.defaultResources).toEqual({
+      requests: { cpu: "500m", memory: "1Gi" },
+      limits: { cpu: "4", memory: "4Gi" },
+    });
+    expect(parseExecutionPolicyBootstrapEnv(env({ PAPERCLIP_EXECUTION_MODE: "kubernetes" }))?.kubernetesConfig.defaultResources)
+      .toBeUndefined();
+  });
+
+  it.each([
+    ["not JSON", "{requests"],
+    ["an array", "[]"],
+    ["an unknown section", '{"request":{"memory":"1Gi"}}'],
+    ["an unknown resource", '{"requests":{"gpu":"1"}}'],
+    ["a malformed quantity", '{"limits":{"memory":"4 GB"}}'],
+    ["a number instead of a quantity string", '{"limits":{"memory":4}}'],
+  ])("throws when PAPERCLIP_K8S_DEFAULT_RESOURCES is %s", (_why, value) => {
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ PAPERCLIP_EXECUTION_MODE: "kubernetes", PAPERCLIP_K8S_DEFAULT_RESOURCES: value })),
+    ).toThrow(/PAPERCLIP_K8S_DEFAULT_RESOURCES/);
+  });
+
   it("throws when PAPERCLIP_K8S_RPC_TIMEOUT_MS is not a positive integer", () => {
     expect(() =>
       parseExecutionPolicyBootstrapEnv(
