@@ -46,11 +46,30 @@ describe("wrapCommandWithEnv", () => {
     expect(out.stdin?.endsWith("\nprompt")).toBe(true);
   });
 
-  it("never propagates PATH (would break command resolution in the sandbox image)", () => {
-    const out = wrapCommandWithEnv(["opencode"], { PATH: "/server/bin", XDG_CONFIG_HOME: "/c" });
+  it("skips the orchestrator's own PATH (would break command resolution in the sandbox image)", () => {
+    const out = wrapCommandWithEnv(["opencode"], { PATH: "/server/bin", XDG_CONFIG_HOME: "/c" }, undefined, { hostPath: "/server/bin" });
     const exports = decodeEnvLine(out.stdin);
     expect(exports).not.toContain("PATH=");
     expect(exports).toContain("XDG_CONFIG_HOME=");
+    const empty = decodeEnvLine(wrapCommandWithEnv(["opencode"], { PATH: "", V: "x" }, undefined, { hostPath: "/server/bin" }).stdin);
+    expect(empty).not.toContain("PATH=");
+  });
+
+  it("defaults hostPath to this process's PATH", () => {
+    const out = wrapCommandWithEnv(["opencode"], { PATH: process.env.PATH ?? "", V: "x" });
+    expect(decodeEnvLine(out.stdin)).not.toContain("PATH=");
+  });
+
+  it("puts a sandbox PATH ahead of the image's PATH, keeping the image's entries", () => {
+    const out = wrapCommandWithEnv(
+      ["/bin/sh", "-c", 'printf "%s" "$PATH"'],
+      { PATH: "/workspace/.launchers:/opt/it's" },
+      undefined,
+      { hostPath: "/server/bin" },
+    );
+    const result = runLikeExecInPod(out.command, out.stdin);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`/workspace/.launchers:/opt/it's:${process.env.PATH ?? "/usr/bin:/bin"}`);
   });
 
   it("skips invalid identifiers and non-string values", () => {
