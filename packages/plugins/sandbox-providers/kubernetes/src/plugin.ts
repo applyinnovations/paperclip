@@ -204,6 +204,41 @@ async function resolveSyncPodExec(
   return { exec, timeoutMs };
 }
 
+// The default working directory of a Sandbox lease: created by the agent user
+// (uid 1000) inside the /workspace volume, so the agent owns its repository.
+const AGENT_WORKSPACE_DIR = "/workspace/paperclip-workspace";
+
+async function createAgentWorkspaceDir(
+  config: ReturnType<typeof kubernetesProviderConfigSchema.parse>,
+  companyId: string,
+  lease: PluginEnvironmentRealizeWorkspaceParams["lease"],
+  dir: string,
+): Promise<void> {
+  const namespace =
+    typeof lease.metadata?.namespace === "string"
+      ? lease.metadata.namespace
+      : deriveTenantNamespace(config, companyId);
+  const kc = createKubeConfig({ inCluster: config.inCluster, kubeconfig: config.kubeconfig });
+  const clients = makeKubeClients(kc);
+  const providerLeaseId = lease.providerLeaseId!;
+  if (!readySandboxesByLease.has(providerLeaseId)) {
+    await sandboxCrOrchestrator.waitForCompletion(clients, namespace, providerLeaseId, {
+      timeoutMs: config.podStartTimeoutSec * 1000,
+      pollMs: 1000,
+    });
+    readySandboxesByLease.add(providerLeaseId);
+  }
+  const podName =
+    typeof lease.metadata?.podName === "string" && lease.metadata.podName
+      ? lease.metadata.podName
+      : await sandboxCrOrchestrator.findPod(clients, namespace, providerLeaseId);
+  if (!podName) throw new Error("Kubernetes workspace setup could not resolve the Sandbox pod name.");
+  const result = await execInPod(kc, namespace, podName, "agent", ["mkdir", "-p", dir], undefined, 30_000);
+  if (result.exitCode !== 0) {
+    throw new Error(`Kubernetes workspace setup could not create ${dir}: ${result.stderr.trim().slice(0, 500)}`);
+  }
+}
+
 // How long a release or destroy waits to confirm the lease's workload and pod
 // are gone. Pods get a 30 s termination grace period by default.
 const TERMINATION_CONFIRM_TIMEOUT_MS = 60_000;
@@ -693,13 +728,22 @@ const plugin = definePlugin({
   async onEnvironmentRealizeWorkspace(
     params: PluginEnvironmentRealizeWorkspaceParams,
   ): Promise<PluginEnvironmentRealizeWorkspaceResult> {
-    // The agent pod already has /workspace mounted as an emptyDir at pod
-    // scheduling time (see pod-spec-builder). Nothing to provision here —
-    // we just hand back the cwd. Honor a caller-supplied remotePath if set.
-    const cwd =
-      params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
-        ? params.workspace.remotePath.trim()
-        : "/workspace";
+    // Honor a caller-supplied remotePath. Otherwise a Sandbox lease works in
+    // a directory the agent user creates inside the /workspace emptyDir: the
+    // kubelet creates the volume root owned by root (group fsGroup), and Git
+    // refuses a repository whose root another user owns ("detected dubious
+    // ownership"). The run's Git launchers ignore system and global config,
+    // so a safe.directory exception can't fix that; ownership does.
+    const supplied = params.workspace.remotePath?.trim();
+    const config = kubernetesProviderConfigSchema.parse(params.config);
+    const leaseBackend =
+      typeof params.lease.metadata?.backend === "string"
+        ? (params.lease.metadata.backend as "sandbox-cr" | "job")
+        : config.backend;
+    const cwd = supplied || (leaseBackend === "sandbox-cr" ? AGENT_WORKSPACE_DIR : "/workspace");
+    if (!supplied && leaseBackend === "sandbox-cr" && params.lease.providerLeaseId) {
+      await createAgentWorkspaceDir(config, params.companyId, params.lease, cwd);
+    }
     return {
       cwd,
       metadata: {
