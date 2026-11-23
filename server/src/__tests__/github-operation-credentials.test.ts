@@ -568,7 +568,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
             token: "ghs_app_installation",
             source: "github_app" as const,
             secretName: null,
-            githubIdentity: { userId: "4242", login: "paperclip-xlab-now[bot]" },
+            githubIdentity: { userId: "4242", login: "paperclip-example[bot]" },
             identitySource: "app" as const,
           },
           expiresAt: "2026-01-01T01:00:00.000Z",
@@ -578,7 +578,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       };
       const unconnected = await seed();
       const result = await resolveGitHubOperationCredentials(db, unconnected, { githubApp });
-      expect(result).toMatchObject({ status: "available", source: "app", login: "paperclip-xlab-now[bot]" });
+      expect(result).toMatchObject({ status: "available", source: "app", login: "paperclip-example[bot]" });
       expect(result.env.GH_TOKEN).toBe("ghs_app_installation");
       expect(githubApp.resolve).toHaveBeenCalledWith(unconnected.companyId);
       const history = await db

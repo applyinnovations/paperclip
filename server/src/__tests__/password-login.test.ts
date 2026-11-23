@@ -3,7 +3,7 @@ import { assertPasswordLoginPolicy, isPasswordLoginPath } from "../auth/password
 import type { OidcConfig } from "../auth/oidc-config.js";
 import { parseStrictBooleanEnv } from "../config.js";
 
-const oidc = { providerId: "xlab" } as OidcConfig;
+const oidc = { providerId: "keycloak" } as OidcConfig;
 
 describe("OIDC-only sign-in policy", () => {
   it.each([

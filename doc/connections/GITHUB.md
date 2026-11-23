@@ -105,7 +105,7 @@ only one company's App bypass required reviews). Set
       "installationId": "175009740",
       "privateKeyFile": "/var/run/paperclip-github-apps/apply/private-key.pem",
       "webhookSecretFile": "/var/run/paperclip-github-apps/apply/webhook-secret",
-      "repositories": ["xlab-deployments"]
+      "repositories": ["deployments"]
     }
   ]
 }
