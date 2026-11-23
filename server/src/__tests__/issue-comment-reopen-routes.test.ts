@@ -164,6 +164,26 @@ vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
 }));
 
+// The decision recorder writes the decision row through the route's
+// transaction; its audit activity is covered by
+// issue-execution-decision-events.test.ts against a real database.
+vi.mock("../services/issue-execution-decisions.js", () => ({
+  recordIssueExecutionDecision: vi.fn(
+    async (
+      tx: { insert: (table: unknown) => { values: (row: unknown) => Promise<unknown> } },
+      input: Record<string, any>,
+    ) => {
+      const { actor, issueIdentifier: _identifier, ...row } = input;
+      await tx.insert("issue_execution_decisions").values({
+        ...row,
+        actorAgentId: actor.agentId ?? null,
+        actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        createdByRunId: actor.runId ?? null,
+      });
+    },
+  ),
+}));
+
 vi.mock("../services/agents.js", () => ({
   agentService: () => mockAgentService,
 }));

@@ -264,6 +264,8 @@ export type {
   PluginIssueRelationsClient,
   PluginIssueRelationSummary,
   PluginIssueCheckoutOwnership,
+  PluginIssueExecutionDecision,
+  PluginIssueExecutionDecisionRecordedPayload,
   PluginIssueWakeupResult,
   PluginIssueWakeupBatchResult,
   PluginIssueRunSummary,

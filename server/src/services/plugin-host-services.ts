@@ -41,6 +41,7 @@ import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { listIssueExecutionDecisions } from "./issue-execution-decisions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -2709,6 +2710,19 @@ export function buildHostServices(
         // Comment visibility follows the ACL of the issue they were posted on.
         if (!(await pluginCanReadIssue(issue))) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
+      },
+      async listExecutionDecisions(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = await issues.getById(params.issueId);
+        if (!inCompany(issue, companyId)) return [];
+        // Decisions follow the ACL of the issue they were recorded on.
+        if (!(await pluginCanReadIssue(issue))) return [];
+        return listIssueExecutionDecisions(db, {
+          companyId,
+          issueId: issue.id,
+          issueIdentifier: issue.identifier ?? null,
+        });
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);

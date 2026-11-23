@@ -981,6 +981,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
+        async listExecutionDecisions(issueId: string, companyId: string) {
+          return callHost("issues.listExecutionDecisions", { issueId, companyId });
+        },
+
         async createComment(
           issueId: string,
           body: string,
