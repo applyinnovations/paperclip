@@ -169,6 +169,36 @@ process.exit(result.status ?? 98);
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+  it("falls back to the run's API URL (the callback bridge) when the broker URL can't be reached", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-bridge-fallback-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const offline = createServer((_req, res) => { res.writeHead(500); res.end(); });
+    await new Promise<void>(resolve => offline.listen(0, "127.0.0.1", resolve));
+    const offlinePort = (offline.address() as { port: number }).port;
+    await new Promise<void>(resolve => offline.close(() => resolve()));
+    const seen: Array<{ url?: string; capability?: string | string[] }> = [];
+    const bridge = createServer((req, res) => {
+      seen.push({ url: req.url, capability: req.headers["x-paperclip-github-capability"] });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "available", env: {
+        GIT_AUTHOR_NAME: "Bridge Bot", GIT_AUTHOR_EMAIL: "bridge@example.test",
+        GIT_COMMITTER_NAME: "Bridge Bot", GIT_COMMITTER_EMAIL: "bridge@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => bridge.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => bridge.close(() => resolve())));
+    const bridgePort = (bridge.address() as { port: number }).port;
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${offlinePort}`, token: "run-capability" }),
+      PAPERCLIP_API_URL: `http://127.0.0.1:${bridgePort}/api`, PATH: `${bin}:${process.env.PATH}` };
+    const result = await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Through the bridge"], { cwd: root, env });
+    expect(result.stderr).not.toContain("broker_transport_unavailable");
+    expect(seen).toEqual([{ url: "/runtime-tools/github/credentials", capability: "run-capability" }]);
+    expect((await exec("git", ["-C", root, "log", "-1", "--format=%an <%ae>"])).stdout.trim()).toBe("Bridge Bot <bridge@example.test>");
+  });
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
