@@ -209,7 +209,7 @@ Use either the file or the single-App variables. Setting both refuses startup.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PAPERCLIP_GITHUB_APPS_FILE` | (unset) | Path to a JSON file that maps each company to its own GitHub App: `{"apps":[{"companyId","appId","installationId","privateKeyFile","webhookSecretFile"?,"repositories"?}]}`. Keys and webhook secrets stay in their own files. Any error (duplicate company, App or installation, malformed ID, unreadable or invalid key) refuses startup |
+| `PAPERCLIP_GITHUB_APPS_FILE` | (unset) | Path to a JSON file that maps each company to its own GitHub App: `{"apps":[{"companyId","appId","installationId","privateKeyFile","webhookSecretFile"?,"repositories"?}]}`. Keys and webhook secrets stay in their own files. Any error (duplicate company, App or installation, malformed ID, unreadable or invalid key) refuses startup. May also name one shared `approvalsApp` for merge-gate plugins (`github.approvals.token`); a broken entry only logs a warning (see `doc/connections/GITHUB.md`) |
 | `PAPERCLIP_GITHUB_APP_ID` | (unset) | Single shared App: App ID |
 | `PAPERCLIP_GITHUB_APP_INSTALLATION_ID` | (unset) | Single shared App: installation ID |
 | `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE` | (unset) | Single shared App: path to the private key (PEM) |

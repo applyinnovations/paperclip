@@ -968,6 +968,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "github.app.webhooks.verify");
         return { verified: false, reason: "not_configured" };
       },
+      async getApprovalsToken() {
+        requireCapability(manifest, capabilitySet, "github.approvals.token");
+        return null;
+      },
     },
     activity: {
       async log(entry) {

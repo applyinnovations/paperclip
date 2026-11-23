@@ -132,6 +132,42 @@ restart.
 A company that is not in the file has no App. It falls through the identity
 resolution order below exactly as before.
 
+#### The shared approvals App (for merge-gate plugins)
+
+The same file can name one more App, separate from every company App, whose
+only job is posting gate results that repository rulesets can pin to its
+integration id (a merge gate: an `approval` commit status posted when a
+reviewer approves in Paperclip). Plugins with the `github.approvals.token`
+capability call `ctx.githubApp.getApprovalsToken({ repository: "owner/name" })`
+and receive an installation token scoped to that one repository, with
+`statuses: write`, `issues: write` and `contents`, `metadata`,
+`pull_requests: read`. They never receive the key or a JWT.
+
+```json
+{
+  "apps": [ ... ],
+  "approvalsApp": {
+    "appId": "123456",
+    "installationId": "7890123",
+    "owner": "my-org",
+    "privateKeyFile": "/var/run/paperclip-github-approvals/private-key.pem",
+    "companies": {
+      "a9d886a3-e526-461c-95d6-d2d0d6b6c722": ["deployments", "infrastructure"],
+      "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01": ["web-app"]
+    }
+  }
+}
+```
+
+`companies` is the operator's allowlist: a plugin acting for a company gets
+tokens only for that company's repositories under `owner`; any other request
+is refused and recorded in the activity log. `apps` may be omitted when the
+file only names the approvals App. Unlike the company Apps, a broken
+`approvalsApp` entry never stops the server: startup logs a warning and every
+token request fails with a clear error, so a key-placement mistake can't take
+Paperclip down. The approvals App's `appId` must differ from every company
+App's.
+
 #### One App for an allow-list of companies
 
 | Variable | Meaning |

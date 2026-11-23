@@ -194,7 +194,7 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, resolveLocalRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
-import { checkGitHubAppsConfigAtStartup } from "./services/github-app-config.js";
+import { checkGitHubApprovalsAppAtStartup, checkGitHubAppsConfigAtStartup } from "./services/github-app-config.js";
 import { checkRunMcpServersConfigAtStartup } from "./services/run-mcp-servers.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -787,6 +787,13 @@ async function startServerWithDatabaseTeardown(
     logger.warn({ error: githubApps.error }, "GitHub App configuration is invalid; GitHub App credentials are unavailable");
   } else if (githubApps.status === "enabled") {
     logger.info({ source: githubApps.source, apps: githubApps.apps }, "GitHub App credentials configured");
+  }
+  // The shared approvals App never stops startup; a broken entry fails each token request.
+  const approvalsApp = await checkGitHubApprovalsAppAtStartup();
+  if (approvalsApp.status === "warning") {
+    logger.warn({ error: approvalsApp.error }, "GitHub approvals App is misconfigured; approvals tokens are unavailable");
+  } else if (approvalsApp.status === "enabled") {
+    logger.info({ appId: approvalsApp.appId, companies: approvalsApp.companies }, "GitHub approvals App configured");
   }
   // Run-scoped MCP server tokens fail closed: a bad file or unreadable client secret stops startup.
   const runMcpServers = await checkRunMcpServersConfigAtStartup();
