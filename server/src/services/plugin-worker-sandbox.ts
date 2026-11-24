@@ -4,6 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { collectProtectedSecretPaths, isWithin, realpathOrResolve } from "./plugin-protected-paths.js";
+
+export { collectProtectedSecretPaths };
 
 /**
  * Filesystem sandbox for plugin workers (Node permission model).
@@ -24,13 +27,6 @@ import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 /** Operator-only escape hatch: `off` runs workers without the sandbox (local development). */
 export const PLUGIN_WORKER_SANDBOX_ENV = "PAPERCLIP_PLUGIN_WORKER_SANDBOX";
-
-/** Env vars naming operator secret files that no worker may ever be able to read. */
-const PROTECTED_FILE_ENV_VARS = [
-  "PAPERCLIP_GITHUB_APPS_FILE",
-  "PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE",
-] as const;
-const GITHUB_APPS_FILE_ENV = "PAPERCLIP_GITHUB_APPS_FILE";
 
 /**
  * Capabilities whose bundled implementations need a child process (tar, ssh, git,
@@ -54,7 +50,13 @@ const DEFAULT_TRUSTED_PLUGIN_ROOTS = (env: NodeJS.ProcessEnv) => [
 ];
 
 export type PluginWorkerSandboxPlan =
-  | { mode: "disabled"; reason: "operator-opt-out" | "trusted-exception"; capability?: string }
+  | {
+      mode: "disabled";
+      reason: "operator-opt-out" | "trusted-exception";
+      capability?: string;
+      /** The host's execArgv plus {@link WORKER_HARDENING_EXEC_ARGV}. */
+      execArgv: string[];
+    }
   | {
       mode: "enforced";
       /** The worker's complete execArgv (sandbox flags plus the host's, minus any tsx loader). */
@@ -83,20 +85,6 @@ export interface PluginWorkerSandboxInput {
   trustedPluginRoots?: readonly string[];
   /** Test seam; parent of every per-worker tmp directory. Defaults to os.tmpdir(). */
   tmpRoot?: string;
-}
-
-function realpathOrResolve(p: string): string {
-  const resolved = path.resolve(p);
-  try {
-    return fs.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-function isWithin(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 function nearestPackageRoot(file: string): string {
@@ -202,6 +190,22 @@ registerHooks({
 `;
 export const SANDBOX_TS_RESOLVE_HOOK_URL = `data:text/javascript,${encodeURIComponent(TS_RESOLVE_HOOK_SOURCE)}`;
 
+/**
+ * Flags for every plugin worker, sandboxed or not. The permission model does not
+ * restrict `process.kill`, and Node opens its inspector on SIGUSR1, so without
+ * this a worker could signal a sibling worker into opening an inspector it can
+ * then drive. The server itself must run with the same flag (Dockerfile CMD);
+ * otherwise a worker can signal its parent the same way.
+ */
+export const WORKER_HARDENING_EXEC_ARGV = ["--disable-sigusr1"] as const;
+
+/**
+ * Extra flags for sandboxed workers. `node:sqlite` opens database files without
+ * consulting the permission model, so it would read and write outside the
+ * allowlist.
+ */
+export const SANDBOX_HARDENING_EXEC_ARGV = ["--no-experimental-sqlite"] as const;
+
 const SANDBOX_TYPESCRIPT_EXEC_ARGV = [
   "--experimental-transform-types",
   "--disable-warning=ExperimentalWarning",
@@ -244,45 +248,6 @@ function importTargets(execArgv: readonly string[]): string[] {
   return out;
 }
 
-/**
- * Operator secret files a worker must never be able to read: the files named by
- * the GitHub App env vars and the apps file, plus every `*File` path inside the
- * apps file (apps[].privateKeyFile, apps[].webhookSecretFile,
- * approvalsApp.privateKeyFile, ...). The apps file is scanned raw so a
- * malformed one is still protected.
- */
-export function collectProtectedSecretPaths(processEnv: NodeJS.ProcessEnv = process.env): string[] {
-  const paths = new Set<string>();
-  const add = (p: unknown) => {
-    if (typeof p !== "string" || !p.trim()) return;
-    const resolved = path.resolve(p.trim());
-    paths.add(resolved);
-    paths.add(realpathOrResolve(resolved));
-  };
-  for (const name of PROTECTED_FILE_ENV_VARS) add(processEnv[name]);
-  const appsFile = processEnv[GITHUB_APPS_FILE_ENV]?.trim();
-  if (appsFile) {
-    try {
-      const doc = JSON.parse(fs.readFileSync(appsFile, "utf8")) as unknown;
-      const baseDir = path.dirname(path.resolve(appsFile));
-      const walk = (node: unknown) => {
-        if (Array.isArray(node)) node.forEach(walk);
-        else if (node && typeof node === "object") {
-          for (const [key, value] of Object.entries(node)) {
-            if (/File$/.test(key) && typeof value === "string") add(path.resolve(baseDir, value));
-            else walk(value);
-          }
-        }
-      };
-      walk(doc);
-    } catch {
-      // Unreadable or malformed: the server's own config check reports it. The
-      // apps file path itself is still protected above.
-    }
-  }
-  return [...paths];
-}
-
 function sanitizeForPath(pluginId: string): string {
   return pluginId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "plugin";
 }
@@ -294,7 +259,7 @@ function sanitizeForPath(pluginId: string): string {
 export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): PluginWorkerSandboxPlan {
   const processEnv = input.processEnv ?? process.env;
   if (processEnv[PLUGIN_WORKER_SANDBOX_ENV]?.trim().toLowerCase() === "off") {
-    return { mode: "disabled", reason: "operator-opt-out" };
+    return { mode: "disabled", reason: "operator-opt-out", execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...(input.execArgv ?? [])] };
   }
 
   const capabilities = (input.manifest.capabilities ?? []) as readonly string[];
@@ -303,7 +268,12 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
     const trustedRoots = (input.trustedPluginRoots ?? DEFAULT_TRUSTED_PLUGIN_ROOTS(processEnv)).map(realpathOrResolve);
     const entry = realpathOrResolve(input.entrypointPath);
     if (trustedRoots.some((root) => isWithin(root, entry))) {
-      return { mode: "disabled", reason: "trusted-exception", capability: exceptionCapability };
+      return {
+        mode: "disabled",
+        reason: "trusted-exception",
+        capability: exceptionCapability,
+        execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...(input.execArgv ?? [])],
+      };
     }
   }
 
@@ -339,6 +309,8 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
     mode: "enforced",
     execArgv: [
       "--permission",
+      ...WORKER_HARDENING_EXEC_ARGV,
+      ...SANDBOX_HARDENING_EXEC_ARGV,
       ...readPaths.map((p) => `--allow-fs-read=${p}`),
       ...write.map((p) => `--allow-fs-write=${p}`),
       ...SANDBOX_TYPESCRIPT_EXEC_ARGV,

@@ -582,10 +582,37 @@ A sandboxed worker **cannot**:
 - write anywhere outside its tmp directory
 - start child processes, worker threads or WASI, load native addons, or open
   the inspector
+- use `node:sqlite` (`--no-experimental-sqlite`). It opens database files
+  without consulting the permission model, so it would bypass the allowlist.
 
 Local folders keep working because the host reads and writes them on the
 worker's behalf through `ctx.localFolders`, within the board-configured folder
 and access mode. A worker never gets direct filesystem access to them.
+
+**Local folder roots.** The host reads files under a local folder root for the
+worker, so it refuses (HTTP 403) any root that would expose a protected path,
+whether a worker sets it through `ctx.localFolders.configure` or the board sets
+it through the local-folder route. Refused roots are:
+
+- a root that is, or contains, a protected secret file (below), the secrets
+  master key (`PAPERCLIP_SECRETS_MASTER_KEY_FILE` or the instance default), the
+  server config file, or the `.env` file beside it
+- a root that is, contains, or sits inside the instance `secrets` directory,
+  the master key's directory, the embedded Postgres data directory, `/run`,
+  `/var/run`, `/proc`, `/sys`, `/dev` or `/etc`
+
+The check runs on both the configured path and its realpath, so a symlink to a
+protected directory is refused too. A folder already stored with such a root
+reports the `protected_path` problem, is not readable, and its realPath is
+never returned.
+
+**Signals.** The permission model does not restrict `process.kill`, and Node
+opens its inspector when it receives `SIGUSR1`. Every plugin worker, sandboxed
+or not, is therefore started with `--disable-sigusr1`, and the server must be
+too: the image's `CMD` is `node --disable-sigusr1 server/dist-runtime/index.mjs`.
+A deployment that overrides the server command must keep the flag (or set it in
+`NODE_OPTIONS`); otherwise a worker can signal the server into opening an
+inspector and run code inside it.
 
 Sandboxed workers load TypeScript with Node's built-in type stripping
 (`--experimental-transform-types`) and a small resolve hook that maps `./x.js`

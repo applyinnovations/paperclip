@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -70,6 +72,49 @@ async function probe(handle: ReturnType<typeof probeHandle>, config: Record<stri
   return (result as { summary: string }).summary;
 }
 
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as net.AddressInfo;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+function portIsOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect(port, "127.0.0.1");
+    socket.once("connect", () => { socket.destroy(); resolve(true); });
+    socket.once("error", () => resolve(false));
+  });
+}
+
+async function portOpensWithin(port: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await portIsOpen(port)) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+/** A long-lived node process whose SIGUSR1 inspector would listen on a known free port. */
+async function inspectorTarget(flags: string[]) {
+  const port = await freePort();
+  const child = spawn(process.execPath, [...flags, `--inspect-port=127.0.0.1:${port}`, "-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  await new Promise((r) => setTimeout(r, 200));
+  return {
+    pid: child.pid as number,
+    port,
+    alive: () => child.exitCode === null && child.signalCode === null,
+    kill: () => child.kill("SIGKILL"),
+  };
+}
+
 describe("plugin worker filesystem sandbox (real worker process)", () => {
   it("denies reading a key file outside the allowlist and keeps serving RPCs", async () => {
     const handle = probeHandle();
@@ -85,6 +130,40 @@ describe("plugin worker filesystem sandbox (real worker process)", () => {
       expect(fs.existsSync(path.join(secretsDir, "planted.txt"))).toBe(false);
     } finally {
       await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("cannot open databases outside the allowlist through node:sqlite", async () => {
+    const outside = path.join(secretsDir, "other.db");
+    const handle = probeHandle();
+    try {
+      await handle.start();
+      expect(await probe(handle, { op: "sqlite", file: outside })).toBe("ERR_UNKNOWN_BUILTIN_MODULE");
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("cannot open the server's inspector with SIGUSR1", async () => {
+    // Stand-in for the server, started with the Dockerfile CMD flag. The permission
+    // model does not restrict process.kill, so the worker *can* send the signal;
+    // --disable-sigusr1 on the target is what keeps the inspector closed.
+    const control = await inspectorTarget([]);
+    const server = await inspectorTarget(["--disable-sigusr1"]);
+    const handle = probeHandle();
+    try {
+      await handle.start();
+      expect(await probe(handle, { op: "signal", pid: control.pid })).toBe("ok");
+      // Control: without the flag the signal does open an inspector, so the probe can detect it.
+      expect(await portOpensWithin(control.port, 3000)).toBe(true);
+      expect(await probe(handle, { op: "signal", pid: server.pid })).toBe("ok");
+      expect(await portOpensWithin(server.port, 1500)).toBe(false);
+      expect(server.alive()).toBe(true);
+    } finally {
+      await handle.stop().catch(() => undefined);
+      control.kill();
+      server.kill();
     }
   });
 
@@ -140,6 +219,8 @@ describe("planPluginWorkerSandbox", () => {
     expect(plan.mode).toBe("enforced");
     if (plan.mode !== "enforced") return;
     expect(plan.execArgv[0]).toBe("--permission");
+    expect(plan.execArgv).toContain("--disable-sigusr1");
+    expect(plan.execArgv).toContain("--no-experimental-sqlite");
     expect(plan.execArgv.some((arg) => arg.startsWith("--allow-child-process") || arg.startsWith("--allow-worker"))).toBe(false);
     expect(plan.writePaths).toHaveLength(1);
     expect(plan.writePaths[0]).toMatch(/paperclip-plugin-workers[\\/]acme_plugin$/);
@@ -177,11 +258,30 @@ describe("planPluginWorkerSandbox", () => {
       pluginId: "p", entrypointPath: PROBE_WORKER, manifest, processEnv: {},
       trustedPluginRoots: [FIXTURES_DIR], tmpRoot: tmpRoot(),
     });
-    expect(trusted).toEqual({ mode: "disabled", reason: "trusted-exception", capability: "environment.drivers.register" });
+    expect(trusted).toMatchObject({ mode: "disabled", reason: "trusted-exception", capability: "environment.drivers.register" });
     const untrusted = planPluginWorkerSandbox({
       pluginId: "p", entrypointPath: PROBE_WORKER, manifest, processEnv: {},
       trustedPluginRoots: [secretsDir], tmpRoot: tmpRoot(),
     });
     expect(untrusted.mode).toBe("enforced");
+  });
+
+  it("disables the SIGUSR1 inspector on unsandboxed workers too", () => {
+    const manifest = { capabilities: ["environment.drivers.register"] } as PaperclipPluginManifestV1;
+    const trusted = planPluginWorkerSandbox({
+      pluginId: "p", entrypointPath: PROBE_WORKER, manifest, processEnv: {},
+      trustedPluginRoots: [FIXTURES_DIR], tmpRoot: tmpRoot(), execArgv: ["--import", "x"],
+    });
+    expect(trusted.execArgv).toEqual(["--disable-sigusr1", "--import", "x"]);
+    const optOut = planPluginWorkerSandbox({
+      pluginId: "p", entrypointPath: PROBE_WORKER, manifest: MANIFEST,
+      processEnv: { PAPERCLIP_PLUGIN_WORKER_SANDBOX: "off" }, tmpRoot: tmpRoot(),
+    });
+    expect(optOut.execArgv).toEqual(["--disable-sigusr1"]);
+  });
+
+  it("starts the production server with --disable-sigusr1", () => {
+    const dockerfile = fs.readFileSync(path.join(FIXTURES_DIR, "../../../../Dockerfile"), "utf8");
+    expect(dockerfile).toMatch(/^CMD \["node", "--disable-sigusr1", "server\/dist-runtime\/index\.mjs"\]$/m);
   });
 });

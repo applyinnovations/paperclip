@@ -39,6 +39,11 @@ void Promise.all([
         summary = await ctx.localFolders.readText("company-1", "notes", params.config.relativePath)
           .then((text) => `ok:${text}`, (error) => (error && error.code) || String(error));
       }
+      else if (op === "signal") summary = attempt(() => process.kill(params.config.pid, "SIGUSR1"));
+      else if (op === "sqlite") summary = attempt(() => {
+        const { DatabaseSync } = require("node:sqlite");
+        new DatabaseSync(file).close();
+      });
       else if (op === "spawn") summary = attempt(() => require("node:child_process").execFileSync("true"));
       else summary = "unknown-op";
       return { ok: summary === "ok", summary };

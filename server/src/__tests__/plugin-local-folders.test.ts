@@ -4,6 +4,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import {
   assertConfiguredLocalFolder,
+  assertPluginLocalFolderRootAllowed,
   assertWritableConfiguredLocalFolder,
   inspectPluginLocalFolder,
   listPluginLocalFolderEntries,
@@ -18,6 +19,7 @@ describe("plugin local folders", () => {
   const tempRoots: string[] = [];
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
     tempRoots.length = 0;
   });
@@ -278,5 +280,73 @@ describe("plugin local folders", () => {
     } finally {
       openSpy.mockRestore();
     }
+  });
+
+  describe("protected host paths (APP-37)", () => {
+    async function withKeyFile() {
+      const keyDir = await makeRoot();
+      const keyFile = path.join(keyDir, "approvals-app.pem");
+      await fs.writeFile(keyFile, "-----BEGIN PRIVATE KEY-----\nfixture\n");
+      vi.stubEnv("PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE", keyFile);
+      return { keyDir, keyFile };
+    }
+
+    it("refuses a root that is or contains the directory holding a GitHub App key", async () => {
+      const { keyDir } = await withKeyFile();
+      expect(() => assertPluginLocalFolderRootAllowed(keyDir)).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed(path.dirname(keyDir))).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/")).toThrow(/protected host path/);
+    });
+
+    it("refuses a root reached through a symlink to the key directory", async () => {
+      const { keyDir } = await withKeyFile();
+      const linkParent = await makeRoot();
+      const link = path.join(linkParent, "innocent");
+      await fs.symlink(keyDir, link);
+      expect(() => assertPluginLocalFolderRootAllowed(link)).toThrow(/protected host path/);
+    });
+
+    it("refuses roots inside the secrets master key dir, secret mounts, /proc and /etc", async () => {
+      const secretsDir = await makeRoot();
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(secretsDir, "master.key"));
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(secretsDir, "nested"))).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/var/run/secrets/kubernetes.io")).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/run/secrets")).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/var/run/paperclip-oidc")).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/proc/1")).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed("/etc")).toThrow(/protected host path/);
+    });
+
+    it("refuses a root that contains the server config file", async () => {
+      const configDir = await makeRoot();
+      vi.stubEnv("PAPERCLIP_CONFIG", path.join(configDir, "config.json"));
+      expect(() => assertPluginLocalFolderRootAllowed(configDir)).toThrow(/protected host path/);
+    });
+
+    it("allows an unrelated folder", async () => {
+      await withKeyFile();
+      const root = await makeRoot();
+      expect(() => assertPluginLocalFolderRootAllowed(root)).not.toThrow();
+    });
+
+    it("reports a stored protected root as unreadable without exposing its realPath", async () => {
+      const { keyDir } = await withKeyFile();
+      const status = await inspectPluginLocalFolder({
+        folderKey: "content-root",
+        storedConfig: { path: keyDir, access: "read" },
+      });
+      expect(status).toMatchObject({ healthy: false, readable: false, realPath: null });
+      expect(status.problems.map((item) => item.code)).toEqual(["protected_path"]);
+      expect(() => assertConfiguredLocalFolder(status)).toThrow();
+    });
+
+    it("does not create directories under a protected root", async () => {
+      const { keyDir } = await withKeyFile();
+      await expect(preparePluginLocalFolder({
+        folderKey: "content-root",
+        storedConfig: { path: keyDir, access: "readWrite", requiredDirectories: ["planted"] },
+      })).rejects.toThrow(/protected host path/);
+      await expect(fs.stat(path.join(keyDir, "planted"))).rejects.toMatchObject({ code: "ENOENT" });
+    });
   });
 });

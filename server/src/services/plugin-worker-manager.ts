@@ -3081,11 +3081,9 @@ export function createPluginWorkerHandle(
     // module closure and writes only its private tmp dir, so it cannot read
     // operator secret files such as GitHub App private keys. See
     // plugin-worker-sandbox.ts and PLUGIN_SPEC.md §12.6.
-    let execArgv = options.execArgv ?? [];
-    if (sandbox.mode === "enforced") {
-      Object.assign(workerEnv, sandbox.env);
-      execArgv = sandbox.execArgv;
-    }
+    // Every plan carries the complete execArgv, including --disable-sigusr1.
+    const execArgv = sandbox.execArgv;
+    if (sandbox.mode === "enforced") Object.assign(workerEnv, sandbox.env);
 
     const child = fork(options.entrypointPath, [], {
       stdio: ["pipe", "pipe", "pipe", "ipc"],
