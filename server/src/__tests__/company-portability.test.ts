@@ -1747,6 +1747,103 @@ describe("company portability", () => {
     }));
   });
 
+  it("imports a project default execution policy, resolving agent slugs in the target company", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    const reviewerId = "6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b";
+    agentSvc.list.mockResolvedValue([{ id: reviewerId, name: "Code Reviewer", status: "idle" }]);
+    projectSvc.list.mockResolvedValue([]);
+    projectSvc.create.mockResolvedValue({ id: "project-imported", name: "Launch", urlKey: "launch" });
+    projectSvc.create.mockClear();
+
+    const files = {
+      "COMPANY.md": ["---", 'schema: "agentcompanies/v1"', 'name: "Imported Paperclip"', "---", ""].join("\n"),
+      "projects/launch/PROJECT.md": ["---", 'name: "Launch"', "---", ""].join("\n"),
+      ".paperclip.yaml": [
+        'schema: "paperclip/v1"',
+        "projects:",
+        "  launch:",
+        "    executionWorkspacePolicy:",
+        "      enabled: true",
+        "      defaultIssueExecutionPolicy:",
+        "        stages:",
+        "          - type: review",
+        "            participants:",
+        "              - agentSlug: code-reviewer",
+        "              - agentSlug: nobody",
+        "          - type: approval",
+        "            participants:",
+        "              - agentSlug: nobody",
+        "",
+      ].join("\n"),
+    };
+
+    const result = await portability.importBundle({
+      source: { type: "inline", rootPath: "paperclip-demo", files },
+      include: { company: false, agents: false, projects: true, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      collisionStrategy: "replace",
+    }, "user-1");
+
+    expect(projectSvc.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultIssueExecutionPolicy: {
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+        },
+      },
+    }));
+    expect(result.warnings).toContainEqual(expect.stringContaining("names agent nobody"));
+  });
+
+  it("exports a project default execution policy with agents named by slug", async () => {
+    const portability = companyPortabilityService({} as any);
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: null,
+        leadAgentId: null,
+        targetDate: null,
+        color: null,
+        status: "planned",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultIssueExecutionPolicy: {
+            stages: [{
+              id: "stage-1",
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [
+                { id: "p-1", type: "agent", agentId: "agent-1", userId: null },
+                { id: "p-2", type: "user", agentId: null, userId: "user-1" },
+              ],
+            }],
+          },
+        },
+        workspaces: [],
+        archivedAt: null,
+      },
+    ]);
+    issueSvc.list.mockResolvedValue([]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: true, issues: false },
+    });
+
+    const extension = asTextFile(exported.files[".paperclip.yaml"]);
+    expect(extension).toContain("defaultIssueExecutionPolicy:");
+    expect(extension).toContain('agentSlug: "claudecoder"');
+    expect(extension).not.toContain("user-1");
+    expect(extension).not.toContain("stage-1");
+    expect(exported.manifest.projects.find((project) => project.slug === "launch")?.executionWorkspacePolicy).toEqual({
+      enabled: true,
+      defaultIssueExecutionPolicy: { stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }] }] },
+    });
+    expect(exported.warnings).toContainEqual(expect.stringContaining("only exported agents are portable"));
+  });
+
   it("infers portable git metadata from a local checkout without task warning fan-out", async () => {
     const portability = companyPortabilityService({} as any);
     const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-portability-git-"));

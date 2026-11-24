@@ -104,7 +104,24 @@ interface IssueExecutionDecision {
 5. **Approver approves** and transitions to `done` with a comment:
    - A decision record is created: `{ outcome: "approved" }`
    - `executionState.status` becomes `completed`
-   - Issue reaches actual `done` status
+   - Issue reaches actual `done` status, because the executor marked the work complete in step 3
+
+### Review Before Delivery Is Done
+
+An executor that still has delivery left after review (merge, release, rollout,
+verification) hands off with `in_review` instead of `done`. The runtime routes
+the issue through the same stages, but approving the **final** stage does not
+close it:
+
+- `executionState.status` becomes `completed` and the decision is recorded as usual
+- Status changes to `in_progress` and the issue is reassigned to the executor (`returnAssignee`), who is woken (`issue_assigned` with an `executionStage` of `wakeRole: "executor"`, `lastDecisionOutcome: "approved"`)
+- The executor finishes delivery and transitions to `done`; the completed review is not run again
+
+`executionState.completionRequested` records which hand-off started the current
+review cycle (`true` for `done`, `false` for `in_review`). It is recomputed on
+every resubmission after changes requested. A state written before the field
+existed counts as `false`, so the issue goes back to its executor rather than
+closing early.
 
 ### Changes Requested Flow
 
@@ -223,6 +240,61 @@ POST /api/companies/{companyId}/issues
 
 Stage IDs and participant IDs are auto-generated if omitted. Duplicate participants within a stage are automatically deduplicated. Stages with no valid participants are removed. If no valid stages remain, the policy is set to `null`.
 
+### Project default stages
+
+A project can declare stages that every issue created in it starts with, so
+review holds by construction instead of each author remembering to add it.
+They live in the project's `executionWorkspacePolicy`, next to its other
+project-level policy:
+
+```bash
+PATCH /api/projects/{projectId}
+{
+  "executionWorkspacePolicy": {
+    "enabled": true,
+    "defaultIssueExecutionPolicy": {
+      "stages": [
+        { "type": "review", "participants": [{ "type": "agent", "agentId": "reviewer-agent-id" }] }
+      ]
+    }
+  }
+}
+```
+
+- The server adds these stages to an issue at creation, on every creation path
+  (API, sub-issues, routines, plugins), when the issue declares no stages of
+  its own. An issue created with its own `stages` keeps them; its other policy
+  fields (monitor, review limit, authorization) are kept either way.
+- They apply whether or not isolated workspaces are enabled.
+- Each issue gets fresh stage and participant ids.
+- Agent participants must belong to the project's company.
+- `executionWorkspacePolicy` is replaced as a whole on update, so send the
+  current policy with the change; omit `defaultIssueExecutionPolicy` (or set it
+  to `null`) to remove the default. Existing issues are not changed.
+- To create an issue without them (a release or verification step, say), send
+  `"executionPolicy": null` explicitly on create; omitting the field applies
+  the default. Removing them later by updating the issue's `executionPolicy`
+  works too.
+
+In a company package, declare it in the project's `executionWorkspacePolicy`
+in `.paperclip.yaml`, naming agents by slug; the import resolves each slug in
+the target company:
+
+```yaml
+projects:
+  my-project:
+    executionWorkspacePolicy:
+      enabled: true
+      defaultIssueExecutionPolicy:
+        stages:
+          - type: review
+            participants:
+              - agentSlug: code-reviewer
+```
+
+Export writes the same form. User participants are not portable and are
+omitted with a warning.
+
 ### Updating execution policy on an existing issue
 
 ```bash
@@ -236,7 +308,7 @@ If the policy is removed (`null`) while a review is in progress, the execution s
 
 ### Advancing a stage (reviewer/approver approves)
 
-The active reviewer or approver transitions the issue to `done` with a comment:
+The active reviewer or approver transitions the issue to `done` with a comment. On the final stage this closes the issue only when the executor marked the work `done`; otherwise the issue returns to the executor in `in_progress` (see [Review Before Delivery Is Done](#review-before-delivery-is-done)):
 
 ```bash
 PATCH /api/issues/{issueId}

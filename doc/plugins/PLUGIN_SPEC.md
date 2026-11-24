@@ -1758,6 +1758,68 @@ When an operator updates a plugin config for a company at runtime:
 4. The worker reads the config through `ctx.config.get(companyId)` and applies it without restarting. If the plugin needs to re-initialize connections (e.g. a new API token), it does so internally.
 5. If the plugin does not handle `configChanged`, the host restarts the worker process; the worker must still request company-scoped config explicitly.
 
+#### 25.4.4.1 Plugin Config From A File (`PAPERCLIP_PLUGIN_CONFIG_FILE`)
+
+An operator who manages configuration in Git (for example a Kubernetes
+ConfigMap) can set `PAPERCLIP_PLUGIN_CONFIG_FILE` to the path of a JSON file:
+
+```json
+{
+  "<pluginKey>": {
+    "<companyId>": { "...": "config matching the plugin's instanceConfigSchema" }
+  }
+}
+```
+
+Unset, nothing changes. Set:
+
+- **Same path as the API.** Each entry goes through the steps above: it is
+  validated against the manifest's `instanceConfigSchema` and the company's
+  secrets, written to `plugin_config`, its secret bindings synced, and the
+  worker gets `configChanged`.
+- **When.** At startup, whenever a plugin is activated (installed, upgraded,
+  enabled or restarted; the entry is written before the worker starts, so the
+  worker starts with it), and when the file changes. The server watches the
+  file's directory, which also sees a ConfigMap's `..data` symlink swap, and
+  re-reads it about 1 s after the last change. The watch starts before the
+  first read, and the file is read again once startup has finished, so a
+  change made while the server starts is not lost.
+- **Only differences are written.** An entry equal to the stored config writes
+  nothing and sends no `configChanged`, so restarts are quiet.
+- **Audit.** Each change writes a `plugin.config.updated` activity with actor
+  `system` / `plugin-config-file` and `details.source = "plugin-config-file"`,
+  the plugin key, the company id, `sha256` (SHA-256 of the entry's config as
+  JSON with sorted keys) and `fileSha256`, so a change can be traced to the
+  commit that made it.
+- **Failures never stop the server and never clear a config.** A file that
+  cannot be read, is not JSON or has the wrong shape is ignored as a whole and
+  the last good file stays in effect. An entry for an unknown company, or one
+  that fails schema or secret validation, is logged with the plugin key,
+  company and reason, stored in `plugin_config.last_error` when a row exists,
+  and the stored config stays; the other entries still apply. An entry for a
+  plugin that is not installed is applied when the plugin is installed.
+- **Read-only when managed.** For a (plugin, company) pair in the file,
+  `POST /api/plugins/:pluginId/config` returns 409 and
+  `GET /api/plugins/:pluginId/config` returns `managedBy: "file"`; the plugin
+  settings page shows the form read-only. A managed pair whose entry has not
+  been stored yet (it failed validation) is still read-only: `GET` returns
+  `managedBy: "file"` with `id: null` and an empty `configJson`. Until the
+  file has been read successfully once, every pair is treated as managed.
+  Pairs not in the file behave as before.
+- **Background jobs see the change at once.** Every config write, from the
+  file or the API, refreshes the companies the plugin's worker may act on
+  from proactive (no-invocation) calls such as `ctx.config.get(companyId)` in
+  a job, whether or not the worker is running at that moment; a worker that
+  is starting gets the newer set.
+- **Removing an entry leaves the config.** Deleting a pair from the file stops
+  managing it; its stored config stays as it was and becomes editable again.
+  Deleting a line must never be a way to remove a policy. To change a config,
+  change the entry.
+- **No secrets in the file.** It is usually a ConfigMap. Put secrets in
+  company secrets and reference them with the plugin's secret-ref fields
+  (`{ "type": "secret_ref", "secretId": "..." }`), which are validated as
+  above.
+
 #### 25.4.5 Frontend Cache Invalidation
 
 The host must version plugin UI bundle URLs (e.g. `/_plugins/:pluginId/ui/:version/*` or content-hash-based paths) so that browser caches do not serve stale bundles after upgrade or reinstall.

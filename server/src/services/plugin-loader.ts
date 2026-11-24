@@ -292,6 +292,13 @@ export interface PluginLoaderOptions {
     previousManifest?: PaperclipPluginManifestV1;
   }) => void;
   /**
+   * Called on every activation after the manifest is refreshed and before the
+   * plugin's stored company configs are read and its worker starts, so config
+   * written here is what the worker receives at startup. Failures are logged
+   * and never block activation. Used by PAPERCLIP_PLUGIN_CONFIG_FILE.
+   */
+  beforeWorkerStart?: (plugin: PluginRecord) => Promise<void>;
+  /**
    * Path to the local plugin directory to scan.
    * Defaults to ~/.paperclip/plugins/
    */
@@ -1169,6 +1176,7 @@ export function pluginLoader(
     assertPackageActivation,
     resolvePackageRoot,
     prebuiltOnly = false,
+    beforeWorkerStart,
   } = options;
 
   const registry = pluginRegistryService(db);
@@ -2317,6 +2325,20 @@ export function pluginLoader(
       // (eventSubscriptions: 0) for the worker's life (LOOA-695). The same rows
       // drive startup config delivery in step 5b below. Listing is best-effort:
       // if it fails the worker still starts, just with no proactive access.
+      if (beforeWorkerStart) {
+        try {
+          await beforeWorkerStart(activePlugin);
+        } catch (hookErr) {
+          log.error(
+            { pluginId, pluginKey, err: hookErr instanceof Error ? hookErr.message : String(hookErr) },
+            "plugin-loader: beforeWorkerStart hook failed",
+          );
+        }
+      }
+      // Read before the rows: a scope set written after this point (a config
+      // saved between the read below and the worker start) is newer than the
+      // rows, and the worker manager starts the worker with it instead.
+      const proactiveCompanyScopesGeneration = workerManager.proactiveScopeGeneration?.(pluginId);
       let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
       try {
         configRows = await registry.listConfigs(pluginId);
@@ -2356,6 +2378,7 @@ export function pluginLoader(
         // set is exactly the plugin's configured companies — proactive access
         // never reaches an unconfigured company.
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
+        proactiveCompanyScopesGeneration,
       };
 
       if (prebuiltOnly) {
