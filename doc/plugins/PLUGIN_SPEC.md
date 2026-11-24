@@ -555,6 +555,68 @@ When the host needs to stop a plugin worker (for upgrade, uninstall, or instance
 
 The shutdown deadline should be configurable per-plugin in plugin config for plugins that need longer drain periods.
 
+## 12.6 Worker Filesystem Sandbox
+
+Every plugin worker is forked under the Node permission model (`--permission`),
+so a plugin cannot read operator secret files such as GitHub App private keys.
+The host plans the sandbox per worker in
+`server/src/services/plugin-worker-sandbox.ts`.
+
+A sandboxed worker **can**:
+
+- read its own package directory and the packages it can resolve: every ancestor
+  `node_modules` and, transitively, the real directories behind linked
+  (`pnpm` workspace) packages
+- read the host's `--import` loader and any absolute `NODE_PATH` entries
+- read and write a private tmp directory,
+  `<os tmpdir>/paperclip-plugin-workers/<plugin id>`. `os.tmpdir()`, `TMPDIR`,
+  `TMP` and `TEMP` point at it.
+- use the network, and everything the host exposes over RPC: config, state,
+  secrets, local folders (`ctx.localFolders.*`), workspaces and so on
+
+A sandboxed worker **cannot**:
+
+- read any other file, including mounted secrets, `/etc`, the server's own
+  source or data directory and other plugins' packages. The call fails with
+  `ERR_ACCESS_DENIED`; the worker keeps running and serving RPCs.
+- write anywhere outside its tmp directory
+- start child processes, worker threads or WASI, load native addons, or open
+  the inspector
+
+Local folders keep working because the host reads and writes them on the
+worker's behalf through `ctx.localFolders`, within the board-configured folder
+and access mode. A worker never gets direct filesystem access to them.
+
+Sandboxed workers load TypeScript with Node's built-in type stripping
+(`--experimental-transform-types`) and a small resolve hook that maps `./x.js`
+to `./x.ts`. `tsx` cannot run under the sandbox because its transform starts a
+worker thread.
+
+**Protected secret files.** The host collects the files named by
+`PAPERCLIP_GITHUB_APPS_FILE` and `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE`, the
+apps file itself and every `*File` path inside it (`apps[].privateKeyFile`,
+`apps[].webhookSecretFile`, `approvalsApp.privateKeyFile`, ...). If any of these
+falls inside a path the worker would be allowed to read or write, for example a
+key mounted under `node_modules`, the host refuses to start the worker: the
+start fails with an error naming both the allowed path and the secret file.
+
+**Trusted exceptions.** A child process is outside the permission model, so
+granting `--allow-child-process` would let it read any file the server can.
+Plugins that declare a capability whose implementation needs one
+(`environment.drivers.register`, `execution.workspaces.read` or
+`project.workspaces.read`) therefore run **unsandboxed**, but only when they are
+installed from the image's trusted plugin roots: the repository's
+`packages/plugins` tree and the bundled plugin catalog. Any other plugin that
+declares these capabilities stays sandboxed and cannot spawn. The host logs a
+warning for every worker it starts unsandboxed. The bundled plugins that run
+under this exception are the sandbox providers (including `kubernetes`), the fake
+sandbox, `plugin-workspace-diff`, and the file-browser and kitchen-sink examples.
+`server/src/__tests__/plugin-worker-sandbox-bundled.test.ts` pins this list.
+
+**Operator escape hatch.** Setting `PAPERCLIP_PLUGIN_WORKER_SANDBOX=off` runs
+every worker without the sandbox. It is meant for local development, is unset in
+the image, and each unsandboxed start is logged as a warning.
+
 ## 13. Host-Worker Protocol
 
 The host must support the following worker RPC methods.
