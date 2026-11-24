@@ -78,9 +78,16 @@ if $fhs_ci; then
   # tests also run without the compiler variables the Nix shell exports
   # (AR=ar, CC=gcc, ...): Ubuntu sets none, and the redactor masks their
   # short values inside unrelated strings.
+  # nix-v1 mounts its scratch volume at /tmp, so the tests' temporary
+  # directories sit on a different filesystem from /. Git then stops its
+  # repository search at /tmp and reports "not a git repository (or any
+  # parent up to mount point /)" instead of "(or any of the parent
+  # directories)", which the server matches to recognise a plain directory.
+  # Upstream's /tmp is on the root filesystem; let Git search across mounts
+  # as it would there.
   as_test_user=(env -u AR -u AS -u CC -u CXX -u LD -u NM -u OBJCOPY -u OBJDUMP
     -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP
-    HOME="$test_root/home" TMPDIR="$test_root/tmp"
+    HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
 fi
 # Pull requests run the test files they add or change. Import-graph selection
