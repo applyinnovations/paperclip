@@ -14,8 +14,8 @@ const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const PEM = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
 
 const APPLY = "a9d886a3-e526-461c-95d6-d2d0d6b6c722";
-const CALILE = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
-const PLAYABLE = "7c2a5d4e-8f60-4b1a-a3c2-1d9e8f7a6b55";
+const COMPANY_A = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
+const COMPANY_B = "7c2a5d4e-8f60-4b1a-a3c2-1d9e8f7a6b55";
 const CONFIG_PATH = "/etc/paperclip/github-apps.json";
 
 const APPS = {
@@ -26,13 +26,13 @@ const APPS = {
       installationId: "175009740",
       privateKeyFile: "/var/run/github-apps/apply/private-key.pem",
       webhookSecretFile: "/var/run/github-apps/apply/webhook-secret",
-      repositories: ["xlab-deployments"],
+      repositories: ["deployments"],
     },
     {
-      companyId: CALILE,
+      companyId: COMPANY_A,
       appId: 6000001,
       installationId: 200000001,
-      privateKeyFile: "/var/run/github-apps/calile/private-key.pem",
+      privateKeyFile: "/var/run/github-apps/company-a/private-key.pem",
     },
   ],
 };
@@ -114,7 +114,7 @@ describe("per-company GitHub App configuration", () => {
   });
 
   it("refuses both configuration forms at once", () => {
-    for (const extra of [SINGLE_ENV, { PAPERCLIP_GITHUB_APP_REPOSITORIES: "xlab-deployments" }]) {
+    for (const extra of [SINGLE_ENV, { PAPERCLIP_GITHUB_APP_REPOSITORIES: "deployments" }]) {
       const result = readGitHubAppsConfig({ ...fileEnv, ...extra }, readConfigFile(APPS));
       expect(result.status === "invalid" && result.error).toContain("not both");
     }
@@ -131,7 +131,7 @@ describe("GitHub App startup check", () => {
   const secrets: Record<string, string> = {
     "/var/run/github-apps/apply/private-key.pem": PEM,
     "/var/run/github-apps/apply/webhook-secret": "s3cret\n",
-    "/var/run/github-apps/calile/private-key.pem": PEM,
+    "/var/run/github-apps/company-a/private-key.pem": PEM,
   };
   const readSecretFile = async (file: string) => {
     const value = secrets[file];
@@ -148,7 +148,7 @@ describe("GitHub App startup check", () => {
   it.each([
     ["an invalid file", { readConfigFile: readConfigFile({ apps: [] }), readSecretFile }, "at least one App"],
     ["both forms", { readConfigFile: readConfigFile(APPS), readSecretFile, env: SINGLE_ENV }, "not both"],
-    ["an unreadable key", { readConfigFile: readConfigFile(APPS), readSecretFile: async (file: string) => file.includes("calile") ? Promise.reject(new Error("EACCES")) : readSecretFile(file) }, "cannot read private key file /var/run/github-apps/calile/private-key.pem"],
+    ["an unreadable key", { readConfigFile: readConfigFile(APPS), readSecretFile: async (file: string) => file.includes("company-a") ? Promise.reject(new Error("EACCES")) : readSecretFile(file) }, "cannot read private key file /var/run/github-apps/company-a/private-key.pem"],
     ["a non-PEM key", { readConfigFile: readConfigFile(APPS), readSecretFile: async (file: string) => file.endsWith(".pem") ? "-----BEGIN NOT A KEY-----" : readSecretFile(file) }, "is not a PEM private key"],
     ["an empty webhook secret", { readConfigFile: readConfigFile(APPS), readSecretFile: async (file: string) => file.endsWith("webhook-secret") ? "  \n" : readSecretFile(file) }, "is empty"],
   ])("refuses to start with %s", async (_name, deps, message) => {
@@ -181,23 +181,23 @@ describe("per-company GitHub App tokens", () => {
   it("mints each company's token from its own App installation and never shares a cache", async () => {
     const { github, tokens } = source();
     const apply = await tokens.resolve(APPLY);
-    const calile = await tokens.resolve(CALILE);
+    const companyA = await tokens.resolve(COMPANY_A);
     expect(apply).toMatchObject({ status: "available", appId: "5462605", installationId: "175009740", credential: { token: "ghs_175009740_1" } });
-    expect(calile).toMatchObject({ status: "available", appId: "6000001", installationId: "200000001", credential: { token: "ghs_200000001_1" } });
+    expect(companyA).toMatchObject({ status: "available", appId: "6000001", installationId: "200000001", credential: { token: "ghs_200000001_1" } });
     // Cached per App: a second resolve for each company reuses its own token.
     expect(await tokens.resolve(APPLY)).toMatchObject({ credential: { token: "ghs_175009740_1" } });
-    expect(await tokens.resolve(CALILE)).toMatchObject({ credential: { token: "ghs_200000001_1" } });
+    expect(await tokens.resolve(COMPANY_A)).toMatchObject({ credential: { token: "ghs_200000001_1" } });
     expect(github.minted).toEqual(["175009740", "200000001"]);
 
     // Invalidating one company's App leaves the other cache in place.
-    tokens.invalidate(CALILE);
+    tokens.invalidate(COMPANY_A);
     expect(await tokens.resolve(APPLY)).toMatchObject({ credential: { token: "ghs_175009740_1" } });
-    expect(await tokens.resolve(CALILE)).toMatchObject({ credential: { token: "ghs_200000001_2" } });
+    expect(await tokens.resolve(COMPANY_A)).toMatchObject({ credential: { token: "ghs_200000001_2" } });
   });
 
   it("falls through for a company without an App", async () => {
     const { github, tokens } = source();
-    expect(await tokens.resolve(PLAYABLE)).toEqual({ status: "not_applicable" });
+    expect(await tokens.resolve(COMPANY_B)).toEqual({ status: "not_applicable" });
     expect(github.minted).toHaveLength(0);
   });
 
@@ -209,7 +209,7 @@ describe("per-company GitHub App tokens", () => {
       readPrivateKey: async () => PEM,
     });
     expect(await tokens.resolve(APPLY)).toMatchObject({ status: "unavailable" });
-    expect(await tokens.resolve(PLAYABLE)).toMatchObject({ status: "unavailable" });
+    expect(await tokens.resolve(COMPANY_B)).toMatchObject({ status: "unavailable" });
   });
 });
 
@@ -284,9 +284,9 @@ describe("plugin GitHub App host services", () => {
   it("returns the invocation company's token and never the private key", async () => {
     const result = await handlers(["github.app.token"])["githubApp.getInstallationToken"](
       {},
-      { invocationScope: { companyId: CALILE } },
+      { invocationScope: { companyId: COMPANY_A } },
     );
-    expect(result).toMatchObject({ token: "ghs_200000001_1", appId: "6000001", installationId: "200000001", companyId: CALILE });
+    expect(result).toMatchObject({ token: "ghs_200000001_1", appId: "6000001", installationId: "200000001", companyId: COMPANY_A });
     expect(JSON.stringify(result)).not.toMatch(/PRIVATE KEY|eyJ/);
   });
 
@@ -294,14 +294,14 @@ describe("plugin GitHub App host services", () => {
     await expect(
       handlers(["github.app.token"])["githubApp.getInstallationToken"](
         { companyId: APPLY },
-        { invocationScope: { companyId: CALILE } },
+        { invocationScope: { companyId: COMPANY_A } },
       ),
     ).rejects.toThrow(/scoped to company/);
     await expect(
       handlers(["github.app.token"])["githubApp.getInstallationToken"]({ companyId: APPLY }),
     ).rejects.toThrow(/company context is required/);
     await expect(
-      handlers([])["githubApp.getInstallationToken"]({}, { invocationScope: { companyId: CALILE } }),
+      handlers([])["githubApp.getInstallationToken"]({}, { invocationScope: { companyId: COMPANY_A } }),
     ).rejects.toThrow(/github\.app\.token/);
     await expect(
       handlers(["github.app.token"])["githubApp.verifyWebhook"]({ headers: {}, rawBody: "" }),
@@ -310,7 +310,7 @@ describe("plugin GitHub App host services", () => {
 
   it("resolves null for a company without an App", async () => {
     await expect(
-      handlers(["github.app.token"])["githubApp.getInstallationToken"]({}, { invocationScope: { companyId: PLAYABLE } }),
+      handlers(["github.app.token"])["githubApp.getInstallationToken"]({}, { invocationScope: { companyId: COMPANY_B } }),
     ).resolves.toBeNull();
   });
 

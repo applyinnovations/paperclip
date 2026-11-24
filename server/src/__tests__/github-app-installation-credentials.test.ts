@@ -42,8 +42,8 @@ function githubStub(options: { tokenStatus?: number; expiresInMs?: number; now?:
         expires_at: new Date(now.getTime() + (options.expiresInMs ?? 60 * 60_000)).toISOString(),
       });
     }
-    if (url.endsWith("/app")) return json(200, { slug: "paperclip-xlab-now" });
-    if (url.includes("/users/paperclip-xlab-now%5Bbot%5D")) return json(200, { id: 4242, login: "paperclip-xlab-now[bot]" });
+    if (url.endsWith("/app")) return json(200, { slug: "paperclip-example" });
+    if (url.includes("/users/paperclip-example%5Bbot%5D")) return json(200, { id: 4242, login: "paperclip-example[bot]" });
     return json(404, { message: "Not Found" });
   });
   return { fetchImpl: fetchImpl as unknown as typeof fetch, calls };
@@ -65,7 +65,7 @@ describe("GitHub App installation tokens", () => {
     let clock = new Date("2026-10-25T00:00:00Z");
     const github = githubStub({ now: () => clock });
     const source = createGitHubAppInstallationTokenSource({
-      env: { ...ENV, PAPERCLIP_GITHUB_APP_REPOSITORIES: "xlab-deployments,xlab-containers" },
+      env: { ...ENV, PAPERCLIP_GITHUB_APP_REPOSITORIES: "deployments,containers" },
       fetchImpl: github.fetchImpl,
       readPrivateKey: async () => PEM,
       now: () => clock,
@@ -78,12 +78,12 @@ describe("GitHub App installation tokens", () => {
       token: "ghs_installation_1",
       source: "github_app",
       identitySource: "app",
-      githubIdentity: { userId: "4242", login: "paperclip-xlab-now[bot]" },
+      githubIdentity: { userId: "4242", login: "paperclip-example[bot]" },
     });
 
     const exchange = github.calls.find((call) => call.url.endsWith("/access_tokens"))!;
     expect(exchange.method).toBe("POST");
-    expect(exchange.body).toEqual({ repositories: ["xlab-deployments", "xlab-containers"] });
+    expect(exchange.body).toEqual({ repositories: ["deployments", "containers"] });
     const jwt = exchange.authorization!.replace(/^Bearer /, "");
     const [header, payload, signature] = jwt.split(".");
     expect(JSON.parse(Buffer.from(header!, "base64url").toString())).toEqual({ alg: "RS256", typ: "JWT" });
@@ -129,12 +129,12 @@ describe("GitHub App installation tokens", () => {
     const env = JSON.stringify(buildGitAuthInvocation(result.credential).env);
     expect(env).toContain("ghs_installation_1");
     expect(env).not.toMatch(/PRIVATE KEY|eyJ/);
-    expect(env).toContain("4242+paperclip-xlab-now[bot]@users.noreply.github.com");
+    expect(env).toContain("4242+paperclip-example[bot]@users.noreply.github.com");
   });
 });
 
 describe("git remote credential resolution order", () => {
-  const remote = "https://github.com/applyinnovations/xlab-deployments.git";
+  const remote = "https://github.com/example-org/deployments.git";
   const noSecrets = { getByName: async () => null, resolveSecretValue: async () => "" };
   const available = { resolve: async () => ({ status: "available" as const, credential: { token: "ghs_app", source: "github_app" as const, secretName: null },
     expiresAt: "2026-01-01T01:00:00.000Z", appId: "1", installationId: "2" }) };

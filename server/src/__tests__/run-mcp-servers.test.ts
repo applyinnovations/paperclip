@@ -13,7 +13,7 @@ import {
 } from "../services/run-mcp-servers.js";
 
 const APPLY = "a9d886a3-e526-461c-95d6-d2d0d6b6c722";
-const CALILE = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
+const COMPANY_B = "0b6f3c0e-1c1d-4c39-9d43-6a3f9d1c2e01";
 const AGENT = "7c2a5d4e-8f60-4b1a-a3c2-1d9e8f7a6b55";
 const RUN = "1d9e8f7a-6b55-4b1a-a3c2-7c2a5d4e8f60";
 const SECRET_FILE = "/var/run/paperclip-run-mcp/grafana/client-secret";
@@ -26,7 +26,7 @@ const GRAFANA = {
   url: UPSTREAM,
   companyIds: [APPLY],
   agents: ["engineer", "cycle-time-engineer"],
-  tokenUrl: "https://id.xlab.now/realms/xlab/protocol/openid-connect/token",
+  tokenUrl: "https://id.example.com/realms/example/protocol/openid-connect/token",
   clientId: "paperclip-agents",
   clientSecretFile: SECRET_FILE,
   scope: "read:agent-telemetry",
@@ -61,7 +61,7 @@ describe("run MCP server configuration", () => {
     ["missing allowlist", { ...GRAFANA, agents: undefined }, "agents"],
     ["empty allowlist", { ...GRAFANA, agents: [] }, "agents"],
     ["agent name instead of key", { ...GRAFANA, agents: ["Cycle Time Engineer"] }, "agents"],
-    ["plaintext token endpoint", { ...GRAFANA, tokenUrl: "http://id.xlab.now/token" }, "tokenUrl"],
+    ["plaintext token endpoint", { ...GRAFANA, tokenUrl: "http://id.example.com/token" }, "tokenUrl"],
     ["credentials in URL", { ...GRAFANA, url: "http://user:pass@grafana.invalid/mcp" }, "url"],
     ["relative secret file", { ...GRAFANA, clientSecretFile: "client-secret" }, "clientSecretFile"],
     ["no companies", { ...GRAFANA, companyIds: [] }, "companyIds"],
@@ -93,7 +93,7 @@ describe("run MCP servers for a run", () => {
   });
 
   it.each([
-    ["other company", { companyId: CALILE, agentUrlKey: "engineer" }],
+    ["other company", { companyId: COMPANY_B, agentUrlKey: "engineer" }],
     ["agent not allowlisted", { companyId: APPLY, agentUrlKey: "ceo" }],
   ])("adds nothing for %s", (_label, input) => {
     expect(runMcpServersForRun(servers(), { ...input, runToken: "run-jwt", apiBaseUrl: "http://paperclip:3100" })).toEqual([]);
