@@ -13193,6 +13193,8 @@ export function issueRoutes(
         originRunId: createBody.originRunId ?? actor.runId,
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
+        // An explicit `executionPolicy: null` opts out of the project's default stages.
+        skipProjectDefaultExecutionStages: createBody.executionPolicy === null,
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -13595,6 +13597,8 @@ export function issueRoutes(
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
         executionPolicy,
+        // An explicit `executionPolicy: null` opts out of the project's default stages.
+        skipProjectDefaultExecutionStages: createBody.executionPolicy === null,
         ...(currentSerializedChild
           ? {
               status: "blocked",

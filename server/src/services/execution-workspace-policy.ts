@@ -2,6 +2,7 @@ import type {
   ExecutionWorkspaceMode,
   ExecutionWorkspaceStrategy,
   IssueExecutionWorkspaceSettings,
+  ProjectDefaultExecutionPolicy,
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
   SharedWorkspaceConcurrency,
@@ -153,6 +154,10 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
       : {}),
     ...(parsed.authorizationPolicy && typeof parsed.authorizationPolicy === "object" && !Array.isArray(parsed.authorizationPolicy)
       ? { authorizationPolicy: { ...(parsed.authorizationPolicy as Record<string, unknown>) } }
+      : {}),
+    ...(parsed.defaultIssueExecutionPolicy && typeof parsed.defaultIssueExecutionPolicy === "object"
+      && Array.isArray((parsed.defaultIssueExecutionPolicy as { stages?: unknown }).stages)
+      ? { defaultIssueExecutionPolicy: parsed.defaultIssueExecutionPolicy as ProjectDefaultExecutionPolicy }
       : {}),
   };
 }

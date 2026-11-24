@@ -97,6 +97,11 @@ PATCH /api/projects/{projectId}
 }
 ```
 
+`executionWorkspacePolicy.defaultIssueExecutionPolicy` (create and update)
+sets the review and approval stages every new issue in the project starts
+with, unless the issue brings its own. See
+[Execution Policy](../guides/execution-policy.md#project-default-stages).
+
 ## Project Workspaces
 
 Workspaces link a project to a repository and directory:
