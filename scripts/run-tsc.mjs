@@ -6,9 +6,12 @@
 // most useful control a package has over its peak memory.
 // scripts/typecheck-low-memory.mjs sets PAPERCLIP_TYPECHECK_LOW_MEMORY=1 so the
 // largest programs check on a single thread. A process whose cgroup memory
-// limit is below LOW_MEMORY_LIMIT_BYTES (an agent sandbox) uses that mode too
-// unless the variable is 0: with the default checkers the server's first layer
-// passed 3.4 GiB in a 4 GiB sandbox, and the kernel killed the agent with it.
+// limit is below LOW_MEMORY_LIMIT_BYTES (an agent sandbox, 8 GiB since
+// deployments#391) uses that mode too unless the variable is 0: with the default
+// checkers the server's first layer passed 3.4 GiB in a 4 GiB sandbox, and the
+// kernel killed the agent with it. Their peak has never been measured to
+// completion, so the threshold sits above the sandbox limit and below CI's
+// 24 GiB.
 //
 // A build that only needs JavaScript sets PAPERCLIP_TSC_EMIT_ONLY=1. That build
 // skips type checks and declarations, which use most of the memory of an emit.
@@ -23,7 +26,7 @@ import { fileURLToPath } from "node:url";
 
 export const LOW_MEMORY_VARIABLE = "PAPERCLIP_TYPECHECK_LOW_MEMORY";
 export const EMIT_ONLY_VARIABLE = "PAPERCLIP_TSC_EMIT_ONLY";
-export const LOW_MEMORY_LIMIT_BYTES = 8 * 1024 ** 3;
+export const LOW_MEMORY_LIMIT_BYTES = 16 * 1024 ** 3;
 
 /** The memory limit of this process's cgroup in bytes, or Infinity when there is none. */
 export function cgroupMemoryLimit(read = (file) => readFileSync(file, "utf8")) {
