@@ -272,7 +272,12 @@ command into the same kill.
   than 8 GiB.
 - To check the server, run `pnpm --filter @paperclipai/server typecheck`. It
   checks the server in layers, and `scripts/run-tsc.mjs` uses one thread when
-  the cgroup limit is below 8 GiB. It peaks at about 3.8 GiB.
+  the cgroup limit is below 8 GiB. It peaks at about 3.8 GiB, and the agent
+  needs about 0.5 GiB beside it, so it needs a limit of at least 5 GiB
+  (`cat /sys/fs/cgroup/memory.max`). Under that, check the packages you
+  changed and leave the server typecheck to CI.
+- `NODE_OPTIONS=--max-old-space-size` does not limit `tsc`: TypeScript 7 runs
+  a native binary.
 - To check the whole workspace, run `node scripts/typecheck-low-memory.mjs`,
   not `pnpm -r typecheck`, which runs several packages at once. Usually the
   packages you changed and CI's typecheck are enough.
