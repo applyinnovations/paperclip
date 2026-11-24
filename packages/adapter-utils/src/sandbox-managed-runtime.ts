@@ -550,6 +550,8 @@ export interface SandboxSyncOperation {
 
 export interface SandboxSyncResult {
   operations: { operationId: string; filesTransferred: number; bytesTransferred: number }[];
+  /** Non-fatal transfer notes (e.g. a skipped escaping symlink) for the run log. */
+  warnings?: string[];
 }
 
 export interface SandboxManagedRuntimeClient {
@@ -1021,7 +1023,11 @@ export async function exportSandboxWorkspaceSnapshot(input: {
   assertSyncOperationsConfined(operations, { sourceRoots: [input.remoteDir], targetRoots: [input.stagingDir] });
   if (!input.client.syncOut) throw Object.assign(new Error("Validated workspace export is unavailable for this provider"),
     { code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
-  await input.client.syncOut(operations);
+  const result = await input.client.syncOut(operations);
+  // A snapshot must be complete: a link the provider had to skip is a refusal.
+  if (result?.warnings?.length) {
+    throw Object.assign(new Error(`Unsafe workspace export: ${result.warnings.join("; ")}`), { code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
+  }
   await confineFullWorkspaceExport(input.stagingDir, true);
 }
 
@@ -1178,6 +1184,14 @@ function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
 // Sum `bytesTransferred` over a `SandboxSyncResult`. The result crosses the
 // plugin boundary, so a provider can return anything: guard each value and
 // treat a missing, non-finite, or negative number as 0.
+/** Write a provider's non-fatal transfer warnings to the run log. */
+async function emitSyncWarnings(sink: RuntimeProgressSink | undefined, result: SandboxSyncResult): Promise<void> {
+  if (!sink) return;
+  for (const warning of result.warnings ?? []) {
+    await Promise.resolve(sink(`[paperclip] Warning: ${warning}\n`)).catch(() => undefined);
+  }
+}
+
 function sumSyncResultBytes(result: SandboxSyncResult): number {
   return result.operations.reduce((total, operation) => {
     const bytes = operation.bytesTransferred;
@@ -2278,6 +2292,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   const syncResult = await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(operations));
                   const transferredBytes = sumSyncResultBytes(syncResult);
                   await workspaceRestore.finish(transferredBytes, transferredBytes);
+                  await emitSyncWarnings(restoreSink, syncResult);
                 } else if (!checkpointSnapshot) {
                   const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-download.tar");
                   await withWorkspaceRestoreStep("workspace_transfer", () => input.client.run(

@@ -1061,3 +1061,47 @@ describe("command managed runtime", () => {
     expect(Array.from(received[0] ?? [])).toEqual(Array.from({ length: 256 }, (_, value) => value));
   });
 });
+
+describe("command managed runtime failure messages", () => {
+  function fixedRunner(result: Partial<RunProcessResult>): CommandManagedRuntimeRunner {
+    return {
+      execute: async () => ({
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: null,
+        ...result,
+      }) as RunProcessResult,
+    };
+  }
+
+  it("says a timed-out command timed out and keeps the provider's reason", async () => {
+    const client = createCommandManagedRuntimeClient({
+      runner: fixedRunner({ timedOut: true, stderr: "Kubernetes exec in pod pc-1 failed: pod pc-1 no longer exists" }),
+      commandCwd: "/",
+      timeoutMs: 1_000,
+    });
+    await expect(client.run("git bundle create x", { timeoutMs: 1_000 })).rejects.toThrow(
+      /git bundle create x timed out:\nstderr: Kubernetes exec in pod pc-1 failed: pod pc-1 no longer exists/,
+    );
+  });
+
+  it("says a command without an exit code failed without one", async () => {
+    const client = createCommandManagedRuntimeClient({ runner: fixedRunner({ stderr: "killed" }), commandCwd: "/", timeoutMs: 1_000 });
+    await expect(client.run("true", { timeoutMs: 1_000 })).rejects.toThrow(/failed without an exit code:\nstderr: killed/);
+  });
+
+  it("serialises non-string output instead of printing [object Object]", async () => {
+    const client = createCommandManagedRuntimeClient({
+      runner: fixedRunner({ exitCode: 1, stderr: { reason: "OOMKilled" } as unknown as string }),
+      commandCwd: "/",
+      timeoutMs: 1_000,
+    });
+    const error = await client.run("true", { timeoutMs: 1_000 }).catch((err: Error) => err);
+    expect(String((error as Error).message)).toContain('failed with exit code 1:\nstderr: {"reason":"OOMKilled"}');
+    expect(String((error as Error).message)).not.toContain("[object Object]");
+  });
+});

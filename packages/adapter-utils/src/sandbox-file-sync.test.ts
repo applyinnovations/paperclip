@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assertSyncOperationsConfined,
+  exportSandboxWorkspaceSnapshot,
   prepareSandboxManagedRuntime,
   type SandboxManagedRuntimeClient,
   type SandboxSyncOperation,
@@ -216,6 +217,48 @@ describe("sandbox native file sync", () => {
     expect(outboundOps[0].files[0]).toMatchObject({ sourcePath: remoteWorkspaceDir, kind: "directory" });
     expect(await readFile(path.join(localWorkspaceDir, "README.md"), "utf8")).toBe("remote workspace\n");
     expect(await readFile(path.join(localWorkspaceDir, "new.txt"), "utf8")).toBe("added\n");
+  });
+
+  it("writes a provider's non-fatal syncOut warnings to the run log and still restores the workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-native-sync-warning-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "local\n", "utf8");
+
+    const { client } = makeNativeClient();
+    const warning = "Workspace sync skipped symlink .tmp-tests/link -> /etc/passwd: its target is outside the synced directory";
+    const nativeSyncOut = client.syncOut!;
+    client.syncOut = async (operations) => ({ ...(await nativeSyncOut(operations)), warnings: [warning] });
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: { transport: "sandbox", provider: "test", sandboxId: "s1", remoteCwd: remoteWorkspaceDir, timeoutMs: 30_000, apiKey: null },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+    });
+    await writeFile(path.join(remoteWorkspaceDir, "README.md"), "remote\n", "utf8");
+
+    const lines: string[] = [];
+    await prepared.restoreWorkspace((line) => { lines.push(line); });
+
+    expect(lines).toContain(`[paperclip] Warning: ${warning}\n`);
+    expect(await readFile(path.join(localWorkspaceDir, "README.md"), "utf8")).toBe("remote\n");
+  });
+
+  it("refuses a workspace snapshot export when the provider had to skip a link", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-native-snapshot-warning-"));
+    cleanupDirs.push(rootDir);
+    const remoteDir = path.join(rootDir, "remote");
+    const stagingDir = path.join(rootDir, "staging");
+    await mkdir(remoteDir, { recursive: true });
+    await writeFile(path.join(remoteDir, "work.txt"), "work\n", "utf8");
+    const { client } = makeNativeClient();
+    const nativeSyncOut = client.syncOut!;
+    client.syncOut = async (operations) => ({ ...(await nativeSyncOut(operations)), warnings: ["Workspace sync skipped symlink x -> /etc"] });
+
+    await expect(exportSandboxWorkspaceSnapshot({ client, remoteDir, stagingDir, operationId: "snapshot" }))
+      .rejects.toMatchObject({ code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
   });
 
   it("stamps the run-specific timeout onto every delegated post-upload command", async () => {

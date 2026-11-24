@@ -37,7 +37,8 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
+import { EXEC_WITHOUT_EXIT_CODE_DIAGNOSTIC, execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
+import { describeExecError, diagnosePodAfterExecFailure } from "./exec-failure.js";
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
@@ -1106,12 +1107,16 @@ const plugin = definePlugin({
         );
       } catch (err) {
         // Watchdog-fired or WebSocket-setup error. Surface as a timeout so
-        // the caller can retry instead of hanging forever.
+        // the caller can retry instead of hanging forever. Name the cause:
+        // the exec error text plus what the API server says about the pod
+        // (gone, terminating, OOMKilled), never a stringified object.
+        const podState = await diagnosePodAfterExecFailure(clients, namespace, podName, "agent");
+        const detail = `Kubernetes exec in pod ${podName} failed: ${describeExecError(err)}${podState ? `; ${podState}` : ""}`;
         return {
           exitCode: null,
           timedOut: true,
           stdout: "",
-          stderr: appendNetworkEgressDenyHint(err instanceof Error ? err.message : String(err), scopedNetworkEgress),
+          stderr: appendNetworkEgressDenyHint(detail, scopedNetworkEgress),
           metadata: {
             provider: "kubernetes",
             backend: "sandbox-cr",
@@ -1120,6 +1125,13 @@ const plugin = definePlugin({
             podName,
           },
         };
+      }
+
+      if (execResult.stderr.includes(EXEC_WITHOUT_EXIT_CODE_DIAGNOSTIC)) {
+        // The exec ended without a command exit code: the container was most
+        // likely killed under it. Say what the pod reports instead of guessing.
+        const podState = await diagnosePodAfterExecFailure(clients, namespace, podName, "agent");
+        if (podState) execResult = { ...execResult, stderr: `${execResult.stderr}Pod state: ${podState}\n` };
       }
 
       return {

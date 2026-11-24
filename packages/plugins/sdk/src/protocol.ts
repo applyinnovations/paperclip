@@ -926,6 +926,12 @@ export interface PluginEnvironmentSyncResult {
     filesTransferred: number;
     bytesTransferred: number;
   }[];
+  /**
+   * Non-fatal transfer notes for the run log, e.g. a sandbox symlink that was
+   * skipped because its target lies outside the synced directory. Optional;
+   * hosts that predate it ignore the field.
+   */
+  warnings?: string[];
 }
 
 export type PluginEnvironmentInteractiveSetupStatus =
