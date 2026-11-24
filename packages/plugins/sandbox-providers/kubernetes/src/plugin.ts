@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { definePlugin, type PluginContext } from "@paperclipai/plugin-sdk";
+import { definePlugin, readEnvironmentCreationCleanupError, type PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentTerminationReceipt,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginEnvironmentInspectLeaseParams,
   PluginEnvironmentLease,
+  PluginEnvironmentLeaseObservation,
   PluginEnvironmentProbeParams,
   PluginEnvironmentProbeResult,
   PluginEnvironmentRealizeWorkspaceParams,
@@ -41,7 +43,9 @@ import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from ".
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
+import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources, isKubeNotFoundError } from "./lease-lifecycle.js";
+import { ACQUIRE_RELEASE_RESERVE_MS, parseAcquireDeadline, SandboxAcquireDeadlineError } from "./acquire-deadline.js";
+import { assertCreationCleanupOwnership, createAttemptLabels, inspectCreation } from "./creation-recovery.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -401,6 +405,8 @@ const plugin = definePlugin({
       executionWorkspaceSettings?: Record<string, unknown> | null;
       // Newer hosts say whether the lease is for a run or a login.
       purpose?: "run" | "login";
+      // Newer hosts say when they stop waiting for this call.
+      acquireDeadlineAt?: string;
     },
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
@@ -462,12 +468,17 @@ const plugin = definePlugin({
 
     // TODO: use params.runId as stand-in for agentId in labels; future
     // versions will have a dedicated agentId on AcquireLeaseParams.
-    const labels = paperclipLabels({
-      runId: params.runId,
-      agentId: params.runId,
-      companyId: params.companyId,
-      adapterType: effectiveAdapterType,
-    });
+    const labels = {
+      ...paperclipLabels({
+        runId: params.runId,
+        agentId: params.runId,
+        companyId: params.companyId,
+        adapterType: effectiveAdapterType,
+      }),
+      // The host's creation intent. If this acquire fails before the host
+      // records a lease, its creation recovery finds the workload by this id.
+      ...createAttemptLabels(params.creationOperationId),
+    };
 
     const image = resolveImage(
       { imageOverride: null },
@@ -509,127 +520,159 @@ const plugin = definePlugin({
           imagePullSecrets: config.imagePullSecrets,
         });
 
-    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
-    const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
-    // The adapter's sign-in hosts join this run's scoped policy in cilium mode,
-    // where FQDN rules are enforced (standard mode cannot enforce them; see
-    // validateConfig). The sandbox-provider acquire does not say whether a lease
-    // is for a login, so they apply unless the host says the lease is a run.
-    const loginAllowFqdns =
-      config.egressMode === "cilium" && params.purpose !== "run" ? adapterDefaults.loginAllowFqdns ?? [] : [];
-    const scopedPolicyGrant = {
-      allowFqdns: [...new Set([...scopedNetworkEgress.allowFqdns, ...loginAllowFqdns])],
-      allowCidrs: scopedNetworkEgress.allowCidrs,
-    };
-    const scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
-      {
-        clients,
-        namespace,
-        mode: config.egressMode,
-        runId: params.runId,
-        workloadName: jobName,
-        ownerReference: {
-          apiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
-          kind: isSandboxCrBackend ? "Sandbox" : "Job",
-          name: jobName,
-          uid: ownerUid,
-          controller: false,
-          blockOwnerDeletion: false,
-        },
-        grant: scopedPolicyGrant,
-      },
-      () => orchestrator.release(clients, namespace, jobName),
-    );
-
-    // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
-    // the process-env secrets named by envKeys override it.
-    const adapterEnv = buildAdapterEnv(adapterDefaults);
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_POLICY = "kubernetes-default-deny";
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
-    const bootstrapToken = generateBootstrapToken();
-
-    // Secret ownerRef: for job backend, the Job owns the Secret (cascade delete).
-    // For sandbox-cr backend, the Sandbox CR owns the Secret.
-    // NOTE: For sandbox-cr, if the Secret outlives the Sandbox due to a cluster
-    // quirk, the release() call will still clean it up via namespace GC or
-    // explicit delete in a future iteration.
-    await createPerRunSecret(clients, {
-      namespace,
-      secretName,
-      runId: params.runId,
-      ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
-      ownerName: jobName,
-      ownerUid,
-      bootstrapToken,
-      adapterEnv,
-    });
-
-    // A Sandbox lease is usable once its pod can take an exec. Wait for that
-    // here, on a start-up budget of its own, so a cold image pull or slow
-    // scheduling never eats the first command's timeout (a 15 s setup probe
-    // lost that race on every node without the image cached). A Sandbox that
-    // fails or never becomes Ready is released rather than handed out.
-    if (isSandboxCrBackend) {
-      try {
-        await sandboxCrOrchestrator.waitForCompletion(clients, namespace, jobName, {
-          timeoutMs: config.podStartTimeoutSec * 1000,
-          pollMs: 1000,
-        });
-      } catch (readyError) {
-        try {
-          await orchestrator.release(clients, namespace, jobName);
-        } catch (releaseError) {
-          throw new AggregateError(
-            [readyError, releaseError],
-            "Sandbox did not become Ready and could not be released",
-          );
-        }
-        throw readyError;
-      }
-      readySandboxesByLease.add(jobName);
+    // The host discards our answer after acquireDeadlineAt. Do not create a
+    // Sandbox we cannot hand out in time: nobody would ever release it.
+    const acquireDeadlineMs = parseAcquireDeadline(params.acquireDeadlineAt);
+    if (acquireDeadlineMs !== null && acquireDeadlineMs - Date.now() <= ACQUIRE_RELEASE_RESERVE_MS) {
+      throw new SandboxAcquireDeadlineError(namespace, jobName, "before the Sandbox was created");
     }
 
-    const podName = await orchestrator.findPod(clients, namespace, jobName);
+    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
+    // From here on the workload exists. Any failure deletes it before the
+    // error leaves this call: a failed acquire returns no lease, so nothing
+    // else would ever release it, and its pod would hold a quota slot.
+    try {
+      const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
+      // The adapter's sign-in hosts join this run's scoped policy in cilium mode,
+      // where FQDN rules are enforced (standard mode cannot enforce them; see
+      // validateConfig). The sandbox-provider acquire does not say whether a lease
+      // is for a login, so they apply unless the host says the lease is a run.
+      const loginAllowFqdns =
+        config.egressMode === "cilium" && params.purpose !== "run" ? adapterDefaults.loginAllowFqdns ?? [] : [];
+      const scopedPolicyGrant = {
+        allowFqdns: [...new Set([...scopedNetworkEgress.allowFqdns, ...loginAllowFqdns])],
+        allowCidrs: scopedNetworkEgress.allowCidrs,
+      };
+      const scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
+        {
+          clients,
+          namespace,
+          mode: config.egressMode,
+          runId: params.runId,
+          workloadName: jobName,
+          ownerReference: {
+            apiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
+            kind: isSandboxCrBackend ? "Sandbox" : "Job",
+            name: jobName,
+            uid: ownerUid,
+            controller: false,
+            blockOwnerDeletion: false,
+          },
+          grant: scopedPolicyGrant,
+        },
+        () => orchestrator.release(clients, namespace, jobName),
+      );
 
-    const leaseMetadata: KubernetesLeaseMetadata = {
-      namespace,
-      jobName,
-      podName,
-      secretName,
-      phase: "Pending",
-      backend: config.backend,
-      scopedNetworkPolicyName,
-      scopedNetworkEgress,
-      // Native file sync streams over a pod exec; only the sandbox-cr backend
-      // exposes one. Flag the job backend so the server keeps the base64 fallback
-      // rather than routing its sync to a hook that would reject immediately.
-      nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
-    };
+      // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
+      // the process-env secrets named by envKeys override it.
+      const adapterEnv = buildAdapterEnv(adapterDefaults);
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_POLICY = "kubernetes-default-deny";
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
+      const bootstrapToken = generateBootstrapToken();
 
-    // Only the Sandbox shutdown time is an absolute, controller-enforced
-    // deadline. A Job's activeDeadlineSeconds counts from when it starts, so a
-    // job lease attests no expiry and a caller with a deadline fails closed.
-    const attestedExpiresAt =
-      isSandboxCrBackend && shutdown.requested ? new Date(shutdown.shutdownMs).toISOString() : undefined;
-    loginPtySessions.rememberLease({
-      providerLeaseId: jobName,
-      companyId: params.companyId,
-      environmentId: params.environmentId,
-      config,
-      namespace,
-      podName,
-      backend: config.backend,
-      expiresAtMs: isSandboxCrBackend ? shutdown.shutdownMs : null,
-    });
+      // Secret ownerRef: for job backend, the Job owns the Secret (cascade delete).
+      // For sandbox-cr backend, the Sandbox CR owns the Secret.
+      // NOTE: For sandbox-cr, if the Secret outlives the Sandbox due to a cluster
+      // quirk, the release() call will still clean it up via namespace GC or
+      // explicit delete in a future iteration.
+      await createPerRunSecret(clients, {
+        namespace,
+        secretName,
+        runId: params.runId,
+        ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
+        ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1beta1" : "batch/v1",
+        ownerName: jobName,
+        ownerUid,
+        bootstrapToken,
+        adapterEnv,
+      });
 
-    return {
-      providerLeaseId: jobName,
-      metadata: leaseMetadata as unknown as Record<string, unknown>,
-      ...(attestedExpiresAt ? { expiresAt: attestedExpiresAt } : {}),
-    };
+      // A Sandbox lease is usable once its pod can take an exec. Wait for that
+      // here, on a start-up budget of its own, so a cold image pull or slow
+      // scheduling never eats the first command's timeout (a 15 s setup probe
+      // lost that race on every node without the image cached). A Sandbox that
+      // fails or never becomes Ready is released rather than handed out.
+      //
+      // The wait also ends before the host's acquire deadline, keeping enough of
+      // it to delete the Sandbox. Past that deadline the host has already failed
+      // the run, and a Sandbox that turned Ready then would run attached to
+      // nothing.
+      if (isSandboxCrBackend) {
+        const startBudgetMs = config.podStartTimeoutSec * 1000;
+        const deadlineBudgetMs = acquireDeadlineMs === null
+          ? null
+          : acquireDeadlineMs - Date.now() - ACQUIRE_RELEASE_RESERVE_MS;
+        if (deadlineBudgetMs !== null && deadlineBudgetMs <= 0) {
+          throw new SandboxAcquireDeadlineError(namespace, jobName, "before its pod could start");
+        }
+        const readyTimeoutMs = deadlineBudgetMs === null ? startBudgetMs : Math.min(startBudgetMs, deadlineBudgetMs);
+        try {
+          await sandboxCrOrchestrator.waitForCompletion(clients, namespace, jobName, {
+            timeoutMs: readyTimeoutMs,
+            pollMs: 1000,
+          });
+        } catch (readyError) {
+          throw readyError instanceof SandboxCrTimeoutError && readyTimeoutMs < startBudgetMs
+            ? new SandboxAcquireDeadlineError(namespace, jobName, "before its pod became Ready", readyError)
+            : readyError;
+        }
+        readySandboxesByLease.add(jobName);
+      }
+
+      const podName = await orchestrator.findPod(clients, namespace, jobName);
+
+      const leaseMetadata: KubernetesLeaseMetadata = {
+        namespace,
+        jobName,
+        podName,
+        secretName,
+        phase: "Pending",
+        backend: config.backend,
+        scopedNetworkPolicyName,
+        scopedNetworkEgress,
+        // Native file sync streams over a pod exec; only the sandbox-cr backend
+        // exposes one. Flag the job backend so the server keeps the base64 fallback
+        // rather than routing its sync to a hook that would reject immediately.
+        nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
+      };
+
+      // Only the Sandbox shutdown time is an absolute, controller-enforced
+      // deadline. A Job's activeDeadlineSeconds counts from when it starts, so a
+      // job lease attests no expiry and a caller with a deadline fails closed.
+      const attestedExpiresAt =
+        isSandboxCrBackend && shutdown.requested ? new Date(shutdown.shutdownMs).toISOString() : undefined;
+      loginPtySessions.rememberLease({
+        providerLeaseId: jobName,
+        companyId: params.companyId,
+        environmentId: params.environmentId,
+        config,
+        namespace,
+        podName,
+        backend: config.backend,
+        expiresAtMs: isSandboxCrBackend ? shutdown.shutdownMs : null,
+      });
+
+      return {
+        providerLeaseId: jobName,
+        metadata: leaseMetadata as unknown as Record<string, unknown>,
+        ...(attestedExpiresAt ? { expiresAt: attestedExpiresAt } : {}),
+      };
+    } catch (acquireError) {
+      readySandboxesByLease.delete(jobName);
+      try {
+        await orchestrator.release(clients, namespace, jobName);
+      } catch (releaseError) {
+        if (!isKubeNotFoundError(releaseError)) {
+          throw new AggregateError(
+            [acquireError, releaseError],
+            "Sandbox lease could not be acquired and its workload could not be released",
+          );
+        }
+      }
+      throw acquireError;
+    }
   },
 
   async onEnvironmentResumeLease(
@@ -801,6 +844,32 @@ const plugin = definePlugin({
     });
   },
 
+  async onEnvironmentInspectLease(
+    params: PluginEnvironmentInspectLeaseParams,
+  ): Promise<PluginEnvironmentLeaseObservation> {
+    // Only creation recovery is answered: is there a workload an acquire with
+    // this attempt id created and nobody released? Any other inspection reports
+    // "unknown", so it never counts as proof that a lease's resources are gone.
+    if (params.creationOperation === undefined) {
+      return { providerLeaseId: params.providerLeaseId, state: "unknown" };
+    }
+    const config = kubernetesProviderConfigSchema.parse(params.config);
+    const namespace = deriveTenantNamespace(config, params.companyId);
+    const kc = createKubeConfig({ inCluster: config.inCluster, kubeconfig: config.kubeconfig });
+    const cleanup = await inspectCreation({
+      clients: makeKubeClients(kc),
+      kc,
+      namespace,
+      backend: config.backend,
+      companyId: params.companyId,
+      environmentId: params.environmentId,
+      creationOperation: params.creationOperation,
+    });
+    return cleanup
+      ? { providerLeaseId: cleanup.providerLeaseId, state: "active", creationCleanup: cleanup }
+      : { providerLeaseId: params.providerLeaseId, state: "unknown" };
+  },
+
   async onEnvironmentDestroyLease(
     params: PluginEnvironmentDestroyLeaseParams,
   ): Promise<PluginEnvironmentTerminationReceipt | void> {
@@ -835,6 +904,19 @@ const plugin = definePlugin({
       kubeconfig: config.kubeconfig,
     });
     const clients = makeKubeClients(kc);
+
+    // A lease built from a failed creation names the workload by the cleanup
+    // envelope inspection returned. Delete it only while it still carries that
+    // attempt's labels.
+    if (params.leaseMetadata?.failedCreateCleanup !== undefined) {
+      const cleanup = readEnvironmentCreationCleanupError({ data: {
+        schema: "paperclip/environment-creation-cleanup/v1", cleanup: params.leaseMetadata.failedCreateCleanup,
+      } });
+      if (!cleanup || cleanup.providerLeaseId !== params.providerLeaseId || cleanup.companyId !== params.companyId) {
+        throw new Error("Creation cleanup ownership is invalid");
+      }
+      await assertCreationCleanupOwnership(clients, namespace, leaseBackend, cleanup);
+    }
 
     // Forcibly delete everything acquireLease created (Sandbox CR / Job, pod,
     // per-run Secret). 404s are success — destroy must be idempotent.

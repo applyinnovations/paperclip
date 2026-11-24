@@ -336,6 +336,52 @@ describe("durable sandbox creation through the runtime entry point", () => {
     await expect(acquire()).rejects.toThrow("requires reconciliation"); expect(creates).toBe(1);
   });
 
+  describe("after an acquire fails on a live server", () => {
+    // The host gave up on the provider call (RPC timeout, provider error) and
+    // failed the run. No lease points at what the provider made, so nothing
+    // else would release it.
+    const inspections = () => vi.mocked(workers.call).mock.calls.filter(value => value[1] === "environmentInspectLease");
+
+    it("deletes the sandbox shortly after, not at the settle deadline", async () => {
+      loseReply = true;
+      const before = Date.now();
+      await expect(acquire()).rejects.toThrow("Lost provider reply");
+      const [operation] = await db.select().from(sandboxCreationOperations);
+      expect(operation).toMatchObject({ state: "pending", metadata: expect.objectContaining({ creationFailed: true }) });
+      expect(operation!.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 60_000);
+      expect(operation!.nextAttemptAt.getTime()).toBeLessThanOrEqual(Date.now() + 60_000);
+      expect(await nextEnvironmentCleanupAt(db)).toBe(operation!.nextAttemptAt.getTime());
+
+      // Not before the recheck delay: the provider may still be finishing.
+      await runtime().flushDeferredOrphanCleanups();
+      expect(inspections()).toHaveLength(0);
+
+      await due(); await runtime().flushDeferredOrphanCleanups();
+      const [lease] = await db.select().from(environmentLeases);
+      expect(lease).toMatchObject({ status: "pending_cleanup", companyId, providerLeaseId: resources.get(operation!.id),
+        failureReason: "interrupted_sandbox_creation" });
+      await runtime().retryPendingSandboxTeardown({ environment: null, lease: (await environmentService(db).getLeaseById(lease!.id))! });
+      expect(resources.size).toBe(0); expect(destroys).toBe(1); expect(creates).toBe(1);
+    });
+
+    it("keeps looking until the settle deadline when the provider shows nothing yet", async () => {
+      loseReply = true;
+      await expect(acquire()).rejects.toThrow("Lost provider reply");
+      const [operation] = await db.select().from(sandboxCreationOperations);
+      const resource = resources.get(operation!.id)!;
+      resources.delete(operation!.id); // Not materialized at the provider yet.
+      await due(); await runtime().flushDeferredOrphanCleanups();
+      expect(inspections()).toHaveLength(1);
+      const [pending] = await db.select().from(sandboxCreationOperations);
+      expect(pending).toMatchObject({ state: "pending" });
+      expect(pending!.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+      // A late allocation is still found and removed.
+      resources.set(operation!.id, resource);
+      await due(); await runtime().flushDeferredOrphanCleanups();
+      expect(await db.select().from(environmentLeases)).toEqual([expect.objectContaining({ status: "pending_cleanup", providerLeaseId: resource })]);
+    });
+  });
+
   describe("after the creating server exits mid-acquire", () => {
     async function exitedPid(): Promise<number> {
       const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
@@ -346,6 +392,12 @@ describe("durable sandbox creation through the runtime entry point", () => {
     async function interruptedCreation(controller: (current: Record<string, unknown>) => Promise<Record<string, unknown>>) {
       loseReply = true;
       await expect(acquire()).rejects.toThrow("Lost provider reply");
+      const [failed] = await db.select().from(sandboxCreationOperations);
+      // A server that exits mid-acquire never sees the call fail, so the intent
+      // keeps the state it was written with: no failure mark, the settle deadline.
+      const { creationFailed: _failed, ...metadata } = failed!.metadata;
+      await db.update(sandboxCreationOperations).set({ metadata, nextAttemptAt: new Date(String(metadata.creationSettleAt)) })
+        .where(eq(sandboxCreationOperations.id, failed!.id));
       const [operation] = await db.select().from(sandboxCreationOperations);
       expect(operation).toMatchObject({ state: "pending" });
       expect(operation!.nextAttemptAt.getTime()).toBeGreaterThan(Date.now() + 25 * 60_000);

@@ -46,6 +46,7 @@ const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
 );
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
 const EXECUTE_LOG_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-execute-log.cjs");
+const ACQUIRE_DEADLINE_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-acquire-deadline.cjs");
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -78,6 +79,32 @@ describe("worker configuration completion", () => {
       await manager.call("test.plugin", "configChanged", { companyId: "company-1", config: {} });
       expect(applied).toHaveBeenCalledTimes(1);
     } finally { unsubscribe(); await manager.stopAll(); }
+  });
+});
+
+describe("environmentAcquireLease deadline", () => {
+  // The host abandons an acquire when its RPC timer fires. The provider is told
+  // when, so it can delete what it created instead of finishing for nobody.
+  it("sends the provider the time the host stops waiting, and only on acquire", async () => {
+    const manager = createPluginWorkerManager();
+    try {
+      await manager.startWorker("test.plugin", {
+        entrypointPath: ACQUIRE_DEADLINE_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+        instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
+      });
+      const before = Date.now();
+      const lease = await manager.call("test.plugin", "environmentAcquireLease",
+        { driverKey: "fixture", companyId: "company-1", environmentId: "env-1", runId: "run-1", config: {} } as never, 45_000) as
+        { metadata: { received: { acquireDeadlineAt?: string; runId: string } } };
+      const deadline = Date.parse(lease.metadata.received.acquireDeadlineAt!);
+      expect(lease.metadata.received.runId).toBe("run-1");
+      expect(deadline).toBeGreaterThanOrEqual(before + 45_000);
+      expect(deadline).toBeLessThanOrEqual(Date.now() + 45_000);
+
+      const executed = await manager.call("test.plugin", "environmentExecute", { command: "true" } as never) as
+        { metadata: { received: Record<string, unknown> } };
+      expect(executed.metadata.received).not.toHaveProperty("acquireDeadlineAt");
+    } finally { await manager.stopAll(); }
   });
 });
 

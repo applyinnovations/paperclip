@@ -153,6 +153,16 @@ Pod                pc-{ulid}-{podSuffix}           (owned by Job; cascade-delete
 Secret             pc-{ulid}-env                   (owned by Job; cascade-deleted)
 ```
 
+Each workload carries `paperclip.io/run-id`, `paperclip.io/company-id` and, on newer servers, `paperclip.io/create-attempt` (the server's creation intent).
+
+### When an acquire fails
+
+A failed acquire hands no lease to the server, so nothing would ever release its workload. Its pod would hold a `paperclip-quota` slot until the Sandbox's `shutdownTime`. Three things prevent that:
+
+- **Deleted on failure.** Once the Sandbox (or Job) exists, any later failure in the acquire deletes it before the error is returned.
+- **Bounded by the server's deadline.** Newer servers send `acquireDeadlineAt`, the time their `environmentAcquireLease` RPC gives up. The readiness wait ends 5 s before it, so the provider has time to delete the Sandbox and answer. A Sandbox is not created at all when less than 5 s is left. The wait is the earlier of this and `podStartTimeoutSec`.
+- **Creation recovery.** The driver declares `creationOperationVersion: 1`. About a minute after a failed acquire, the server asks `onEnvironmentInspectLease` for the workload labelled with that attempt. The provider checks the run and company labels, returns a cleanup envelope, and the server deletes the workload through `onEnvironmentDestroyLease`. Destroy checks the labels again first. This also covers a server that exits mid-acquire. Any other inspection returns `unknown`.
+
 ## Security baseline
 
 Every agent pod is:

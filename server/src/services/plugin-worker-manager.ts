@@ -3650,6 +3650,11 @@ export function createPluginWorkerHandle(
           } });
       }
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
+      // The acquire RPC is abandoned when this timer fires; tell the provider
+      // when, so it cannot finish creating a sandbox nobody is waiting for.
+      const requestParams = method === "environmentAcquireLease" && isRecord(params)
+        ? { ...params, acquireDeadlineAt: new Date(Date.now() + timeout).toISOString() }
+        : params;
       const invocationScope = deriveInvocationScope(method, params);
       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
       if (invocation && startupContextId) activeInvocations.get(invocation.id)!.startupContextId = startupContextId;
@@ -3708,7 +3713,7 @@ export function createPluginWorkerHandle(
 
       try {
         const request = {
-          ...createRequest(method, params, id),
+          ...createRequest(method, requestParams, id),
           ...(invocation ? { paperclipInvocation: invocation } : {}),
         };
         sendMessage(request);
