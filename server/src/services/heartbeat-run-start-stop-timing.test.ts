@@ -40,7 +40,7 @@ function row(overrides: Partial<Row> = {}): Row {
     createdAt: at(0), startedAt: at(1_000), finishedAt: at(60_000),
     contextSnapshot: {
       issueId: "issue-1",
-      paperclipWorkspace: { repoUrl: "https://github.com/applyinnovations/paperclip.git" },
+      paperclipWorkspace: { repoUrl: "https://github.com/example-org/paperclip.git" },
       paperclipEnvironment: { driver: "kubernetes" },
     },
     agentName: "Engineer", adapterType: "claude_local",
@@ -107,7 +107,7 @@ describe("heartbeat run start/stop timing", () => {
     };
     expect(buildHeartbeatRunStartStopTiming(row(), { name: "Engineer", adapterType: "claude_local" }, marks)).toEqual({
       runId: "run-1", agentId: "agent-1", agentName: "Engineer", companyId: "company-1", issueId: "issue-1",
-      repository: "applyinnovations/paperclip", adapter: "claude_local", environmentDriver: "kubernetes",
+      repository: "example-org/paperclip", adapter: "claude_local", environmentDriver: "kubernetes",
       outcome: "succeeded", status: "succeeded", errorCode: null, failedStep: null,
       queueMs: 1_000, leaseMs: 10_000, prepareMs: 4_000, syncInMs: 5_000, providerStartMs: 5_000,
       timeToFirstOutputMs: 25_000, agentMs: 25_000, syncOutMs: 4_000, finalizeMs: 6_000, totalMs: 60_000,
@@ -194,10 +194,10 @@ describe("heartbeat run start/stop timing", () => {
   });
 
   it("reads owner/name from https, ssh and scp-like remotes", () => {
-    expect(repositoryFromRepoUrl("https://github.com/applyinnovations/paperclip")).toBe("applyinnovations/paperclip");
-    expect(repositoryFromRepoUrl("https://github.com/applyinnovations/paperclip.git/")).toBe("applyinnovations/paperclip");
-    expect(repositoryFromRepoUrl("git@github.com:applyinnovations/deployments.git")).toBe("applyinnovations/deployments");
-    expect(repositoryFromRepoUrl("ssh://git@github.com/applyinnovations/paperclip.git")).toBe("applyinnovations/paperclip");
+    expect(repositoryFromRepoUrl("https://github.com/example-org/paperclip")).toBe("example-org/paperclip");
+    expect(repositoryFromRepoUrl("https://github.com/example-org/paperclip.git/")).toBe("example-org/paperclip");
+    expect(repositoryFromRepoUrl("git@github.com:example-org/deployments.git")).toBe("example-org/deployments");
+    expect(repositoryFromRepoUrl("ssh://git@github.com/example-org/paperclip.git")).toBe("example-org/paperclip");
     expect(repositoryFromRepoUrl("not a url")).toBeNull();
     expect(repositoryFromRepoUrl(null)).toBeNull();
   });
