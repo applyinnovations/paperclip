@@ -31,7 +31,9 @@
  * window. Secret files land at their requested `mode` with no world-readable
  * window (the staging dir is created `0700` and each file is `chmod`ed before
  * the rename). All interpolated paths are single-quoted. Sandbox-authored
- * tarballs (outbound) are member-confined before host extraction.
+ * tarballs (outbound) are member-confined before host extraction; an absolute
+ * symlink into the synced directory is rewritten relative, and a symlink that
+ * escapes it is dropped and reported in the result's `warnings`.
  *
  * Memory + disk posture: because the archive streams to/from disk, a transfer of
  * any size keeps host and pod memory flat — there is no whole-payload buffer and
@@ -362,14 +364,53 @@ export function splitLinkEntryOnce(field: string, delimiter: string): { name: st
 }
 
 /**
- * Reject a sandbox-authored tarball before extraction if any member would land
- * outside the extraction dir. The archive is produced by the (untrusted) sandbox,
- * so host-side `tar -xf` must never be handed an archive whose entries carry
- * absolute paths or `../` traversal, nor a symlink/hardlink member whose target
- * escapes the tree. Legitimate in-tree relative links are preserved. Parses the
- * `-tvf` verbose listing; any unparseable line fails closed.
+ * How a sandbox-authored symlink member is materialized on the host. Relative
+ * links that stay inside the archive are kept as-is. An absolute link whose
+ * target lies inside the archive's sandbox root (`archiveRoot`, the directory
+ * that was tarred) is the same link written as a sandbox path — it is rewritten
+ * to the equivalent relative link. Anything else points outside what was synced
+ * and is dropped with a warning instead of failing the whole transfer.
  */
-async function assertTarballEntriesConfined(archivePath: string, rejectSpecialModes = false): Promise<void> {
+type SymlinkDisposition =
+  | { action: "keep" }
+  | { action: "rewrite"; target: string }
+  | { action: "drop" };
+
+function classifySymlink(memberName: string, linkTarget: string, archiveRoot: string | undefined): SymlinkDisposition {
+  if (!path.posix.isAbsolute(linkTarget)) {
+    return posixPathEscapes(path.posix.join(path.posix.dirname(memberName), linkTarget)) ? { action: "drop" } : { action: "keep" };
+  }
+  if (archiveRoot === undefined) return { action: "drop" };
+  const root = path.posix.normalize(archiveRoot).replace(/\/+$/, "") || "/";
+  const target = path.posix.normalize(linkTarget);
+  const inside = path.posix.relative(root, target);
+  if (inside.length > 0 && (inside === ".." || inside.startsWith("../") || path.posix.isAbsolute(inside))) {
+    return { action: "drop" };
+  }
+  const linkDir = path.posix.join(root, path.posix.dirname(memberName));
+  const relative = path.posix.relative(linkDir, target) || ".";
+  // Defense in depth: the rewritten link must itself stay inside the archive.
+  if (posixPathEscapes(path.posix.join(path.posix.dirname(memberName), relative))) return { action: "drop" };
+  return { action: "rewrite", target: relative };
+}
+
+/**
+ * Validate a sandbox-authored tarball before extraction. The archive is produced
+ * by the (untrusted) sandbox, so host-side `tar -xf` must never be handed an
+ * archive whose entries carry absolute paths or `../` traversal, nor a hardlink
+ * whose target escapes the tree. Symlinks are classified by `classifySymlink`;
+ * the names of links that need a host-side rewrite or drop are returned so
+ * `repairExtractedSymlinks` can fix them after extraction. A member that would
+ * be written THROUGH such a link fails closed — a real `tar -c` never emits
+ * one, so it is not a leftover. Exact-copy (`rejectSpecialModes`) transfers
+ * keep the old fail-closed behavior: they promise a byte-identical tree.
+ * Parses the `-tvf` verbose listing; any unparseable line fails closed.
+ */
+async function assertTarballEntriesConfined(
+  archivePath: string,
+  rejectSpecialModes = false,
+  archiveRoot?: string,
+): Promise<string[]> {
   // Validate the same raw `._*` members the preserving extractor will write.
   const rawMacEntries = rejectSpecialModes && process.platform === "darwin"
     && (await execFileAsync("tar", ["--version"])).stdout.includes("bsdtar");
@@ -378,6 +419,9 @@ async function assertTarballEntriesConfined(archivePath: string, rejectSpecialMo
     maxBuffer: 64 * 1024 * 1024,
   });
   const lines = stdout.split("\n").filter((line) => line.trim().length > 0);
+  const memberNames: string[] = [];
+  const repairs = new Set<string>();
+  const hardlinks: { name: string; target: string }[] = [];
   for (const line of lines) {
     const parsed = parseTarVerboseListingLine(line);
     if (!parsed) {
@@ -406,21 +450,81 @@ async function assertTarballEntriesConfined(archivePath: string, rejectSpecialMo
     if (cleanName.length > 0 && posixPathEscapes(cleanName)) {
       throw new Error(`Kubernetes syncOut refusing tarball member that escapes the extraction dir: ${name}`);
     }
-    if (linkTarget !== null) {
-      const resolved = path.posix.join(path.posix.dirname(cleanName), linkTarget);
-      if (path.posix.isAbsolute(linkTarget) || posixPathEscapes(resolved)) {
+    if (cleanName.length > 0) memberNames.push(path.posix.normalize(cleanName));
+    if (linkTarget === null) continue;
+    const escapes = path.posix.isAbsolute(linkTarget)
+      || posixPathEscapes(path.posix.join(path.posix.dirname(cleanName), linkTarget));
+    if (typeFlag === "h" || rejectSpecialModes) {
+      // Hardlink targets are archive member names, never sandbox paths, and an
+      // exact-copy transfer cannot change a link: both keep failing closed.
+      if (escapes) {
         throw new Error(
           `Kubernetes syncOut refusing tarball link whose target escapes the extraction dir: ${name} -> ${linkTarget}`,
         );
       }
+      if (typeFlag === "h") hardlinks.push({ name: path.posix.normalize(cleanName), target: path.posix.normalize(linkTarget) });
+      continue;
+    }
+    if (classifySymlink(cleanName, linkTarget, archiveRoot).action !== "keep") {
+      repairs.add(path.posix.normalize(cleanName));
+    }
+  }
+  if (repairs.size === 0) return [];
+  // A hardlink to a repaired symlink would be a second, unrepaired copy of it.
+  for (const link of hardlinks) if (repairs.has(link.target)) repairs.add(link.name);
+  for (const member of memberNames) {
+    for (const link of repairs) {
+      if (member.startsWith(`${link}/`)) {
+        throw new Error(`Kubernetes syncOut refusing tarball member written through a link: ${member}`);
+      }
+    }
+  }
+  return [...repairs];
+}
+
+/**
+ * Rewrite or drop the extracted symlinks `assertTarballEntriesConfined`
+ * flagged. The decision is re-made from what is on disk (a later archive member
+ * may have replaced the link), so no absolute or escaping link survives. A
+ * flagged path that cannot be found fails closed rather than leaving an
+ * unrepaired link behind (e.g. a name the listing printed escaped).
+ */
+async function repairExtractedSymlinks(input: {
+  localDir: string;
+  names: string[];
+  archiveRoot: string | undefined;
+  warnings: string[];
+}): Promise<void> {
+  for (const name of input.names) {
+    const hostPath = path.join(input.localDir, ...name.split("/"));
+    const stats = await fs.lstat(hostPath).catch(() => null);
+    if (!stats) throw new Error(`Kubernetes syncOut could not locate extracted link to repair: ${name}`);
+    if (!stats.isSymbolicLink()) continue;
+    const target = await fs.readlink(hostPath);
+    const disposition = classifySymlink(name, target, input.archiveRoot);
+    if (disposition.action === "keep") continue;
+    await fs.unlink(hostPath);
+    if (disposition.action === "rewrite") {
+      await fs.symlink(disposition.target, hostPath);
+    } else {
+      input.warnings.push(
+        `Workspace sync skipped symlink ${name} -> ${target}: its target is outside the synced directory`,
+      );
     }
   }
 }
 
-async function extractHostTarball(input: { archivePath: string; localDir: string; preserveSourceEntries?: boolean }): Promise<void> {
+async function extractHostTarball(input: {
+  archivePath: string;
+  localDir: string;
+  preserveSourceEntries?: boolean;
+  /** Sandbox path the archive was created from; enables absolute-link rewrite. */
+  archiveRoot?: string;
+  warnings?: string[];
+}): Promise<void> {
   // The archive is sandbox-authored and untrusted: validate every member (and
   // link target) is confined before letting host-side tar write a single byte.
-  await assertTarballEntriesConfined(input.archivePath, input.preserveSourceEntries);
+  const repairs = await assertTarballEntriesConfined(input.archivePath, input.preserveSourceEntries, input.archiveRoot);
   await fs.mkdir(input.localDir, { recursive: true });
   // macOS tar otherwise consumes source files named `._*` as AppleDouble
   // metadata instead of writing their bytes. These are ordinary user entries.
@@ -435,6 +539,14 @@ async function extractHostTarball(input: { archivePath: string; localDir: string
     env: { ...process.env, COPYFILE_DISABLE: "1" },
     maxBuffer: 64 * 1024 * 1024,
   });
+  if (repairs.length > 0) {
+    await repairExtractedSymlinks({
+      localDir: input.localDir,
+      names: repairs,
+      archiveRoot: input.archiveRoot,
+      warnings: input.warnings ?? [],
+    });
+  }
 }
 
 async function countHostFiles(root: string, exclude?: string[]): Promise<number> {
@@ -848,6 +960,7 @@ async function syncOutDirectoryMapping(input: {
   remoteDir: string;
   timeoutMs: number;
   maxOutputBytes: number;
+  warnings: string[];
 }): Promise<{ filesTransferred: number; bytesTransferred: number }> {
   const { exec, mapping, remoteDir, timeoutMs, maxOutputBytes } = input;
   assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
@@ -888,7 +1001,13 @@ async function syncOutDirectoryMapping(input: {
       label: "syncOut directory transfer",
     });
     const bytesTransferred = (await fs.stat(localTar)).size;
-    await extractHostTarball({ archivePath: localTar, localDir: mapping.targetPath, preserveSourceEntries: mapping.preserveSourceEntries });
+    await extractHostTarball({
+      archivePath: localTar,
+      localDir: mapping.targetPath,
+      preserveSourceEntries: mapping.preserveSourceEntries,
+      archiveRoot: mapping.sourcePath,
+      warnings: input.warnings,
+    });
     const filesTransferred = await countHostFiles(mapping.targetPath, mapping.preserveSourceEntries ? undefined : mapping.exclude);
     return { filesTransferred, bytesTransferred };
   });
@@ -903,6 +1022,7 @@ export async function performSyncOut(input: {
 }): Promise<PluginEnvironmentSyncResult> {
   const maxOutputBytes = input.maxOutputBytes ?? MAX_SYNC_OUTPUT_BYTES;
   const operations: PluginEnvironmentSyncResult["operations"] = [];
+  const warnings: string[] = [];
   for (const operation of input.operations) {
     let filesTransferred = 0;
     let bytesTransferred = 0;
@@ -927,6 +1047,7 @@ export async function performSyncOut(input: {
         remoteDir: input.remoteDir,
         timeoutMs: input.timeoutMs,
         maxOutputBytes,
+        warnings,
       });
       filesTransferred += dirResult.filesTransferred;
       bytesTransferred += dirResult.bytesTransferred;
@@ -934,5 +1055,5 @@ export async function performSyncOut(input: {
 
     operations.push({ operationId: operation.operationId, filesTransferred, bytesTransferred });
   }
-  return { operations };
+  return warnings.length > 0 ? { operations, warnings } : { operations };
 }

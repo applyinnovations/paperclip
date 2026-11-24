@@ -634,6 +634,139 @@ describe("kubernetes onEnvironmentSyncOut (native single-exec transfer)", () => 
   });
 });
 
+// A stub exec that streams a pre-built host archive as the pod's tar output, so a
+// test can hand the host extractor an archive a real `tar -c` would never emit.
+function makeArchiveExec(archivePath: string): PodStreamExec {
+  return async (_command, io) => {
+    const bytes = await fs.readFile(archivePath);
+    return await new Promise((resolve, reject) => {
+      const sink = io.stdout;
+      if (!sink) return resolve({ exitCode: 0, stderr: "" });
+      sink.on("error", reject);
+      sink.on("finish", () => resolve({ exitCode: 0, stderr: "" }));
+      sink.end(bytes);
+    });
+  };
+}
+
+function execTar(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("tar", args);
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`tar exited ${code}`))));
+  });
+}
+
+// The pod's pinned descriptor protocol depends on Linux /proc/self/fd.
+describe.skipIf(process.platform !== "linux")("kubernetes onEnvironmentSyncOut symlink handling", () => {
+  it("rewrites an absolute symlink that points inside the synced workspace to the equivalent relative link", async () => {
+    const remoteDir = await makeTmp("k8s-abs-inside-");
+    const hostOut = await makeTmp("k8s-abs-inside-out-");
+    // Mirrors APP-315: a test leftover links to a sibling cache by sandbox path.
+    const cacheFile = path.join(remoteDir, ".tmp-tests/tmplg1ghob1/exports/cache/nix-cache-info");
+    await fs.mkdir(path.dirname(cacheFile), { recursive: true });
+    await fs.writeFile(cacheFile, "StoreDir: /nix/store\n");
+    await fs.mkdir(path.join(remoteDir, ".tmp-tests/tmp.ek0Kd9zpsh/1"), { recursive: true });
+    await fs.symlink(cacheFile, path.join(remoteDir, ".tmp-tests/tmp.ek0Kd9zpsh/1/nix-cache-info"));
+    await fs.symlink(remoteDir, path.join(remoteDir, "root-link"));
+    await fs.writeFile(path.join(remoteDir, "work.txt"), "agent work");
+
+    const { exec } = makeRealExec();
+    const result = await performSyncOut({ exec, remoteDir, timeoutMs: 30_000, operations: [{ operationId: "inside", files: [{
+      kind: "directory", sourcePath: remoteDir, targetPath: hostOut,
+    }] }] });
+
+    expect(result.warnings).toBeUndefined();
+    const link = path.join(hostOut, ".tmp-tests/tmp.ek0Kd9zpsh/1/nix-cache-info");
+    expect(await fs.readlink(link)).toBe("../../tmplg1ghob1/exports/cache/nix-cache-info");
+    expect(await fs.readFile(link, "utf8")).toBe("StoreDir: /nix/store\n");
+    expect(await fs.readlink(path.join(hostOut, "root-link"))).toBe(".");
+    expect(await fs.readFile(path.join(hostOut, "work.txt"), "utf8")).toBe("agent work");
+  });
+
+  it("drops a symlink that truly escapes, reports it as a warning naming the path, and keeps everything else", async () => {
+    const remoteDir = await makeTmp("k8s-escape-");
+    const hostOut = await makeTmp("k8s-escape-out-");
+    const outside = await makeTmp("k8s-escape-outside-");
+    await fs.writeFile(path.join(outside, "secret"), "host secret");
+    await fs.mkdir(path.join(remoteDir, "nested"));
+    await fs.symlink(path.join(outside, "secret"), path.join(remoteDir, "nested/absolute"));
+    await fs.symlink("../../escape", path.join(remoteDir, "nested/relative"));
+    await fs.symlink("../work.txt", path.join(remoteDir, "nested/in-tree"));
+    await fs.writeFile(path.join(remoteDir, "work.txt"), "agent work");
+    await fs.writeFile(path.join(remoteDir, "nested/more.txt"), "more work");
+
+    const { exec } = makeRealExec();
+    const result = await performSyncOut({ exec, remoteDir, timeoutMs: 30_000, operations: [{ operationId: "escape", files: [{
+      kind: "directory", sourcePath: remoteDir, targetPath: hostOut,
+    }] }] });
+
+    expect(result.operations).toEqual([{ operationId: "escape", filesTransferred: expect.any(Number), bytesTransferred: expect.any(Number) }]);
+    expect(result.warnings).toEqual([
+      `Workspace sync skipped symlink nested/absolute -> ${path.join(outside, "secret")}: its target is outside the synced directory`,
+      "Workspace sync skipped symlink nested/relative -> ../../escape: its target is outside the synced directory",
+    ]);
+    await expect(fs.lstat(path.join(hostOut, "nested/absolute"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(path.join(hostOut, "nested/relative"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readlink(path.join(hostOut, "nested/in-tree"))).toBe("../work.txt");
+    expect(await fs.readFile(path.join(hostOut, "work.txt"), "utf8")).toBe("agent work");
+    expect(await fs.readFile(path.join(hostOut, "nested/more.txt"), "utf8")).toBe("more work");
+    expect(await fs.readFile(path.join(outside, "secret"), "utf8")).toBe("host secret");
+  });
+
+  it("drops an absolute link into the workspace that points outside the synced subdirectory", async () => {
+    const remoteDir = await makeTmp("k8s-subdir-");
+    const hostOut = await makeTmp("k8s-subdir-out-");
+    await fs.mkdir(path.join(remoteDir, "artifacts"));
+    await fs.writeFile(path.join(remoteDir, "sibling.txt"), "not synced");
+    await fs.symlink(path.join(remoteDir, "sibling.txt"), path.join(remoteDir, "artifacts/sibling"));
+    await fs.writeFile(path.join(remoteDir, "artifacts/a.txt"), "aaa");
+    await fs.symlink(path.join(remoteDir, "artifacts/a.txt"), path.join(remoteDir, "artifacts/a-link"));
+
+    const { exec } = makeRealExec();
+    const result = await performSyncOut({ exec, remoteDir, timeoutMs: 30_000, operations: [{ operationId: "subdir", files: [{
+      kind: "directory", sourcePath: path.join(remoteDir, "artifacts"), targetPath: hostOut,
+    }] }] });
+
+    expect(result.warnings).toEqual([expect.stringContaining("skipped symlink sibling -> ")]);
+    await expect(fs.lstat(path.join(hostOut, "sibling"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readlink(path.join(hostOut, "a-link"))).toBe("a.txt");
+    expect(await fs.readFile(path.join(hostOut, "a.txt"), "utf8")).toBe("aaa");
+  });
+
+  it("still fails closed on an exact-copy transfer, which cannot change a link", async () => {
+    const remoteDir = await makeTmp("k8s-preserve-link-");
+    const hostOut = await makeTmp("k8s-preserve-link-out-");
+    await fs.writeFile(path.join(remoteDir, "a.txt"), "aaa");
+    await fs.symlink(path.join(remoteDir, "a.txt"), path.join(remoteDir, "abs"));
+    const { exec } = makeRealExec();
+    await expect(performSyncOut({ exec, remoteDir, timeoutMs: 30_000, operations: [{ operationId: "preserve", files: [{
+      kind: "directory", sourcePath: remoteDir, targetPath: hostOut, preserveSourceEntries: true,
+    }] }] })).rejects.toThrow(/link whose target escapes the extraction dir: abs ->/);
+    expect(await fs.readdir(hostOut)).toEqual([]);
+  });
+
+  it("fails closed on an archive that writes a member through an escaping link, touching nothing outside", async () => {
+    const build = await makeTmp("k8s-through-build-");
+    const outside = await makeTmp("k8s-through-outside-");
+    const hostOut = await makeTmp("k8s-through-out-");
+    const linkSide = path.join(build, "link-side"), dirSide = path.join(build, "dir-side");
+    await fs.mkdir(linkSide);
+    await fs.mkdir(path.join(dirSide, "evil"), { recursive: true });
+    await fs.symlink(outside, path.join(linkSide, "evil"));
+    await fs.writeFile(path.join(dirSide, "evil/planted"), "planted");
+    const archive = path.join(build, "crafted.tar");
+    await execTar(["-cf", archive, "-C", linkSide, "evil"]);
+    await execTar(["-rf", archive, "-C", dirSide, "evil/planted"]);
+
+    await expect(performSyncOut({ exec: makeArchiveExec(archive), remoteDir: "/workspace", timeoutMs: 30_000, operations: [{
+      operationId: "through", files: [{ kind: "directory", sourcePath: "/workspace", targetPath: hostOut }],
+    }] })).rejects.toThrow(/member written through a link: evil\/planted/);
+    expect(await fs.readdir(outside)).toEqual([]);
+    expect(await fs.readdir(hostOut)).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Post-upload commands (Phase 3 / Security Conditions C1–C4 + C7). Kubernetes is
 // a native provider, so it EXECUTES an operation's ordered `postUploadCommands`
