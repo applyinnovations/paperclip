@@ -102,4 +102,54 @@ describe("claude_local failure classification precedence", () => {
 
     expect(result.errorCode).toBe("model_not_found");
   });
+
+  it("never classifies an OOM-killed run as claude_auth_required (APP-199)", async () => {
+    const toolOutput = JSON.stringify({
+      type: "user",
+      session_id: "claude-session-1",
+      message: { content: [{ type: "tool_result", content: "Error: not logged in to Claude. Please run /login" }] },
+    });
+    mockExecutionResult({
+      exitCode: 137,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
+        toolOutput,
+      ].join("\n"),
+      stderr: "",
+      pid: 321,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).not.toBe("claude_auth_required");
+  });
+
+  it("never classifies a signal-killed run as claude_auth_required, even with a login prompt on stderr", async () => {
+    mockExecutionResult({
+      exitCode: null,
+      signal: "SIGKILL",
+      timedOut: false,
+      stdout: "",
+      stderr: "Not logged in · Please run /login",
+      pid: 321,
+      startedAt: new Date().toISOString(),
+    } as never);
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).not.toBe("claude_auth_required");
+  });
+
+  it("still reports claude_auth_required for a real CLI login failure", async () => {
+    mockExecutionResult(
+      buildProcResult({ is_error: true, subtype: "success", result: "Not logged in · Please run /login" }),
+    );
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("claude_auth_required");
+  });
 });

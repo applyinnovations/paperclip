@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { emitOnlyTscArgs, lowMemoryTscArgs, runTsc } from "../../scripts/run-tsc.mjs";
+import { cgroupMemoryLimit, emitOnlyTscArgs, lowMemoryTscArgs, runTsc } from "../../scripts/run-tsc.mjs";
 import { STEPS, typecheckLowMemory } from "../../scripts/typecheck-low-memory.mjs";
 import { findServerSource, PREPARE_STEPS, PROJECTS, typecheckTestProjects } from "../../scripts/typecheck-test-projects.mjs";
 import { declarationsConfig, layerConfig, listSourceFiles, planLayers, readImports, typecheckLayers } from "./typecheck-layers.mjs";
@@ -842,9 +842,40 @@ describe("emitOnlyTscArgs", () => {
 });
 
 describe("lowMemoryTscArgs", () => {
+  const GiB = 1024 ** 3;
+
   it("uses one thread only when low-memory mode is on", () => {
-    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "1" })).toEqual(["--singleThreaded"]);
-    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "0" })).toEqual([]);
-    expect(lowMemoryTscArgs({})).toEqual([]);
+    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "1" }, Infinity)).toEqual(["--singleThreaded"]);
+    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "0" }, Infinity)).toEqual([]);
+    expect(lowMemoryTscArgs({}, Infinity)).toEqual([]);
+  });
+
+  it("turns low-memory mode on under a small cgroup memory limit unless the variable says otherwise", () => {
+    expect(lowMemoryTscArgs({}, 6 * GiB)).toEqual(["--singleThreaded"]);
+    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "" }, 6 * GiB)).toEqual(["--singleThreaded"]);
+    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "0" }, 6 * GiB)).toEqual([]);
+    expect(lowMemoryTscArgs({}, 8 * GiB)).toEqual([]);
+    expect(lowMemoryTscArgs({}, 64 * GiB)).toEqual([]);
+  });
+});
+
+describe("cgroupMemoryLimit", () => {
+  const reader = (files) => (file) => {
+    if (!(file in files)) throw Object.assign(new Error(`ENOENT: ${file}`), { code: "ENOENT" });
+    return files[file];
+  };
+
+  it("reads the cgroup v2 limit", () => {
+    expect(cgroupMemoryLimit(reader({ "/sys/fs/cgroup/memory.max": "4294967296\n" }))).toBe(4294967296);
+    expect(cgroupMemoryLimit(reader({ "/sys/fs/cgroup/memory.max": "max\n" }))).toBe(Infinity);
+  });
+
+  it("falls back to cgroup v1 and treats its unlimited value as no limit", () => {
+    expect(cgroupMemoryLimit(reader({ "/sys/fs/cgroup/memory/memory.limit_in_bytes": "6442450944\n" }))).toBe(6442450944);
+    expect(cgroupMemoryLimit(reader({ "/sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712\n" }))).toBe(Infinity);
+  });
+
+  it("reports no limit outside a cgroup", () => {
+    expect(cgroupMemoryLimit(reader({}))).toBe(Infinity);
   });
 });

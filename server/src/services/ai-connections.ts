@@ -1099,6 +1099,50 @@ export function aiConnectionService(db: Db) {
     });
   }
 
+  /**
+   * True unless this is a shared grant whose credential the provider still
+   * accepts. Personal grants, and methods without a usage probe, keep the
+   * existing behaviour: the run's auth failure is enough to revoke.
+   */
+  async function sharedCredentialRejectedByProvider(input: {
+    companyId: string;
+    runId?: string;
+    agentId?: string;
+    attribution: AiConnectionAttribution & { identity: string };
+  }): Promise<boolean> {
+    const { attribution } = input;
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.companyId, input.companyId),
+      eq(connectionGrants.id, attribution.grantId),
+      eq(connectionGrants.connectionId, attribution.connectionId),
+    ));
+    if (!grant || grant.status !== "active" || grant.kind !== "organization") return true;
+    const [connection] = await db.select().from(toolConnections).where(and(
+      eq(toolConnections.companyId, input.companyId),
+      eq(toolConnections.id, attribution.connectionId),
+      eq(toolConnections.connectionPurpose, "ai"),
+    ));
+    if (!connection) return true;
+    const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+    if (!metadata.success || !supportsAiConnectionUsage(metadata.data.provider, metadata.data.method)) return true;
+    let probe: Awaited<ReturnType<typeof probeAiConnectionUsage>>;
+    try {
+      const value = await credential({ connection, grant });
+      probe = await probeAiConnectionUsage(metadata.data, value);
+    } catch (error) {
+      logger.warn({ err: error, grantId: grant.id }, "Shared AI credential verification failed; keeping the grant active");
+      probe = { ...metadata.data, checkedAt: new Date().toISOString(), source: null, planType: null, limits: [], overage: null,
+        status: "error", errorCode: "provider_unavailable", message: "Verification failed" };
+    }
+    if (probe.errorCode === "authentication_required") return true;
+    await logActivity(db, {
+      companyId: input.companyId, actorType: "system", actorId: input.runId ? "heartbeat" : "adapter_test",
+      agentId: input.agentId, runId: input.runId, action: "ai_connection.authentication_failure_unconfirmed",
+      entityType: "tool_connection", entityId: connection.id,
+      details: { provider: attribution.provider, grantId: grant.id, probeStatus: probe.status, probeErrorCode: probe.errorCode ?? null },
+    });
+    return false;
+  }
   /** A late failure must never invalidate credentials that were refreshed or reconnected meanwhile. */
   async function markAuthenticationFailed(input: {
     companyId: string;
@@ -1107,6 +1151,10 @@ export function aiConnectionService(db: Db) {
     runStartedAt: Date;
     attribution: AiConnectionAttribution & { identity: string };
   }) {
+    // One failed run must not take a whole company offline (APP-199). Before
+    // revoking a shared grant, ask the provider whether the credential still
+    // works. Revoke only when the provider also rejects it.
+    if (!await sharedCredentialRejectedByProvider(input)) return;
     return withAccountHomeSecretMutationLock(undefined, input.companyId, async () => {
       let recovered = false;
       await db.transaction(async (tx) => {

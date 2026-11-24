@@ -21,6 +21,23 @@ in the cluster.
 `xlab` is never rebased or force-pushed: every commit that has been deployed
 stays reachable from it.
 
+## Before carrying a change
+
+Every carried patch costs a conflict risk at each upstream intake, so pick the
+lowest layer that solves the problem:
+
+| Layer | Where the change lives | Fork cost |
+| --- | --- | --- |
+| 0 | Outside the fork: the agent runtime image (`xlab-containers`), agent hooks, cluster config (`deployments`), a Paperclip plugin | none |
+| 1 | A small, additive, config-driven seam (an env var or config key, off by default), such as `PAPERCLIP_K8S_DEFAULT_RESOURCES` | one small patch, offered upstream |
+| 2 | A small bug fix in upstream code | one small patch, offered upstream at once |
+| 3 | A redesign of an upstream subsystem | not carried: propose it upstream with our evidence, build it only with upstream's agreement |
+
+A carried change (layers 1 and 2) must be generic: it knows nothing about our
+companies, namespaces or cluster ([fork-guard](#carrying-a-change) enforces part
+of this). Its PATCHES.md row links the upstream PR in *Upstream status*; a row
+still "Not yet offered" when the change merges is a follow-up to offer it.
+
 ## Carrying a change
 
 1. Branch from `xlab` as `feat/<topic>` or `fix/<topic>`; keep one concern per
