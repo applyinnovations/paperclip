@@ -132,6 +132,7 @@ import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { serverDatabaseConnectionBudget } from "./database-connection-budget.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -746,6 +747,13 @@ async function startServerWithDatabaseTeardown(
     await Promise.all([...clients.map((client) => endDatabaseClient(client, 5)), closeLivenessDb(db, 5), closeCheckpointDb(db, 5), closeFileStorageDb(db, 5)]);
   };
   startupDatabase.close = closeDatabaseClients;
+  const connectionBudget = serverDatabaseConnectionBudget(db, pluginMigrationDb);
+  if (connectionBudget) {
+    logger.info(
+      { databaseConnectionBudget: connectionBudget.total, databaseConnectionPools: connectionBudget.pools },
+      `Database connection budget: at most ${connectionBudget.total} connections from this process`,
+    );
+  }
   setSentryRunLinkResolver(createSentryRunLinkResolver(db));
   await migrateCloudConfiguration(db as any);
   await initializeAdapterSettings(db as any);
