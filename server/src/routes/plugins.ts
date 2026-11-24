@@ -44,6 +44,7 @@ import type {
   PaperclipPluginManifestV1,
   PluginBridgeErrorCode,
   PluginLauncherRenderContextSnapshot,
+  PluginConfigManagedWithoutRow,
 } from "@paperclipai/shared";
 import {
   PLUGIN_STATUSES,
@@ -2340,9 +2341,11 @@ export function pluginRoutes(
    * Retrieve the current company-scoped configuration for a plugin.
    *
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
-   * has not yet been configured.
+   * has not yet been configured. A pair PAPERCLIP_PLUGIN_CONFIG_FILE manages
+   * carries `managedBy: "file"`, with or without a stored row (without one,
+   * the response is a `PluginConfigManagedWithoutRow`).
    *
-   * Response: `PluginConfig | null`
+   * Response: `PluginConfig | PluginConfigManagedWithoutRow | null`
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/config", async (req, res) => {
@@ -2358,7 +2361,28 @@ export function pluginRoutes(
 
     const config = await registry.getConfig(plugin.id, companyId);
     const managedBy = configFile?.managedBy(plugin.pluginKey, companyId) ?? null;
-    res.json(config && managedBy ? { ...config, managedBy: managedBy.source } : config);
+    if (!managedBy) {
+      res.json(config);
+      return;
+    }
+    if (config) {
+      res.json({ ...config, managedBy: managedBy.source });
+      return;
+    }
+    // Managed, but the file's entry has not been stored (it failed to apply,
+    // or the file has not been read): still read-only, so the UI never offers
+    // a save the POST route would refuse.
+    const managedWithoutRow: PluginConfigManagedWithoutRow = {
+      id: null,
+      pluginId: plugin.id,
+      companyId,
+      configJson: {},
+      lastError: null,
+      managedBy: managedBy.source,
+      createdAt: null,
+      updatedAt: null,
+    };
+    res.json(managedWithoutRow);
   });
 
   /**

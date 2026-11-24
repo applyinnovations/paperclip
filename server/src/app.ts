@@ -952,9 +952,10 @@ export async function createApp(
     hostServicesDisposers,
   );
   // PAPERCLIP_PLUGIN_CONFIG_FILE (off when unset): plugin config from a file,
-  // applied through the same path as the config API. Read now so the managed
-  // pairs are known before any request; applied before each worker starts
-  // (beforeWorkerStart), after startup, and on file change.
+  // applied through the same path as the config API. Watched first and then
+  // read, so a change during startup is never missed and the managed pairs
+  // are known before any request; applied before each worker starts
+  // (beforeWorkerStart), re-read and applied after startup, and on change.
   const pluginConfigFile = createPluginConfigFileManagerFromEnv(process.env, {
     db,
     deps: {
@@ -962,6 +963,7 @@ export async function createApp(
       restartWorker: (pluginId) => pluginConfigFileLifecycle.restartWorker(pluginId),
     },
   });
+  pluginConfigFile?.watch();
   pluginConfigFile?.load();
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null =
     null;
@@ -1399,12 +1401,10 @@ export async function createApp(
       logger.error({ err }, "Failed to load ready plugins on startup");
     })
     // PAPERCLIP_PLUGIN_CONFIG_FILE: activated plugins got their entries before
-    // their workers started; this applies the rest (installed, not running)
-    // and starts watching the file.
+    // their workers started; this re-reads the file (so nothing that changed
+    // during startup is lost) and applies every installed plugin's entries.
     .then(async () => {
-      if (!pluginConfigFile) return;
-      await pluginConfigFile.applyAll();
-      pluginConfigFile.watch();
+      await pluginConfigFile?.reload();
     });
   app.locals.bundledPluginsStartup = trackIdleWork(bundledPluginsStartup);
   // Manifest ids the managed auto-install list resolves to; the managed

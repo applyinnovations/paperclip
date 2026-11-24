@@ -17,6 +17,7 @@ import type {
   PluginLocalFolderDeclaration,
   PluginRecord,
   PluginConfig,
+  PluginConfigManagedWithoutRow,
   PluginStatus,
 } from "@paperclipai/shared";
 import { api } from "./client";
@@ -354,12 +355,13 @@ export const pluginsApi = {
    * Fetch the current configuration for a plugin.
    *
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
-   * has not yet been configured.
+   * has not yet been configured. A pair the server manages from its plugin
+   * config file has `managedBy: "file"`, even before it has a stored row.
    *
    * @param pluginId - UUID of the plugin.
    */
   getConfig: (pluginId: string, companyId: string) =>
-    api.get<PluginConfig | null>(`/plugins/${pluginId}/config?companyId=${encodeURIComponent(companyId)}`),
+    api.get<PluginConfig | PluginConfigManagedWithoutRow | null>(`/plugins/${pluginId}/config?companyId=${encodeURIComponent(companyId)}`),
 
   /**
    * Save (create or update) the configuration for a plugin.

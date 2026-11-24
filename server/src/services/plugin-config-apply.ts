@@ -79,6 +79,19 @@ export async function validatePluginConfig(
   return secretRefs;
 }
 
+// One scope refresh (read the rows, then set) at a time per plugin, so a
+// refresh that read the rows before another writer's row can never be the
+// last to set, dropping that writer's company.
+const scopeRefreshes = new Map<string, Promise<void>>();
+function refreshProactiveScopes(pluginId: string, refresh: () => Promise<void>): Promise<void> {
+  const next = (scopeRefreshes.get(pluginId) ?? Promise.resolve()).then(refresh);
+  scopeRefreshes.set(pluginId, next);
+  void next.finally(() => {
+    if (scopeRefreshes.get(pluginId) === next) scopeRefreshes.delete(pluginId);
+  });
+  return next;
+}
+
 /**
  * Validate, persist and deliver a plugin's company-scoped configuration.
  * Throws before writing anything when validation fails. Delivery to the
@@ -101,23 +114,31 @@ export async function applyPluginConfig(
   );
   const row = await registry.upsertConfig(plugin.id, companyId, { companyId, configJson });
 
+  const workerManager = deps.workerManager;
+
+  // Refresh the plugin's authorized proactive company scopes so the
+  // just-configured company can be acted on from proactive loops (e.g. the
+  // chat gateway's notifier drain) without a restart (LOOA-629). The set is
+  // exactly the plugin's configured companies. Done whether or not the worker
+  // runs now: the manager keeps the set for a worker that is stopped or still
+  // starting from an older read of the rows (APP-262).
+  if (workerManager) {
+    await refreshProactiveScopes(plugin.id, async () => {
+      try {
+        const configRows = await registry.listConfigs(plugin.id);
+        workerManager.setProactiveCompanyScopes(plugin.id, configRows.map((r) => r.companyId));
+      } catch {
+        // Non-fatal: the set is rebuilt from the DB on the next worker start.
+      }
+    });
+  }
+
   // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
   // If the worker implements onConfigChanged, send the new config via RPC.
   // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
-  // up the new config on re-initialize. If no worker is running, skip.
-  const workerManager = deps.workerManager;
+  // up the new config on re-initialize. If no worker is running, skip: it
+  // reads the stored config when it starts.
   if (workerManager?.isRunning(plugin.id)) {
-    // Refresh the worker's authorized proactive company scopes so the
-    // just-configured company can be acted on from proactive loops (e.g.
-    // the chat gateway's notifier drain) without requiring a restart
-    // (LOOA-629). The set is exactly the plugin's configured companies.
-    try {
-      const configRows = await registry.listConfigs(plugin.id);
-      workerManager.setProactiveCompanyScopes(plugin.id, configRows.map((r) => r.companyId));
-    } catch {
-      // Non-fatal: the set is rebuilt from the DB on the next worker start.
-    }
-
     try {
       await workerManager.call(plugin.id, "configChanged", { config: configJson, companyId });
     } catch (rpcErr) {

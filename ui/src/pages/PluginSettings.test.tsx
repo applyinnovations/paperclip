@@ -251,6 +251,32 @@ describe("PluginSettings", () => {
     });
   });
 
+  it("renders a file-managed pair with no stored config read-only, without Save", async () => {
+    mockPluginsApi.get.mockResolvedValue(configurablePlugin());
+    mockPluginsApi.getConfig.mockResolvedValue({
+      id: null,
+      pluginId: "plugin-1",
+      companyId: "company-1",
+      configJson: {},
+      lastError: null,
+      managedBy: "file",
+      createdAt: null,
+      updatedAt: null,
+    });
+
+    const root = await renderSettings(container);
+
+    const note = container.querySelector('[data-testid="plugin-config-managed-note"]')?.textContent;
+    expect(note).toContain("PAPERCLIP_PLUGIN_CONFIG_FILE");
+    expect(note).toContain("has not been applied yet");
+    expect(container.textContent).not.toContain("Save Configuration");
+    expect((container.querySelector("input") as HTMLInputElement | null)?.disabled).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("keeps a plugin config the file does not manage editable", async () => {
     mockPluginsApi.get.mockResolvedValue(configurablePlugin());
     mockPluginsApi.getConfig.mockResolvedValue({

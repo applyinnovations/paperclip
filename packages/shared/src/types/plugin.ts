@@ -908,6 +908,24 @@ export interface PluginConfig {
 }
 
 /**
+ * `GET /api/plugins/:pluginId/config` for a (plugin, company) pair that
+ * `PAPERCLIP_PLUGIN_CONFIG_FILE` manages but that has no stored config yet
+ * (its entry has not applied: it failed validation, or the file has not been
+ * read). Read-only like any managed config; there is no row, so no id or
+ * timestamps.
+ */
+export interface PluginConfigManagedWithoutRow {
+  id: null;
+  pluginId: string;
+  companyId: string;
+  configJson: Record<string, never>;
+  lastError: null;
+  managedBy: "file";
+  createdAt: null;
+  updatedAt: null;
+}
+
+/**
  * Company-scoped plugin settings row. This is intentionally generic; plugin
  * features such as local folders live inside `settingsJson` under namespaced
  * keys instead of requiring feature-specific database columns.

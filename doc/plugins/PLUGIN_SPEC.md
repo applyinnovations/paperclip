@@ -1680,7 +1680,9 @@ Unset, nothing changes. Set:
   enabled or restarted; the entry is written before the worker starts, so the
   worker starts with it), and when the file changes. The server watches the
   file's directory, which also sees a ConfigMap's `..data` symlink swap, and
-  re-reads it about 1 s after the last change.
+  re-reads it about 1 s after the last change. The watch starts before the
+  first read, and the file is read again once startup has finished, so a
+  change made while the server starts is not lost.
 - **Only differences are written.** An entry equal to the stored config writes
   nothing and sends no `configChanged`, so restarts are quiet.
 - **Audit.** Each change writes a `plugin.config.updated` activity with actor
@@ -1698,9 +1700,16 @@ Unset, nothing changes. Set:
 - **Read-only when managed.** For a (plugin, company) pair in the file,
   `POST /api/plugins/:pluginId/config` returns 409 and
   `GET /api/plugins/:pluginId/config` returns `managedBy: "file"`; the plugin
-  settings page shows the form read-only. Until the file has been read
-  successfully once, every pair is treated as managed. Pairs not in the file
-  behave as before.
+  settings page shows the form read-only. A managed pair whose entry has not
+  been stored yet (it failed validation) is still read-only: `GET` returns
+  `managedBy: "file"` with `id: null` and an empty `configJson`. Until the
+  file has been read successfully once, every pair is treated as managed.
+  Pairs not in the file behave as before.
+- **Background jobs see the change at once.** Every config write, from the
+  file or the API, refreshes the companies the plugin's worker may act on
+  from proactive (no-invocation) calls such as `ctx.config.get(companyId)` in
+  a job, whether or not the worker is running at that moment; a worker that
+  is starting gets the newer set.
 - **Removing an entry leaves the config.** Deleting a pair from the file stops
   managing it; its stored config stays as it was and becomes editable again.
   Deleting a line must never be a way to remove a policy. To change a config,

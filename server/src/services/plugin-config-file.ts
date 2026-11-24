@@ -112,9 +112,15 @@ export type PluginConfigFileManager = PluginConfigFileManagedCheck & {
   load(): void;
   /** Apply every entry whose plugin is installed. */
   applyAll(): Promise<void>;
+  /** Re-read the file, then apply every entry whose plugin is installed (queued). */
+  reload(): Promise<void>;
   /** Apply one plugin's entries; the loader's `beforeWorkerStart` hook. */
   applyPlugin(plugin: ApplyPluginConfigPlugin): Promise<void>;
-  /** Watch the file's directory and re-read and apply on change, debounced. */
+  /**
+   * Watch the file's directory and re-read and apply on change, debounced.
+   * Call it before `load()`, so a change between the read and the watch
+   * cannot be missed.
+   */
   watch(): void;
   /** Resolves once every queued read and apply has finished. */
   idle(): Promise<void>;
@@ -285,15 +291,19 @@ export function createPluginConfigFileManager(opts: {
     }
   }
 
+  function reload(): Promise<void> {
+    return enqueue(async () => {
+      load();
+      await applyAllNow();
+    });
+  }
+
   function scheduleReload(): void {
     if (closed) return;
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
-      void enqueue(async () => {
-        load();
-        await applyAllNow();
-      });
+      void reload();
     }, debounceMs);
     debounceTimer.unref?.();
   }
@@ -315,6 +325,7 @@ export function createPluginConfigFileManager(opts: {
     },
     load,
     applyAll: () => enqueue(applyAllNow),
+    reload,
     applyPlugin: (plugin) => enqueue(() => applyPluginEntries(plugin)),
     watch() {
       if (watcher || closed) return;

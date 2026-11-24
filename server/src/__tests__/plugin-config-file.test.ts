@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { mkdtempSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,13 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, companies, createDb, pluginConfig, plugins } from "@paperclipai/db";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import {
+  createHostClientHandlers,
+  PLUGIN_RPC_ERROR_CODES,
+  type HostServices,
+  type HostToWorkerMethods,
+} from "@paperclipai/plugin-sdk";
 import { errorHandler } from "../middleware/index.js";
 import { pluginRoutes } from "../routes/plugins.js";
 import {
@@ -18,6 +26,7 @@ import {
   type PluginConfigFileManager,
 } from "../services/plugin-config-file.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { createPluginWorkerManager, type PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -61,6 +70,13 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const GATE_KEY = "acme.approval-gate";
+// Answers a getData call by making a worker→host call; mode "omit" makes it a
+// proactive call (no invocation id), as a background job's would be.
+const PROACTIVE_WORKER_ENTRYPOINT = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "fixtures",
+  "plugin-worker-invocation-scope.cjs",
+);
 const SCHEMA = {
   type: "object",
   properties: {
@@ -144,7 +160,11 @@ describeEmbeddedPostgres("PAPERCLIP_PLUGIN_CONFIG_FILE", () => {
     };
   }
 
-  function startManager(filePath: string, workerManager = fakeWorkerManager()) {
+  function startManager(
+    filePath: string,
+    workerManager: unknown = fakeWorkerManager(),
+    options: { watch?: boolean } = {},
+  ) {
     const manager = createPluginConfigFileManager({
       db,
       filePath,
@@ -152,8 +172,30 @@ describeEmbeddedPostgres("PAPERCLIP_PLUGIN_CONFIG_FILE", () => {
       debounceMs: 50,
     });
     managers.push(manager);
+    // As app.ts does: watch first, then read, so no change falls between.
+    if (options.watch) manager.watch();
     manager.load();
-    return { manager, workerManager };
+    return { manager, workerManager: workerManager as ReturnType<typeof fakeWorkerManager> };
+  }
+
+  /** Kubernetes ConfigMap layout: file -> ..data/file, ..data -> ..<version>/ */
+  function configMapDir() {
+    const filePath = path.join(dir, "plugin-config.json");
+    let current: string | null = null;
+    const publish = (version: string, document: unknown) => {
+      mkdirSync(path.join(dir, version));
+      writeFileSync(path.join(dir, version, "plugin-config.json"), JSON.stringify(document));
+      if (current === null) {
+        symlinkSync(version, path.join(dir, "..data"));
+        symlinkSync(path.join("..data", "plugin-config.json"), filePath);
+      } else {
+        symlinkSync(version, path.join(dir, "..data_tmp"));
+        renameSync(path.join(dir, "..data_tmp"), path.join(dir, "..data"));
+        rmSync(path.join(dir, current), { recursive: true });
+      }
+      current = version;
+    };
+    return { filePath, publish };
   }
 
   function writeConfigFile(document: unknown, name = "plugin-config.json") {
@@ -314,6 +356,167 @@ describeEmbeddedPostgres("PAPERCLIP_PLUGIN_CONFIG_FILE", () => {
     expect((await configRow(plugin.id, companyId))?.configJson).toEqual({ mode: "enforce" });
   });
 
+  it("re-applies a symlink swap made right after the first read, with no later change", async () => {
+    const plugin = await seedPlugin();
+    const companyId = await seedCompany();
+    const { filePath, publish } = configMapDir();
+    publish("..v1", { [GATE_KEY]: { [companyId]: { mode: "shadow" } } });
+
+    // Startup: the file is read before plugins start; the swap lands while
+    // they are starting, and nothing changes after it.
+    const { manager } = startManager(filePath, fakeWorkerManager(), { watch: true });
+    publish("..v2", { [GATE_KEY]: { [companyId]: { mode: "enforce" } } });
+
+    await vi.waitFor(async () => {
+      await manager.idle();
+      expect((await configRow(plugin.id, companyId))?.configJson).toEqual({ mode: "enforce" });
+    }, { timeout: 5_000, interval: 50 });
+    expect(manager.managedBy(GATE_KEY, companyId)).not.toBeNull();
+  });
+
+  it("reload() at the end of startup picks up a change made after the first read", async () => {
+    const plugin = await seedPlugin();
+    const companyId = await seedCompany();
+    const { filePath, publish } = configMapDir();
+    publish("..v1", { [GATE_KEY]: { [companyId]: { mode: "shadow" } } });
+    const { manager } = startManager(filePath); // no watch: no change event at all
+
+    publish("..v2", { [GATE_KEY]: { [companyId]: { mode: "enforce" } } });
+    await manager.reload();
+
+    expect((await configRow(plugin.id, companyId))?.configJson).toEqual({ mode: "enforce" });
+  });
+
+  describe("proactive company scopes", () => {
+    const workerManagers: PluginWorkerManager[] = [];
+
+    afterEach(async () => {
+      for (const workerManager of workerManagers.splice(0)) await workerManager.stopAll();
+    });
+
+    const manifest: PaperclipPluginManifestV1 = {
+      id: GATE_KEY,
+      apiVersion: 1,
+      version: "0.0.1",
+      displayName: GATE_KEY,
+      description: "Test plugin",
+      author: "Acme",
+      categories: ["automation"],
+      capabilities: [],
+      entrypoints: { worker: "./dist/worker.js" },
+    };
+
+    /** What the loader does: read the scope generation, then the rows, then start the worker. */
+    function readStartScopes(workerManager: PluginWorkerManager, pluginId: string) {
+      const generation = workerManager.proactiveScopeGeneration(pluginId);
+      return pluginRegistryService(db).listConfigs(pluginId).then((rows) => ({
+        generation,
+        companyIds: rows.map((row) => row.companyId),
+      }));
+    }
+
+    async function startWorker(
+      workerManager: PluginWorkerManager,
+      pluginId: string,
+      scopes: { generation: number; companyIds: string[] },
+    ) {
+      const registry = pluginRegistryService(db);
+      await workerManager.startWorker(pluginId, {
+        entrypointPath: PROACTIVE_WORKER_ENTRYPOINT,
+        manifest,
+        config: {},
+        instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+        apiVersion: 1,
+        hostHandlers: createHostClientHandlers({
+          pluginId,
+          capabilities: [],
+          services: {
+            config: {
+              get: async ({ companyId }: { companyId?: string }) =>
+                (await registry.getConfig(pluginId, companyId!))?.configJson ?? {},
+            },
+          } as unknown as HostServices,
+        }),
+        proactiveCompanyScopes: scopes.companyIds,
+        proactiveCompanyScopesGeneration: scopes.generation,
+      });
+    }
+
+    /** `ctx.config.get(companyId)` from a background job: no invocation. */
+    function proactiveConfigGet(workerManager: PluginWorkerManager, pluginId: string, companyId: string) {
+      return workerManager.call(pluginId, "getData", {
+        params: { mode: "omit", hostMethod: "config.get", requestedCompanyId: companyId },
+      } as unknown as HostToWorkerMethods["getData"][0]);
+    }
+
+    function realWorkerManager() {
+      const workerManager = createPluginWorkerManager();
+      workerManagers.push(workerManager);
+      return workerManager;
+    }
+
+    it("authorizes a company configured at startup, before the worker starts", async () => {
+      const plugin = await seedPlugin();
+      const companyId = await seedCompany();
+      const workerManager = realWorkerManager();
+      const { manager } = startManager(writeConfigFile({ [GATE_KEY]: { [companyId]: { mode: "shadow" } } }), workerManager);
+
+      await manager.applyPlugin(plugin as never); // beforeWorkerStart
+      await startWorker(workerManager, plugin.id, await readStartScopes(workerManager, plugin.id));
+
+      await expect(proactiveConfigGet(workerManager, plugin.id, companyId)).resolves.toEqual({ mode: "shadow" });
+    });
+
+    it("authorizes a company written between the loader's row read and the worker start", async () => {
+      const plugin = await seedPlugin();
+      const companyId = await seedCompany();
+      const workerManager = realWorkerManager();
+      const { manager } = startManager(writeConfigFile({ [GATE_KEY]: { [companyId]: { mode: "shadow" } } }), workerManager);
+
+      const staleScopes = await readStartScopes(workerManager, plugin.id);
+      expect(staleScopes.companyIds).toEqual([]);
+      await manager.applyAll(); // no worker registered: isRunning is false
+      await startWorker(workerManager, plugin.id, staleScopes);
+
+      await expect(proactiveConfigGet(workerManager, plugin.id, companyId)).resolves.toEqual({ mode: "shadow" });
+    });
+
+    it("a later start from a fresh read uses that read, not an older kept set", async () => {
+      const plugin = await seedPlugin();
+      const companyId = await seedCompany();
+      const workerManager = realWorkerManager();
+      const { manager } = startManager(writeConfigFile({ [GATE_KEY]: { [companyId]: { mode: "shadow" } } }), workerManager);
+      await manager.applyAll();
+      // The row goes away (outside this seam); the next start reads after the kept set.
+      await db.delete(pluginConfig);
+      await startWorker(workerManager, plugin.id, await readStartScopes(workerManager, plugin.id));
+
+      await expect(proactiveConfigGet(workerManager, plugin.id, companyId)).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+      });
+    });
+
+    it("authorizes a company added by a file change, without a worker restart", async () => {
+      const plugin = await seedPlugin();
+      const first = await seedCompany();
+      const added = await seedCompany();
+      const workerManager = realWorkerManager();
+      const filePath = writeConfigFile({ [GATE_KEY]: { [first]: { mode: "shadow" } } });
+      const { manager } = startManager(filePath, workerManager);
+      await manager.applyPlugin(plugin as never);
+      await startWorker(workerManager, plugin.id, await readStartScopes(workerManager, plugin.id));
+      await expect(proactiveConfigGet(workerManager, plugin.id, added)).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+      });
+
+      writeConfigFile({ [GATE_KEY]: { [first]: { mode: "shadow" }, [added]: { mode: "enforce" } } });
+      await manager.reload();
+
+      await expect(proactiveConfigGet(workerManager, plugin.id, added)).resolves.toEqual({ mode: "enforce" });
+      expect(workerManager.isRunning(plugin.id)).toBe(true);
+    });
+  });
+
   it("treats every pair as managed until the file has been read once", () => {
     const { manager } = startManager(path.join(dir, "missing.json"));
     expect(manager.managedBy(GATE_KEY, randomUUID())).toMatchObject({ source: "file" });
@@ -369,6 +572,39 @@ describeEmbeddedPostgres("PAPERCLIP_PLUGIN_CONFIG_FILE", () => {
 
       const unmanagedRead = await request(app).get(`/api/plugins/${plugin.id}/config?companyId=${unmanaged}`);
       expect(unmanagedRead.body.managedBy).toBeUndefined();
+    });
+
+    it("flags a managed pair with no stored config as managed, and refuses writes to it", async () => {
+      const plugin = await seedPlugin();
+      const companyId = await seedCompany();
+      // The entry fails validation, so no row is stored.
+      const { manager } = startManager(writeConfigFile({ [GATE_KEY]: { [companyId]: { mode: "off" } } }));
+      await manager.applyAll();
+      expect(await configRow(plugin.id, companyId)).toBeNull();
+      const app = createApp(manager, [companyId]);
+
+      const read = await request(app).get(`/api/plugins/${plugin.id}/config?companyId=${companyId}`);
+      expect(read.status).toBe(200);
+      expect(read.body).toEqual({
+        id: null,
+        pluginId: plugin.id,
+        companyId,
+        configJson: {},
+        lastError: null,
+        managedBy: "file",
+        createdAt: null,
+        updatedAt: null,
+      });
+
+      const refused = await request(app)
+        .post(`/api/plugins/${plugin.id}/config`)
+        .send({ companyId, configJson: { mode: "shadow" } });
+      expect(refused.status).toBe(409);
+
+      const unmanaged = await seedCompany();
+      const unmanagedRead = await request(createApp(manager, [unmanaged]))
+        .get(`/api/plugins/${plugin.id}/config?companyId=${unmanaged}`);
+      expect(unmanagedRead.body).toBeNull();
     });
 
     it("rejects a config that does not match the schema through the shared path", async () => {

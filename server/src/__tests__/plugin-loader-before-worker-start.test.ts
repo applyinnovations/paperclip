@@ -2,7 +2,9 @@
  * The loader's `beforeWorkerStart` hook (used by PAPERCLIP_PLUGIN_CONFIG_FILE)
  * runs on activation before the stored company configs are read and before
  * the worker starts, so the worker's startup config replay carries what the
- * hook wrote. A failing hook never blocks activation.
+ * hook wrote. A failing hook never blocks activation. The worker manager's
+ * proactive scope generation is read before the rows and passed to the start,
+ * so a scope set written in between wins over the rows read here.
  */
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -77,14 +79,21 @@ describe("pluginLoader beforeWorkerStart", () => {
       order.push("listConfigs");
       return [];
     });
-    const startWorker = vi.fn(async () => {
-      order.push("startWorker");
+    const startWorker = vi.fn(async (_pluginId: string, options: { proactiveCompanyScopesGeneration?: number }) => {
+      order.push(`startWorker:generation=${options.proactiveCompanyScopesGeneration}`);
       // Stop activation here; only the order up to the worker start matters.
       throw new Error("stop after start");
     });
     const runtime = {
       lifecycleManager: { markError: vi.fn(async () => undefined) },
-      workerManager: { startWorker, isRunning: vi.fn(() => false) },
+      workerManager: {
+        startWorker,
+        isRunning: vi.fn(() => false),
+        proactiveScopeGeneration: vi.fn(() => {
+          order.push("scopeGeneration");
+          return 7;
+        }),
+      },
       eventBus: {},
       jobScheduler: {},
       jobStore: {},
@@ -104,10 +113,10 @@ describe("pluginLoader beforeWorkerStart", () => {
     return { order, result: loader.loadSingle("plugin-1") };
   }
 
-  it("runs before the stored configs are read and the worker starts", async () => {
+  it("runs before the stored configs are read and the worker starts, which gets the scope generation read first", async () => {
     const { order, result } = activate(async () => undefined);
     await result;
-    expect(order).toEqual([`hook:${manifest.id}`, "listConfigs", "startWorker"]);
+    expect(order).toEqual([`hook:${manifest.id}`, "scopeGeneration", "listConfigs", "startWorker:generation=7"]);
   });
 
   it("still starts the worker when the hook fails", async () => {
@@ -115,6 +124,6 @@ describe("pluginLoader beforeWorkerStart", () => {
       throw new Error("bad file");
     });
     await result;
-    expect(order).toEqual([`hook:${manifest.id}`, "listConfigs", "startWorker"]);
+    expect(order).toEqual([`hook:${manifest.id}`, "scopeGeneration", "listConfigs", "startWorker:generation=7"]);
   });
 });

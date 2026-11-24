@@ -2335,6 +2335,10 @@ export function pluginLoader(
           );
         }
       }
+      // Read before the rows: a scope set written after this point (a config
+      // saved between the read below and the worker start) is newer than the
+      // rows, and the worker manager starts the worker with it instead.
+      const proactiveCompanyScopesGeneration = workerManager.proactiveScopeGeneration?.(pluginId);
       let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
       try {
         configRows = await registry.listConfigs(pluginId);
@@ -2374,6 +2378,7 @@ export function pluginLoader(
         // set is exactly the plugin's configured companies — proactive access
         // never reaches an unconfigured company.
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
+        proactiveCompanyScopesGeneration,
       };
 
       if (prebuiltOnly) {

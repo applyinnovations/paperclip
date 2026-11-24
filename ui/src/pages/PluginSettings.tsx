@@ -282,6 +282,7 @@ export function PluginSettings() {
                   initialValues={configData?.configJson}
                   managedBy={configData?.managedBy}
                   lastError={configData?.lastError ?? null}
+                  managedWithoutRow={configData?.managedBy === "file" && configData.id === null}
                   isLoading={configLoading}
                   pluginStatus={plugin.status}
                   supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
@@ -969,6 +970,8 @@ interface PluginConfigFormProps {
   managedBy?: "file";
   /** The stored config's last error, shown with a file-managed config. */
   lastError?: string | null;
+  /** File-managed, but the file's entry has not been stored yet. */
+  managedWithoutRow?: boolean;
 }
 
 /**
@@ -978,7 +981,7 @@ interface PluginConfigFormProps {
  * Separated from PluginSettings to isolate re-render scope — only the form
  * re-renders on field changes, not the entire page.
  */
-function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoading, pluginStatus, supportsConfigTest, managedBy, lastError }: PluginConfigFormProps) {
+function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoading, pluginStatus, supportsConfigTest, managedBy, lastError, managedWithoutRow }: PluginConfigFormProps) {
   const readOnly = managedBy === "file";
   const queryClient = useQueryClient();
 
@@ -1099,6 +1102,9 @@ function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoadin
       {readOnly && (
         <div className="text-sm text-muted-foreground" data-testid="plugin-config-managed-note">
           Managed by the server's plugin config file (PAPERCLIP_PLUGIN_CONFIG_FILE). Change it there.
+          {managedWithoutRow && (
+            <span className="block mt-1">The file's entry has not been applied yet; the server log says why.</span>
+          )}
           {lastError && <span className="block mt-1 text-destructive">{lastError}</span>}
         </div>
       )}
