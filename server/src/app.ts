@@ -235,6 +235,7 @@ import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
+import { createPluginConfigFileManagerFromEnv } from "./services/plugin-config-file.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
@@ -950,6 +951,18 @@ export async function createApp(
     lifecycle,
     hostServicesDisposers,
   );
+  // PAPERCLIP_PLUGIN_CONFIG_FILE (off when unset): plugin config from a file,
+  // applied through the same path as the config API. Read now so the managed
+  // pairs are known before any request; applied before each worker starts
+  // (beforeWorkerStart), after startup, and on file change.
+  const pluginConfigFile = createPluginConfigFileManagerFromEnv(process.env, {
+    db,
+    deps: {
+      workerManager,
+      restartWorker: (pluginId) => pluginConfigFileLifecycle.restartWorker(pluginId),
+    },
+  });
+  pluginConfigFile?.load();
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null =
     null;
   let viteDevServer: { close(): Promise<void> } | null = null;
@@ -964,6 +977,7 @@ export async function createApp(
       prebuiltOnly: managedAutoInstallKeys !== null,
       enableLocalFilesystem: managedAutoInstallKeys === null,
       enableNpmDiscovery: managedAutoInstallKeys === null,
+      beforeWorkerStart: pluginConfigFile ? (plugin) => pluginConfigFile.applyPlugin(plugin) : undefined,
     },
     {
       workerManager,
@@ -1004,6 +1018,7 @@ export async function createApp(
     },
   );
   runtimePluginLoader = loader;
+  const pluginConfigFileLifecycle = pluginLifecycleManager(db, { loader, workerManager });
   const browserUse = browserUseService(db, undefined,
     { cancelWorkForScope: heartbeatService(db, { pluginWorkerManager: workerManager }).cancelBudgetScopeWork },
     (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
@@ -1018,6 +1033,7 @@ export async function createApp(
       { toolDispatcher },
       { workerManager },
       { toolGateway },
+      pluginConfigFile ?? undefined,
     ),
   );
   api.use(
@@ -1381,6 +1397,14 @@ export async function createApp(
     })
     .catch((err) => {
       logger.error({ err }, "Failed to load ready plugins on startup");
+    })
+    // PAPERCLIP_PLUGIN_CONFIG_FILE: activated plugins got their entries before
+    // their workers started; this applies the rest (installed, not running)
+    // and starts watching the file.
+    .then(async () => {
+      if (!pluginConfigFile) return;
+      await pluginConfigFile.applyAll();
+      pluginConfigFile.watch();
     });
   app.locals.bundledPluginsStartup = trackIdleWork(bundledPluginsStartup);
   // Manifest ids the managed auto-install list resolves to; the managed
@@ -1403,6 +1427,7 @@ export async function createApp(
         importSpoolCleanup.unsubscribe();
         await deliveryWork.stop();
         devWatcher?.close();
+        pluginConfigFile?.close();
         viteHtmlRenderer?.dispose();
         void viteDevServer?.close().catch(() => undefined);
         viteHmrServer?.close();

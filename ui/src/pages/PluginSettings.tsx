@@ -280,6 +280,8 @@ export function PluginSettings() {
                   companyId={selectedCompanyId}
                   schema={configSchema!}
                   initialValues={configData?.configJson}
+                  managedBy={configData?.managedBy}
+                  lastError={configData?.lastError ?? null}
                   isLoading={configLoading}
                   pluginStatus={plugin.status}
                   supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
@@ -963,6 +965,10 @@ interface PluginConfigFormProps {
   pluginStatus?: string;
   /** Whether the plugin worker implements `validateConfig`. */
   supportsConfigTest?: boolean;
+  /** Set when the server manages this config from a file: the form is read-only. */
+  managedBy?: "file";
+  /** The stored config's last error, shown with a file-managed config. */
+  lastError?: string | null;
 }
 
 /**
@@ -972,7 +978,8 @@ interface PluginConfigFormProps {
  * Separated from PluginSettings to isolate re-render scope — only the form
  * re-renders on field changes, not the entire page.
  */
-function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoading, pluginStatus, supportsConfigTest }: PluginConfigFormProps) {
+function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoading, pluginStatus, supportsConfigTest, managedBy, lastError }: PluginConfigFormProps) {
+  const readOnly = managedBy === "file";
   const queryClient = useQueryClient();
 
   // Form values: start with saved values, fall back to schema defaults
@@ -1089,12 +1096,18 @@ function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoadin
 
   return (
     <div className="space-y-4">
+      {readOnly && (
+        <div className="text-sm text-muted-foreground" data-testid="plugin-config-managed-note">
+          Managed by the server's plugin config file (PAPERCLIP_PLUGIN_CONFIG_FILE). Change it there.
+          {lastError && <span className="block mt-1 text-destructive">{lastError}</span>}
+        </div>
+      )}
       <JsonSchemaForm
         schema={schema}
         values={values}
         onChange={handleChange}
         errors={errors}
-        disabled={saveMutation.isPending}
+        disabled={readOnly || saveMutation.isPending}
       />
 
       {/* Status messages */}
@@ -1124,7 +1137,7 @@ function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoadin
 
       {/* Action buttons */}
       <div className="flex items-center gap-2 pt-2">
-        <Button
+        {!readOnly && <Button
           onClick={handleSave}
           disabled={saveMutation.isPending || !isDirty}
           size="sm"
@@ -1137,7 +1150,7 @@ function PluginConfigForm({ pluginId, companyId, schema, initialValues, isLoadin
           ) : (
             "Save Configuration"
           )}
-        </Button>
+        </Button>}
         {pluginStatus === "ready" && supportsConfigTest && (
           <Button
             variant="outline"
