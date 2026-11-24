@@ -318,12 +318,19 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
 
-export type IssuePostCommitAction = {
-  type: "cancel_native_question_run";
-  runId: string;
-  issueId: string;
-  issueStatus: string;
-};
+export type IssuePostCommitAction =
+  | {
+      type: "cancel_native_question_run";
+      runId: string;
+      issueId: string;
+      issueStatus: string;
+    }
+  | {
+      // Best-effort, fire-and-forget: see checkpoint-ref-cleanup.ts.
+      type: "delete_checkpoint_refs";
+      companyId: string;
+      issueId: string;
+    };
 
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
@@ -331,10 +338,26 @@ export async function executeIssuePostCommitActions(
   actions: readonly IssuePostCommitAction[],
 ): Promise<void> {
   if (actions.length === 0) return;
+  const checkpointCleanupIssueIds = new Set<string>();
+  for (const action of actions) {
+    if (action.type !== "delete_checkpoint_refs" || checkpointCleanupIssueIds.has(action.issueId)) continue;
+    checkpointCleanupIssueIds.add(action.issueId);
+    try {
+      const { scheduleIssueCheckpointRefCleanup } = await import("./checkpoint-ref-cleanup.js");
+      scheduleIssueCheckpointRefCleanup(db, { companyId: action.companyId, issueId: action.issueId });
+    } catch (err) {
+      logger.warn({ err, issueId: action.issueId }, "checkpoint ref cleanup could not be scheduled");
+    }
+  }
+  const cancellations = actions.filter(
+    (action): action is Extract<IssuePostCommitAction, { type: "cancel_native_question_run" }> =>
+      action.type === "cancel_native_question_run",
+  );
+  if (cancellations.length === 0) return;
   const { heartbeatService } = await import("./heartbeat.js");
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
-  for (const action of actions) {
+  for (const action of cancellations) {
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
@@ -11921,6 +11944,14 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            // Delete the issue's refs/paperclip/{wip,kept} checkpoint refs after
+            // commit. Best effort: an external transaction without a post-commit
+            // queue skips it, and the next terminal transition re-runs it.
+            queuedPostCommitActions.push({
+              type: "delete_checkpoint_refs",
+              companyId: updated.companyId,
+              issueId: updated.id,
+            });
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, status cards)
             // that never touch the HTTP routes. Governed cards expire; ordinary
