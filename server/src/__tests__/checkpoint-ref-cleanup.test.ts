@@ -223,7 +223,7 @@ describe("deleteCheckpointRefs against a local bare repository", () => {
   it("is scheduled after an issue goes done or cancelled, not on other transitions", async () => {
     const svc = issueService(db);
     const { companyId, issueId } = await seed("todo");
-    await svc.update(issueId, { status: "in_progress" });
+    await svc.update(issueId, { status: "backlog" });
     expect(scheduled).toEqual([]);
     await svc.update(issueId, { status: "done" });
     expect(scheduled).toEqual([{ companyId, issueId }]);
