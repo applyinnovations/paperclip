@@ -94,14 +94,14 @@ describe("environmentAcquireLease deadline", () => {
       });
       const before = Date.now();
       const lease = await manager.call("test.plugin", "environmentAcquireLease",
-        { driverKey: "fixture", companyId: "company-1", environmentId: "env-1", runId: "run-1", config: {} } as never, 45_000) as
+        { driverKey: "fixture", companyId: "company-1", environmentId: "env-1", runId: "run-1", config: {} } as never, 45_000) as unknown as
         { metadata: { received: { acquireDeadlineAt?: string; runId: string } } };
       const deadline = Date.parse(lease.metadata.received.acquireDeadlineAt!);
       expect(lease.metadata.received.runId).toBe("run-1");
       expect(deadline).toBeGreaterThanOrEqual(before + 45_000);
       expect(deadline).toBeLessThanOrEqual(Date.now() + 45_000);
 
-      const executed = await manager.call("test.plugin", "environmentExecute", { command: "true" } as never) as
+      const executed = await manager.call("test.plugin", "environmentExecute", { command: "true" } as never) as unknown as
         { metadata: { received: Record<string, unknown> } };
       expect(executed.metadata.received).not.toHaveProperty("acquireDeadlineAt");
     } finally { await manager.stopAll(); }
