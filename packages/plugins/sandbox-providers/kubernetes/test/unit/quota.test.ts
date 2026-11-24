@@ -134,4 +134,45 @@ describe("createQuotaGate", () => {
     const check = gate(c);
     for (let poll = 0; poll < 5; poll++) await expect(check()).resolves.toBeUndefined();
   });
+
+  // A read that never answers, like an API proxy that accepts the connection
+  // and then hangs; it settles only when aborted.
+  const stalled = (_param: unknown, options?: { middleware?: Array<{ pre(c: unknown): Promise<unknown> }> }) =>
+    new Promise((_resolve, reject) => {
+      let signal: AbortSignal | undefined;
+      void options?.middleware?.[0]?.pre({ setSignal: (s: AbortSignal) => { signal = s; } });
+      signal?.addEventListener("abort", () => reject(signal!.reason));
+    });
+
+  it.each(["quota", "pod"] as const)(
+    "stops at the wait's deadline, cancels the request and turns off when the %s read stalls",
+    async (which) => {
+      const c = clients({ quota: fullPods });
+      if (which === "quota") c.core.readNamespacedResourceQuota.mockImplementation(stalled as never);
+      else c.core.readNamespacedPod.mockImplementation(stalled as never);
+      const logger = { warn: vi.fn() };
+      const check = createQuotaGate({
+        clients: c as never, namespace: "ns", sandboxName: "pc-1", demand: { pods: 1 }, logger,
+      });
+      const started = Date.now();
+      await expect(check({ signal: AbortSignal.timeout(30) })).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      // Turned off: later polls read nothing and never fail.
+      const reads = c.core.readNamespacedResourceQuota.mock.calls.length;
+      for (let poll = 0; poll < 3; poll++) await expect(check()).resolves.toBeUndefined();
+      expect(c.core.readNamespacedResourceQuota).toHaveBeenCalledTimes(reads);
+    },
+  );
+
+  it("bounds a stalled read by its own timeout when the wait has time left", async () => {
+    const c = clients({ quota: fullPods });
+    c.core.readNamespacedResourceQuota.mockImplementation(stalled as never);
+    const logger = { warn: vi.fn() };
+    const check = createQuotaGate({
+      clients: c as never, namespace: "ns", sandboxName: "pc-1", demand: { pods: 1 }, logger, probeTimeoutMs: 30,
+    });
+    await expect(check({ signal: new AbortController().signal })).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
 });

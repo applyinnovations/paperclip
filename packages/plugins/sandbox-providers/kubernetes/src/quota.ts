@@ -8,10 +8,12 @@
  * the wait reads the quota and fails at once, naming it, when this Sandbox's
  * pod cannot fit.
  *
- * The check can only shorten a wait. A quota that is missing, unreadable or
- * forbidden leaves the wait exactly as it was.
+ * The check can only shorten a wait. A quota that is missing, unreadable,
+ * forbidden or slow to answer leaves the wait exactly as it was, and no read
+ * outlives the wait's deadline.
  */
 
+import type { ConfigurationOptions, Middleware } from "@kubernetes/client-node";
 import type { KubeClients } from "./kube-client.js";
 
 /** Set by ensureTenant; the provisioner Role may `get` only this name. */
@@ -116,10 +118,21 @@ export interface QuotaGateLogger {
 }
 
 /**
+ * Longest one quota or pod read may take. A read that has not answered by then
+ * turns the check off, like any other failed read; the wait's own deadline cuts
+ * it shorter still.
+ */
+export const QUOTA_PROBE_TIMEOUT_MS = 5_000;
+
+/**
  * A check to run on each Pending poll of the readiness wait. Throws
  * SandboxQuotaExceededError once the Sandbox has no pod and the quota has had
- * no room for it on QUOTA_SHORTFALL_POLLS consecutive polls. The first failed
- * quota read turns the check off for this acquire.
+ * no room for it on QUOTA_SHORTFALL_POLLS consecutive polls. The first quota
+ * read that fails or stalls, or a pod read that stalls, turns the check off for
+ * this acquire.
+ *
+ * Every read is aborted at the earlier of QUOTA_PROBE_TIMEOUT_MS and the wait's
+ * deadline (`signal`), so the check never holds the wait open.
  */
 export function createQuotaGate(input: {
   clients: KubeClients;
@@ -128,32 +141,52 @@ export function createQuotaGate(input: {
   demand: Record<string, number>;
   quotaName?: string;
   logger?: QuotaGateLogger;
-}): () => Promise<void> {
+  probeTimeoutMs?: number;
+}): (ctx?: { signal?: AbortSignal }) => Promise<void> {
   const quotaName = input.quotaName ?? TENANT_RESOURCE_QUOTA_NAME;
+  const probeTimeoutMs = input.probeTimeoutMs ?? QUOTA_PROBE_TIMEOUT_MS;
   let disabled = false;
   let streak = 0;
 
-  return async () => {
+  const disable = (reason: string, err: unknown) => {
+    disabled = true;
+    input.logger?.warn(`${reason}; waiting for the Sandbox without the quota check`, {
+      namespace: input.namespace,
+      quota: quotaName,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  };
+
+  return async ({ signal } = {}) => {
     if (disabled) return;
+    const timeout = AbortSignal.timeout(probeTimeoutMs);
+    const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
     let quota: Parameters<typeof quotaShortfall>[0];
     try {
-      quota = (await input.clients.core.readNamespacedResourceQuota({
-        name: quotaName,
-        namespace: input.namespace,
-      })) as typeof quota;
+      quota = (await abortable(
+        (options) => input.clients.core.readNamespacedResourceQuota({ name: quotaName, namespace: input.namespace }, options),
+        probeSignal,
+      )) as typeof quota;
     } catch (err) {
-      disabled = true;
-      input.logger?.warn("Tenant quota unreadable; waiting for the Sandbox without the quota check", {
-        namespace: input.namespace,
-        quota: quotaName,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      disable("Tenant quota unreadable", err);
       return;
     }
 
     const short = quotaShortfall(quota, input.demand);
-    if (short.length === 0 || (await sandboxHasPod(input.clients, input.namespace, input.sandboxName))) {
-      // Room, or the pod already exists: quota is not what this wait is on.
+    if (short.length === 0) {
+      streak = 0;
+      return;
+    }
+    let hasPod: boolean;
+    try {
+      hasPod = await sandboxHasPod(input.clients, input.namespace, input.sandboxName, probeSignal);
+    } catch (err) {
+      disable("Sandbox pod read did not answer", err);
+      return;
+    }
+    if (hasPod) {
+      // The pod already exists: quota is not what this wait is on.
       streak = 0;
       return;
     }
@@ -167,15 +200,46 @@ export function createQuotaGate(input: {
 /**
  * Whether the Sandbox's pod exists. The agent-sandbox controller names the pod
  * after the Sandbox. Any read error other than 404 counts as "has a pod", so an
- * unreadable cluster never produces a quota error.
+ * unreadable cluster never produces a quota error. A read that is aborted
+ * (stalled past its deadline) throws instead, so the caller can stop checking.
  */
-async function sandboxHasPod(clients: KubeClients, namespace: string, name: string): Promise<boolean> {
+async function sandboxHasPod(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  signal: AbortSignal,
+): Promise<boolean> {
   try {
-    await clients.core.readNamespacedPod({ namespace, name });
+    await abortable((options) => clients.core.readNamespacedPod({ namespace, name }, options), signal);
     return true;
   } catch (err) {
+    if (signal.aborted) throw err;
     const code = (err as { code?: number; statusCode?: number }).code
       ?? (err as { code?: number; statusCode?: number }).statusCode;
     return code !== 404;
   }
+}
+
+/**
+ * Run one API read under `signal`: the signal is handed to the HTTP request so
+ * it is cancelled, and the read rejects when the signal aborts even if the
+ * request does not notice.
+ */
+function abortable<T>(read: (options: ConfigurationOptions) => Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  const setSignal: Middleware = {
+    pre: async (context) => {
+      context.setSignal(signal);
+      return context;
+    },
+    post: async (context) => context,
+  };
+  // The generated client wraps per-call middleware as promise middleware at
+  // runtime, though ConfigurationOptions names the observable form.
+  const options = { middleware: [setSignal], middlewareMergeStrategy: "append" } as unknown as ConfigurationOptions;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    read(options).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }

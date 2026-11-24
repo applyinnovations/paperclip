@@ -167,7 +167,7 @@ A failed acquire hands no lease to the server, so nothing would ever release its
 
 A Sandbox whose pod `paperclip-quota` refuses stays Pending until a slot frees, so its acquire would otherwise end in the deadline error above with the cause hidden. While the Sandbox has no pod, each readiness poll reads `paperclip-quota` and compares it with what this Sandbox's pod needs (one pod plus its container requests and limits). When `used + needed > hard` for any of them on two polls in a row, the acquire fails at once with `SandboxQuotaExceededError`, e.g. `quota paperclip-quota exhausted: pods 16/16`, and the Sandbox is deleted as for any failed acquire.
 
-The check needs `get` on `resourcequotas/paperclip-quota` in the tenant namespace (the provisioner Role's `resourceNames` grant; `list` is not used). If the quota is missing or the read fails or is forbidden, the check turns itself off for that acquire, logs one warning, and the wait behaves as before.
+The check needs `get` on `resourcequotas/paperclip-quota` in the tenant namespace (the provisioner Role's `resourceNames` grant; `list` is not used). If the quota is missing, or the read fails, is forbidden or does not answer, the check turns itself off for that acquire, logs one warning, and the wait behaves as before. Each quota or pod read is cancelled after 5 s or at the readiness deadline, whichever is first, and the wait never waits for the check past its deadline, so the 5 s kept back to delete the Sandbox stays intact.
 
 ## Security baseline
 

@@ -265,6 +265,22 @@ describe("waitForSandboxReady", () => {
     expect(onPending).toHaveBeenCalledTimes(2);
   });
 
+  it("times out on schedule when onPending never settles, aborting its signal", async () => {
+    const get = vi.fn().mockResolvedValue(makeCr("Pending"));
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    let signal: AbortSignal | undefined;
+    const onPending = vi.fn((ctx: { signal: AbortSignal }) => {
+      signal = ctx.signal;
+      return new Promise<void>(() => undefined);
+    });
+    const started = Date.now();
+    await expect(
+      waitForSandboxReady(clients as never, "ns", "pc-abc", { timeoutMs: 50, pollMs: 10, onPending }),
+    ).rejects.toBeInstanceOf(SandboxCrTimeoutError);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(signal?.aborted).toBe(true);
+  });
+
   it("does not run onPending once the Sandbox is Ready", async () => {
     const get = vi.fn().mockResolvedValue(makeCr("Ready"));
     const clients = { custom: { getNamespacedCustomObject: get } };

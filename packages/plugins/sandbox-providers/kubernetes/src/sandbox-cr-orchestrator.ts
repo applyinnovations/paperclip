@@ -22,7 +22,7 @@
  */
 
 import type { KubeClients } from "./kube-client.js";
-import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
+import type { PendingCheck, SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
 
 export const SANDBOX_GROUP = "agents.x-k8s.io";
 export const SANDBOX_VERSION = "v1beta1";
@@ -261,7 +261,7 @@ export async function waitForSandboxReady(
   clients: KubeClients,
   namespace: string,
   name: string,
-  opts: { timeoutMs: number; pollMs?: number; onPending?: () => Promise<void> } = {
+  opts: { timeoutMs: number; pollMs?: number; onPending?: PendingCheck } = {
     timeoutMs: 120_000,
     pollMs: 2000,
   },
@@ -298,11 +298,40 @@ export async function waitForSandboxReady(
       );
     }
     // Pending — let the caller check why (e.g. tenant quota), then keep polling
-    await opts.onPending?.();
-    await sleep(pollMs);
+    if (opts.onPending) await runPendingCheck(opts.onPending, deadline);
+    await sleep(Math.max(0, Math.min(pollMs, deadline - Date.now())));
   }
 
   throw new SandboxCrTimeoutError(namespace, name, opts.timeoutMs);
+}
+
+/**
+ * Run one onPending check, but never past the wait's deadline. At the deadline
+ * the check's signal aborts and the wait stops waiting for it, so a check that
+ * stalls (an API read that never answers) cannot hold the wait open past its
+ * timeout. A check that settles after the deadline is ignored: the wait has
+ * already timed out.
+ */
+async function runPendingCheck(check: PendingCheck, deadline: number): Promise<void> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) return;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error("readiness wait deadline reached"));
+      resolve();
+    }, remainingMs);
+  });
+  const run = check({ signal: controller.signal });
+  // Once the deadline has won the race nobody awaits run; keep a late
+  // rejection from surfacing as unhandled.
+  run.catch(() => undefined);
+  try {
+    await Promise.race([run, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

@@ -13,18 +13,23 @@ const h = vi.hoisted(() => ({
   quota: null as unknown,
   readQuota: vi.fn(),
   readPod: vi.fn(),
+  // The real readiness wait, for tests that drive it against a Pending Sandbox.
+  realWaitForReady: null as unknown as (...args: unknown[]) => Promise<unknown>,
+  getSandbox: vi.fn(async () => ({ metadata: { uid: "uid-1" }, status: { phase: "Pending" } })),
 }));
 
 vi.mock("../../src/kube-client.js", () => ({
   createKubeConfig: vi.fn(() => ({})),
   makeKubeClients: vi.fn(() => ({
     core: { readNamespacedResourceQuota: h.readQuota, readNamespacedPod: h.readPod },
+    custom: { getNamespacedCustomObject: h.getSandbox },
   })),
 }));
 vi.mock("../../src/tenant-orchestrator.js", () => ({ ensureTenant: vi.fn(async () => undefined) }));
 vi.mock("../../src/secret-manager.js", () => ({ createPerRunSecret: h.createSecret }));
 vi.mock("../../src/sandbox-cr-orchestrator.js", async (importActual) => {
   const actual = await importActual<typeof import("../../src/sandbox-cr-orchestrator.js")>();
+  h.realWaitForReady = actual.waitForSandboxReady as never;
   return {
     ...actual,
     sandboxCrOrchestrator: {
@@ -57,7 +62,7 @@ vi.mock("../../src/scoped-network-egress.js", async (importActual) => {
 });
 
 import plugin from "../../src/plugin.js";
-import { SandboxAcquireDeadlineError } from "../../src/acquire-deadline.js";
+import { ACQUIRE_RELEASE_RESERVE_MS, SandboxAcquireDeadlineError } from "../../src/acquire-deadline.js";
 import { SandboxCrTimeoutError } from "../../src/sandbox-cr-orchestrator.js";
 import { SandboxQuotaExceededError } from "../../src/quota.js";
 
@@ -210,7 +215,7 @@ describe("onEnvironmentAcquireLease and a full tenant quota", () => {
     expect(error).not.toBeInstanceOf(SandboxAcquireDeadlineError);
     expect(error.message).toContain("quota paperclip-quota exhausted: pods 16/16");
     expect(Date.now() - started).toBeLessThan(5_000);
-    expect(h.readQuota).toHaveBeenCalledWith({ name: "paperclip-quota", namespace: expect.any(String) });
+    expect(h.readQuota).toHaveBeenCalledWith({ name: "paperclip-quota", namespace: expect.any(String) }, expect.anything());
     expect(h.release).toHaveBeenCalledTimes(1);
   });
 
@@ -235,4 +240,29 @@ describe("onEnvironmentAcquireLease and a full tenant quota", () => {
     expect(h.readQuota).toHaveBeenCalledTimes(1);
     expect(h.release).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("onEnvironmentAcquireLease when a quota check read stalls", () => {
+  // A read that never answers, like an API proxy that accepts the connection
+  // and then hangs.
+  const never = () => new Promise(() => undefined);
+  // Leaves the readiness wait ~300 ms once the release reserve is kept back.
+  const shortDeadline = () => new Date(Date.now() + ACQUIRE_RELEASE_RESERVE_MS + 300).toISOString();
+
+  it.each(["quota", "pod"] as const)(
+    "still ends the wait at the deadline and deletes the Sandbox when the %s read never answers",
+    async (which) => {
+      h.waitForReady.mockImplementation(h.realWaitForReady as never);
+      h.quota = {
+        status: { hard: { pods: "16" }, used: { pods: "16" } },
+      };
+      if (which === "quota") h.readQuota.mockImplementation(never);
+      else h.readPod.mockImplementation(never);
+      const started = Date.now();
+      const error = await acquire({}, { acquireDeadlineAt: shortDeadline() }).catch(value => value);
+      expect(error).toBeInstanceOf(SandboxAcquireDeadlineError);
+      expect(Date.now() - started).toBeLessThan(ACQUIRE_RELEASE_RESERVE_MS);
+      expect(h.release).toHaveBeenCalledTimes(1);
+    },
+  );
 });
