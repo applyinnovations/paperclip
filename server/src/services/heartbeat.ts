@@ -332,6 +332,7 @@ import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
+import { prepareSandboxToolCaches } from "./heartbeat/sandbox-tool-caches.js";
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
@@ -3030,6 +3031,15 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        const toolCaches = await timePreparation("sandbox_tool_caches", () => prepareSandboxToolCaches({
+          runId: run.id, target: executionTarget, env: parseObject(runtimeConfig.env),
+        }));
+        runtimeConfig = { ...runtimeConfig, env: toolCaches.env };
+        if (toolCaches.applied) context.paperclipSandboxToolCaches = { type: "workspace_volume", env: toolCaches.appliedEnv };
+        else delete context.paperclipSandboxToolCaches;
+        if (!toolCaches.applied && toolCaches.reason === "mkdir_failed") {
+          logger.warn({ runId: run.id, detail: toolCaches.detail }, "could not create sandbox tool cache directories; caches stay on /tmp");
+        }
       }
       if (issueId && (!executionTarget || executionTarget.kind === "local")) {
         await recordLegacyCaseHandoffCleanupIntent(db, { runId: run.id, issueId, controllerBootId: legacyControllerBootId, scratch: runScratch });

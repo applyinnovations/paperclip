@@ -1117,9 +1117,18 @@ describe("sandbox managed runtime", () => {
     await git(remoteWorkspaceDir, ["commit", "-m", "sandbox update"]);
     await writeFile(path.join(remoteWorkspaceDir, "tracked.txt"), "remote dirty\n", "utf8");
     await writeFile(path.join(remoteWorkspaceDir, "remote-only.txt"), "from sandbox\n", "utf8");
+    // Sandbox tool caches (APP-20) live on the workspace volume under
+    // `.paperclip-runtime/cache/`. They must never ship back to the host.
+    const remoteCacheRoot = path.join(remoteWorkspaceDir, ".paperclip-runtime", "cache");
+    for (const [relative, body] of [["pnpm-store/v10/files/00/blob", "store\n"], ["npm/_cacache/index", "npm\n"],
+      ["xdg/tool/cache.bin", "xdg\n"]] as const) {
+      await mkdir(path.dirname(path.join(remoteCacheRoot, relative)), { recursive: true });
+      await writeFile(path.join(remoteCacheRoot, relative), body, "utf8");
+    }
 
     await prepared.restoreWorkspace();
 
+    await expect(lstat(path.join(localWorkspaceDir, ".paperclip-runtime", "cache"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await lstat(path.join(localWorkspaceDir, ".git"))).isFile()).toBe(true);
     expect(await git(localWorkspaceDir, ["log", "-1", "--pretty=%s"])).toBe("sandbox update");
     await expect(readFile(path.join(localWorkspaceDir, "tracked.txt"), "utf8")).resolves.toBe("remote dirty\n");
@@ -1132,6 +1141,7 @@ describe("sandbox managed runtime", () => {
     const downloadMembers = await listTarMembers(rootDir, "workspace-download-list.tar", downloadedTars[0]!.bytes);
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
+    expect(downloadMembers.some((entry) => entry.startsWith(".paperclip-runtime"))).toBe(false);
     expect(runtimeStatuses.map((status) => status.phase)).toEqual(expect.arrayContaining([
       "git_sync",
       "config_sync",

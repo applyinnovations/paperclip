@@ -2202,6 +2202,23 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(changed.result.sessionParams?.configFingerprint).not.toBe(first.result.sessionParams?.configFingerprint);
   });
 
+  it("keeps sandbox tool cache paths out of session identity so a session saved before them resumes (APP-20)", async () => {
+    const root = await makeTempRoot();
+    const config = { agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") };
+    const cache = "/workspace/w/.paperclip-runtime/cache";
+    const cacheEnv = { npm_config_cache: `${cache}/npm`, npm_config_store_dir: `${cache}/pnpm-store`,
+      XDG_CACHE_HOME: `${cache}/xdg`, GOMODCACHE: `${cache}/go-mod`, npm_config_package_import_method: "hardlink" };
+    // Saved by the previous release: no cache env, no context marker.
+    const before = await runExecutor({ ...config, env: { FOO: "bar" } }, { context: { taskId: "issue-1" } });
+    const after = await runExecutor({ ...config, env: { FOO: "bar", ...cacheEnv } },
+      { context: { taskId: "issue-1", paperclipSandboxToolCaches: { type: "workspace_volume", env: cacheEnv } } });
+    expect(after.result.sessionParams?.configFingerprint).toBe(before.result.sessionParams?.configFingerprint);
+    // An operator value for the same key is still an adapter setting.
+    const operator = await runExecutor({ ...config, env: { FOO: "bar", ...cacheEnv, npm_config_cache: "/scratch" } },
+      { context: { taskId: "issue-1", paperclipSandboxToolCaches: { type: "workspace_volume", env: { ...cacheEnv, npm_config_cache: undefined } } } });
+    expect(operator.result.sessionParams?.configFingerprint).not.toBe(before.result.sessionParams?.configFingerprint);
+  });
+
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

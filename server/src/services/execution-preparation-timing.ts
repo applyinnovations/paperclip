@@ -7,7 +7,7 @@ import { isSpanContextValid, ROOT_CONTEXT, SpanStatusCode, trace, type Context }
 type PreparationPhase = "environment_selection" | "execution_configuration" | "session"
   | "agent_read" | "chat_completion" | "conversation" | "runtime_state" | "issue_context"
   | "run_identity" | "trust_preset" | "task_context"
-  | "workspace" | "github_environment" | "github_launchers" | "run_output"
+  | "workspace" | "sandbox_tool_caches" | "github_environment" | "github_launchers" | "run_output"
   | "workspace_validation" | "runtime_services" | "instructions" | "runtime_selection"
   | "configuration_mentions" | "configuration_github_identity" | "configuration_secrets"
   | "configuration_ai_runtime" | "configuration_skills" | "configuration_connector_assignments"
