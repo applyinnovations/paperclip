@@ -600,6 +600,14 @@ it through the local-folder route. Refused roots are:
 - a root that is, contains, or sits inside the instance `secrets` directory,
   the master key's directory, the embedded Postgres data directory, `/run`,
   `/var/run`, `/proc`, `/sys`, `/dev` or `/etc`
+- a root that is, contains, or sits inside code the host runs: the server install
+  root (`/app` in the image, which holds the repo plugin tree and
+  `node_modules`), the bundled plugin catalog (`PAPERCLIP_BUNDLED_PLUGIN_ROOT`,
+  including its distribution directory), the local plugin install directory
+  (`~/.paperclip/plugins` and `$PAPERCLIP_HOME/plugins`) and the external
+  adapter directory (`$PAPERCLIP_HOME/adapter-plugins`). A `readWrite` folder
+  there would let a plugin overwrite trusted plugin code, which runs unsandboxed,
+  or code the server imports
 
 The check runs on both the configured path and its realpath, so a symlink to a
 protected directory is refused too. A folder already stored with such a root
@@ -610,9 +618,13 @@ never returned.
 opens its inspector when it receives `SIGUSR1`. Every plugin worker, sandboxed
 or not, is therefore started with `--disable-sigusr1`, and the server must be
 too: the image's `CMD` is `node --disable-sigusr1 server/dist-runtime/index.mjs`.
-A deployment that overrides the server command must keep the flag (or set it in
-`NODE_OPTIONS`); otherwise a worker can signal the server into opening an
-inspector and run code inside it.
+A worker can also signal every process of its uid at once (`process.kill(-1,
+"SIGUSR1")`), so every other Node process in the container needs the flag as
+well, including short-lived ones such as `node -e` health probes and agent CLIs.
+The production image therefore sets `NODE_OPTIONS=--disable-sigusr1`. A
+deployment that overrides the server command or `NODE_OPTIONS` must keep the
+flag; otherwise a worker can signal a Node process into opening an inspector and
+run code inside it.
 
 Sandboxed workers load TypeScript with Node's built-in type stripping
 (`--experimental-transform-types`) and a small resolve hook that maps `./x.js`

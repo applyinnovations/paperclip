@@ -14,6 +14,7 @@ import {
   deletePluginLocalFolderFile,
   writePluginLocalFolderTextAtomic,
 } from "../services/plugin-local-folders.js";
+import { collectHostCodeDirs, resolveServerInstallRoot } from "../services/plugin-protected-paths.js";
 
 describe("plugin local folders", () => {
   const tempRoots: string[] = [];
@@ -321,6 +322,45 @@ describe("plugin local folders", () => {
       const configDir = await makeRoot();
       vi.stubEnv("PAPERCLIP_CONFIG", path.join(configDir, "config.json"));
       expect(() => assertPluginLocalFolderRootAllowed(configDir)).toThrow(/protected host path/);
+    });
+
+    it("refuses roots over host code: install root, bundled catalog, local plugin and adapter dirs (B6)", async () => {
+      const installRoot = resolveServerInstallRoot();
+      expect(installRoot).toBeTruthy();
+      // The repo plugin tree (and node_modules) sit inside the install root.
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(installRoot!, "packages", "plugins", "x"))).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed(installRoot!)).toThrow(/protected host path/);
+
+      // Bundled catalog root, including the image's writable distribution dir under it.
+      const catalogRoot = await makeRoot();
+      vi.stubEnv("PAPERCLIP_BUNDLED_PLUGIN_ROOT", catalogRoot);
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(catalogRoot, "distribution"))).toThrow(/protected host path/);
+
+      // Local plugin install dir and external adapter dir under PAPERCLIP_HOME.
+      const home = await makeRoot();
+      vi.stubEnv("PAPERCLIP_HOME", home);
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(home, "plugins", "some-plugin"))).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(home, "adapter-plugins"))).toThrow(/protected host path/);
+      expect(() => assertPluginLocalFolderRootAllowed(path.join(os.homedir(), ".paperclip", "plugins"))).toThrow(/protected host path/);
+    });
+
+    it("refuses a readWrite folder over a plugin package before writing to it", async () => {
+      const catalogRoot = await makeRoot();
+      vi.stubEnv("PAPERCLIP_BUNDLED_PLUGIN_ROOT", catalogRoot);
+      const workerDir = path.join(catalogRoot, "distribution", "other-plugin", "dist");
+      await fs.mkdir(workerDir, { recursive: true });
+      await fs.writeFile(path.join(workerDir, "worker.js"), "original");
+      await expect(preparePluginLocalFolder({
+        folderKey: "content-root",
+        storedConfig: { path: path.dirname(workerDir), access: "readWrite", requiredDirectories: ["planted"] },
+      })).rejects.toThrow(/protected host path/);
+      await expect(fs.stat(path.join(path.dirname(workerDir), "planted"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(workerDir, "worker.js"), "utf8")).toBe("original");
+    });
+
+    it("never treats / as a host code dir", () => {
+      expect(collectHostCodeDirs()).not.toContain("/");
+      expect(resolveServerInstallRoot("/")).toBeNull();
     });
 
     it("allows an unrelated folder", async () => {

@@ -101,10 +101,11 @@ async function portOpensWithin(port: number, ms: number): Promise<boolean> {
 }
 
 /** A long-lived node process whose SIGUSR1 inspector would listen on a known free port. */
-async function inspectorTarget(flags: string[]) {
+async function inspectorTarget(flags: string[], env: NodeJS.ProcessEnv = {}) {
   const port = await freePort();
   const child = spawn(process.execPath, [...flags, `--inspect-port=127.0.0.1:${port}`, "-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
+    env: { ...process.env, NODE_OPTIONS: "", ...env },
   });
   await new Promise((r) => setTimeout(r, 200));
   return {
@@ -283,5 +284,32 @@ describe("planPluginWorkerSandbox", () => {
   it("starts the production server with --disable-sigusr1", () => {
     const dockerfile = fs.readFileSync(path.join(FIXTURES_DIR, "../../../../Dockerfile"), "utf8");
     expect(dockerfile).toMatch(/^CMD \["node", "--disable-sigusr1", "server\/dist-runtime\/index\.mjs"\]$/m);
+  });
+
+  it("sets NODE_OPTIONS=--disable-sigusr1 for every other Node process in the production image", () => {
+    const dockerfile = fs.readFileSync(path.join(FIXTURES_DIR, "../../../../Dockerfile"), "utf8");
+    const production = dockerfile.slice(dockerfile.indexOf("AS production"), dockerfile.indexOf("\nFROM ", dockerfile.indexOf("AS production")));
+    expect(production).toMatch(/^ENV NODE_OPTIONS=--disable-sigusr1$/m);
+    // No later stage may replace it (the cloud image builds FROM production).
+    const after = dockerfile.slice(dockerfile.indexOf("AS production"));
+    const values = [...after.matchAll(/NODE_OPTIONS=([^\s\\]+)/g)].map((m) => m[1]);
+    expect(values.length).toBeGreaterThan(0);
+    expect(new Set(values)).toEqual(new Set(["--disable-sigusr1"]));
+  });
+
+  it("a node -e started with NODE_OPTIONS=--disable-sigusr1 (the image env) never opens an inspector on SIGUSR1", async () => {
+    // Stands in for the Deployment's `node -e` probes, which take the flag only from NODE_OPTIONS.
+    const control = await inspectorTarget([]);
+    const probeProcess = await inspectorTarget([], { NODE_OPTIONS: "--disable-sigusr1" });
+    try {
+      process.kill(control.pid, "SIGUSR1");
+      expect(await portOpensWithin(control.port, 3000)).toBe(true);
+      process.kill(probeProcess.pid, "SIGUSR1");
+      expect(await portOpensWithin(probeProcess.port, 1500)).toBe(false);
+      expect(probeProcess.alive()).toBe(true);
+    } finally {
+      control.kill();
+      probeProcess.kill();
+    }
   });
 });

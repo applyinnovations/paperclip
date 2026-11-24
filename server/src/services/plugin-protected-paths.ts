@@ -1,11 +1,15 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   resolveDefaultConfigPath,
   resolveDefaultEmbeddedPostgresDir,
   resolveDefaultSecretsKeyFilePath,
+  resolvePaperclipHomeDir,
   resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
+import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 /**
  * Host paths no plugin may ever reach, neither through its own filesystem
@@ -28,6 +32,22 @@ const GITHUB_APPS_FILE_ENV = "PAPERCLIP_GITHUB_APPS_FILE";
  * `/etc`, `/sys` and `/dev` are host configuration and devices.
  */
 const SYSTEM_DENIED_DIRS = ["/run", "/var/run", "/proc", "/sys", "/dev", "/etc"] as const;
+
+/**
+ * The server's install root: the nearest ancestor of this module holding
+ * `pnpm-workspace.yaml` (`/app` in the image, the checkout in development).
+ * Walking up rather than a fixed `../../..` keeps it right for the bundled
+ * `server/dist-runtime/index.mjs`, where a fixed hop count would land on `/`.
+ */
+export function resolveServerInstallRoot(startDir = path.dirname(fileURLToPath(import.meta.url))): string | null {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, "pnpm-workspace.yaml"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
 
 export function realpathOrResolve(p: string): string {
   const resolved = path.resolve(p);
@@ -91,6 +111,34 @@ export interface LocalFolderDeniedPaths {
 }
 
 /**
+ * Directories holding code the host executes: the server install root (which
+ * contains the repo plugin tree and node_modules), the bundled plugin catalog
+ * (in the image, including the writable distribution emptyDir under it), the
+ * local plugin install dir and the external adapter plugin dir. `/` is never
+ * returned: it would deny every root.
+ */
+export function collectHostCodeDirs(processEnv: NodeJS.ProcessEnv = process.env): string[] {
+  const paperclipHome = resolvePaperclipHomeDir();
+  const candidates = [
+    resolveServerInstallRoot(),
+    resolveBundledCatalogRoot(processEnv),
+    // DEFAULT_LOCAL_PLUGIN_DIR (plugin-loader.ts), plus its PAPERCLIP_HOME form.
+    path.join(os.homedir(), ".paperclip", "plugins"),
+    path.join(paperclipHome, "plugins"),
+    // adapter-plugin-store.ts: external adapters are imported into the server process.
+    path.join(paperclipHome, "adapter-plugins"),
+  ];
+  const dirs = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate?.trim()) continue;
+    const resolved = path.resolve(candidate);
+    if (path.dirname(resolved) === resolved) continue;
+    dirs.add(resolved);
+  }
+  return [...dirs];
+}
+
+/**
  * Paths a plugin local-folder root must stay clear of. The host reads and
  * writes local folders on the plugin's behalf, so a root over any of these
  * would hand the plugin the file through RPC even though its own sandbox
@@ -111,6 +159,12 @@ export function collectLocalFolderDeniedPaths(processEnv: NodeJS.ProcessEnv = pr
   addPath(files, path.join(path.dirname(path.resolve(configFile)), ".env"));
 
   for (const dir of SYSTEM_DENIED_DIRS) addPath(dirs, dir);
+
+  // Code the host runs or loads. Host writes through a readWrite folder over
+  // any of these would let a plugin replace trusted plugin code (which runs
+  // unsandboxed as a trusted exception), another plugin's worker, an adapter
+  // the server imports in-process, or the server itself.
+  for (const dir of collectHostCodeDirs(processEnv)) addPath(dirs, dir);
   return { files: [...files], dirs: [...dirs] };
 }
 
