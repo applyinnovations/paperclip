@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import * as tar from "tar";
 import {
   assertConfinedSandboxPath,
   parseTarVerboseListingLine,
@@ -912,5 +913,219 @@ describe("splitLinkEntryOnce", () => {
     // unresolvable; either split choice can hide an escaping target.
     expect(splitLinkEntryOnce("evil -> decoy -> ../../outside.txt", " -> ")).toBeNull();
     expect(splitLinkEntryOnce("a link to b link to ../../outside.txt", " link to ")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// In-process tar (node-tar) member confinement. The sandbox authors the outbound
+// archive, so these feed hand-crafted hostile archives through the pod exec and
+// assert the whole archive is refused before ANY member (including a benign one
+// ahead of the hostile one) is written on the host.
+// ---------------------------------------------------------------------------
+interface CraftedMember {
+  path: string;
+  type?: "File" | "Directory" | "SymbolicLink" | "Link";
+  linkpath?: string;
+  body?: string;
+}
+
+function craftTarball(members: CraftedMember[]): Buffer {
+  const blocks: Buffer[] = [];
+  for (const member of members) {
+    const body = Buffer.from(member.body ?? "");
+    const header = new tar.Header({
+      path: member.path,
+      type: member.type ?? "File",
+      linkpath: member.linkpath,
+      size: body.length,
+      mode: member.type === "Directory" ? 0o755 : 0o644,
+      uid: 0,
+      gid: 0,
+      mtime: new Date(0),
+    });
+    const block = Buffer.alloc(512);
+    header.encode(block, 0);
+    blocks.push(block);
+    if (body.length > 0) {
+      const padded = Buffer.alloc(Math.ceil(body.length / 512) * 512);
+      body.copy(padded);
+      blocks.push(padded);
+    }
+  }
+  blocks.push(Buffer.alloc(1024));
+  return Buffer.concat(blocks);
+}
+
+// Stub pod exec that "streams" a fixed archive on stdout without running a shell.
+function makeArchiveExec(archive: Buffer): PodStreamExec {
+  return async (_command, io) =>
+    await new Promise((resolve, reject) => {
+      const sink = io.stdout;
+      if (!sink) {
+        resolve({ exitCode: 0, stderr: "" });
+        return;
+      }
+      sink.on("error", reject);
+      sink.on("finish", () => resolve({ exitCode: 0, stderr: "" }));
+      sink.end(archive);
+    });
+}
+
+describe("kubernetes onEnvironmentSyncOut in-process tar member confinement", () => {
+  async function setup() {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    const outside = await makeTmp("k8s-outside-");
+    await fs.writeFile(path.join(outside, "secret"), "PRIVATE");
+    const target = path.join(hostOut, "restored");
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, "retained.txt"), "existing host work");
+    return { remoteDir, hostOut, outside, target };
+  }
+
+  async function syncOutArchive(remoteDir: string, target: string, members: CraftedMember[]) {
+    return performSyncOut({
+      exec: makeArchiveExec(craftTarball([{ path: "benign.txt", body: "benign" }, ...members])),
+      remoteDir,
+      timeoutMs: 30_000,
+      operations: [
+        {
+          operationId: "op",
+          files: [{ sourcePath: path.join(remoteDir, "artifacts"), targetPath: target, kind: "directory" }],
+        },
+      ],
+    });
+  }
+
+  async function expectNothingWritten(target: string, outside: string) {
+    expect(await fs.readdir(target)).toEqual(["retained.txt"]);
+    expect(await fs.readFile(path.join(target, "retained.txt"), "utf8")).toBe("existing host work");
+    expect(await fs.readdir(outside)).toEqual(["secret"]);
+    expect(await fs.readFile(path.join(outside, "secret"), "utf8")).toBe("PRIVATE");
+  }
+
+  it("rejects a ../ traversal member, writing nothing", async () => {
+    const { remoteDir, hostOut, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: "../escaped.txt", body: "pwned" }]),
+    ).rejects.toThrow(/escapes the extraction dir/);
+    await expectNothingWritten(target, outside);
+    await expect(fs.lstat(path.join(hostOut, "escaped.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a ../ member hidden inside a nested path, writing nothing", async () => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: "sub/../../escaped.txt", body: "pwned" }]),
+    ).rejects.toThrow(/escapes the extraction dir/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it("rejects an absolute member, writing nothing", async () => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: path.join(outside, "abs.txt"), body: "pwned" }]),
+    ).rejects.toThrow(/escapes the extraction dir/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it.each([
+    ["an absolute target", (outside: string) => outside],
+    ["a relative ../ target", () => "../../outside"],
+  ])("rejects a symlink member with %s outside the target, writing nothing", async (_label, linkpath) => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: "sub/link", type: "SymbolicLink", linkpath: linkpath(outside) }]),
+    ).rejects.toThrow(/link whose target escapes/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it("rejects a symlink that escapes only by traversing another archived symlink, writing nothing", async () => {
+    const { remoteDir, outside, target } = await setup();
+    // `self -> .` is in-tree, and `self/../x` normalizes lexically to `x`, but on
+    // disk `self` is the extraction dir, so `link` would point at its parent.
+    await expect(
+      syncOutArchive(remoteDir, target, [
+        { path: "self", type: "SymbolicLink", linkpath: "." },
+        { path: "link", type: "SymbolicLink", linkpath: "self/../secret" },
+      ]),
+    ).rejects.toThrow(/link whose target escapes/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it("rejects a member nested under an archived symlink, writing nothing", async () => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [
+        { path: "dir", type: "SymbolicLink", linkpath: "sub" },
+        { path: "dir/file.txt", body: "through the link" },
+      ]),
+    ).rejects.toThrow(/nested under an archived symlink/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it.each([
+    ["an absolute target", (outside: string) => path.join(outside, "secret")],
+    ["a relative ../ target", () => "../outside/secret"],
+  ])("rejects a hardlink member with %s outside the target, writing nothing", async (_label, linkpath) => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: "hl", type: "Link", linkpath: linkpath(outside) }]),
+    ).rejects.toThrow(/link whose target escapes/);
+    await expectNothingWritten(target, outside);
+  });
+
+  it("still extracts in-tree symlinks and hardlinks", async () => {
+    const { remoteDir, target } = await setup();
+    await syncOutArchive(remoteDir, target, [
+      { path: "sub/", type: "Directory" },
+      { path: "sub/data.txt", body: "data" },
+      { path: "sub/up", type: "SymbolicLink", linkpath: "../benign.txt" },
+      { path: "hl", type: "Link", linkpath: "sub/data.txt" },
+    ]);
+    expect(await fs.readFile(path.join(target, "benign.txt"), "utf8")).toBe("benign");
+    expect(await fs.readlink(path.join(target, "sub/up"))).toBe("../benign.txt");
+    expect(await fs.readFile(path.join(target, "sub/up"), "utf8")).toBe("benign");
+    expect(await fs.readFile(path.join(target, "hl"), "utf8")).toBe("data");
+  });
+});
+
+describe("kubernetes onEnvironmentSyncIn in-process tar exclude semantics", () => {
+  it("matches tar --exclude unanchored: a bare name excludes that entry at any depth, subtree included", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const host = await makeTmp("k8s-host-");
+    const src = path.join(host, "tree");
+    await fs.mkdir(path.join(src, "pkg/node_modules/dep"), { recursive: true });
+    await fs.mkdir(path.join(src, "node_modules"), { recursive: true });
+    await fs.writeFile(path.join(src, "pkg/node_modules/dep/index.js"), "dep");
+    await fs.writeFile(path.join(src, "node_modules/top.js"), "top");
+    await fs.writeFile(path.join(src, "pkg/keep.js"), "keep");
+    await fs.writeFile(path.join(src, "pkg/._sidecar"), "appledouble");
+    await fs.writeFile(path.join(src, "pkg/not_node_modules.js"), "kept");
+
+    const { exec } = makeRealExec();
+    await performSyncIn({
+      exec,
+      remoteDir,
+      timeoutMs: 30_000,
+      operations: [
+        {
+          operationId: "op",
+          files: [
+            {
+              sourcePath: src,
+              targetPath: path.join(remoteDir, "out"),
+              kind: "directory",
+              exclude: ["node_modules"],
+            },
+          ],
+        },
+      ],
+    });
+    expect(await fs.readFile(path.join(remoteDir, "out/pkg/keep.js"), "utf8")).toBe("keep");
+    expect(await fs.readFile(path.join(remoteDir, "out/pkg/not_node_modules.js"), "utf8")).toBe("kept");
+    await expect(fs.lstat(path.join(remoteDir, "out/node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(path.join(remoteDir, "out/pkg/node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(path.join(remoteDir, "out/pkg/._sidecar"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
