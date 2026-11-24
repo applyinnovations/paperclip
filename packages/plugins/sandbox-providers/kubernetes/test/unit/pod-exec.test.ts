@@ -20,6 +20,9 @@ let scriptedExec: (
   stdin: PassThrough | null,
 ) => void = () => undefined;
 
+// Frames the streaming exec sends on the fake WebSocket (channel byte first).
+let sentFrames: Buffer[] = [];
+
 vi.mock("@kubernetes/client-node", () => {
   class Exec {
     constructor(_kc: unknown) {}
@@ -36,7 +39,15 @@ vi.mock("@kubernetes/client-node", () => {
     ) {
       // Defer so the caller has wired its stream listeners first.
       setImmediate(() => scriptedExec(stdout, stderr, statusCb, stdin));
-      return { close() {} };
+      return {
+        close() {},
+        send(data: Buffer, cb?: (err?: Error) => void) {
+          sentFrames.push(Buffer.from(data));
+          setImmediate(() => cb?.());
+        },
+        pause() {},
+        resume() {},
+      };
     }
   }
   return { Exec };
@@ -207,28 +218,27 @@ describe("execInPodStreaming", () => {
     expect(Buffer.concat(chunks).toString("utf-8")).toBe("chunk-one;chunk-two");
   });
 
-  it("streams the caller stdin Readable into the pod command", async () => {
-    let received = Buffer.alloc(0);
+  it("sends the caller stdin Readable to the pod command on the stdin channel", async () => {
+    sentFrames = [];
+    let stdinRequested = false;
     scriptedExec = (stdout, stderr, statusCb, stdin) => {
-      if (stdin) {
-        stdin.on("data", (chunk: Buffer) => {
-          received = Buffer.concat([received, chunk]);
-        });
-      }
-      // Resolve once the source has been fully piped through.
-      setImmediate(() => {
+      stdinRequested = stdin !== null;
+      // Report the exit once the source has been sent.
+      setTimeout(() => {
         stdout.end();
         stderr.end();
         statusCb({ status: "Success" });
-      });
+      }, 20);
     };
-    const source = Readable.from([Buffer.from("payload-bytes")]);
+    const source = Readable.from([Buffer.from("payload-"), Buffer.from("bytes")]);
     const result = await execInPodStreaming(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], {
       stdin: source,
       timeoutMs: 5_000,
     });
     expect(result.exitCode).toBe(0);
-    expect(received.toString("utf-8")).toBe("payload-bytes");
+    expect(stdinRequested).toBe(true);
+    expect(sentFrames.every((frame) => frame[0] === 0)).toBe(true);
+    expect(Buffer.concat(sentFrames.map((frame) => frame.subarray(1))).toString("utf-8")).toBe("payload-bytes");
   });
 
   it("fails closed when the pod floods stderr past the cap", async () => {
