@@ -3,6 +3,23 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const PLUGIN_ID = "paperclip.kubernetes-sandbox-provider";
 const PLUGIN_VERSION = "0.1.0-alpha.2";
 
+/**
+ * Default `podStartTimeoutSec` (see types.ts): how long an acquire waits for
+ * its Sandbox pod to become Ready.
+ */
+export const DEFAULT_POD_START_TIMEOUT_SEC = 300;
+
+/**
+ * Budget the host gives a fresh acquire. An acquire ensures the tenant,
+ * creates the workload, its network policy and Secret, then waits up to
+ * `podStartTimeoutSec` for the pod. Without a declared default the host
+ * gives up after its 30 s RPC default while the provider is still waiting,
+ * so the run fails and the Sandbox it went on to create is orphaned. The
+ * margin covers the API calls around the wait. An environment that raises
+ * `podStartTimeoutSec` must raise `timeoutMs` to match.
+ */
+export const DEFAULT_ACQUIRE_TIMEOUT_MS = DEFAULT_POD_START_TIMEOUT_SEC * 1000 + 60_000;
+
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
   apiVersion: 1,
@@ -19,7 +36,12 @@ const manifest: PaperclipPluginManifestV1 = {
   environmentDrivers: [
     {
       driverKey: "kubernetes",
+      defaultAcquireTimeoutMs: DEFAULT_ACQUIRE_TIMEOUT_MS,
       kind: "sandbox_provider",
+      // Each acquire names its workload after the host's creation operation
+      // and labels it with its owner; onEnvironmentInspectLease reports it so
+      // host recovery destroys a Sandbox whose acquire caller gave up.
+      creationOperationVersion: 1,
       displayName: "Kubernetes",
       description:
         "Dispatches agent runs in per-tenant Kubernetes namespaces. Default backend (sandbox-cr, alpha) uses kubernetes-sigs/agent-sandbox for multi-command exec; fallback backend (job) uses stable batch/v1 Job for clusters without agent-sandbox installed.",
