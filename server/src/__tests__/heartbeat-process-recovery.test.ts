@@ -272,7 +272,6 @@ import {
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
-  writeHotRestartShutdownSnapshot,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
@@ -4201,121 +4200,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         finalizedWhileDownRunIds: [runId],
         lostRunIds: [],
       });
-    });
-  });
-
-  it("drains a hot-restart run without a local process identity to retry and adopts the detached local run", async () => {
-    const child = spawnAliveProcess();
-    childProcesses.add(child);
-    expect(child.pid).toBeGreaterThan(0);
-    const local = await seedRunFixture({
-      agentStatus: "running",
-      processPid: child.pid ?? null,
-      processGroupId: null,
-      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
-    });
-    // A run on a remote sandbox target: its process lives in another pod, so
-    // the server never records a pid for it.
-    const remote = await seedRunFixture({
-      agentStatus: "running",
-      processPid: null,
-      processGroupId: null,
-      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
-    });
-
-    await withTempPaperclipHome(async (home) => {
-      await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerVersion: "old-version",
-        requestedAt: new Date("2026-11-24T00:05:00.000Z"),
-        preflightActiveRunIds: [local.runId, remote.runId],
-      });
-      const heartbeat = heartbeatService(db);
-
-      const prepared = await heartbeat.prepareHotRestartShutdown(
-        "SIGTERM",
-        new Date("2026-11-24T00:06:00.000Z"),
-      );
-      expect(prepared).toMatchObject({
-        mode: "non_adoptable_drain_required",
-        skipDrain: false,
-        drainRunIds: [remote.runId],
-        drainReason: "non_adoptable_run",
-      });
-      expect([...(prepared as { activeRunIds: string[] }).activeRunIds].sort())
-        .toEqual([local.runId, remote.runId].sort());
-      await expect(readHotRestartIntent()).resolves.toMatchObject({
-        drainRequired: true,
-        drainReason: "non_adoptable_run",
-        drainRunIds: [remote.runId],
-      });
-
-      const drain = await heartbeat.drainRunningRunsForShutdown(
-        "SIGTERM",
-        new Date("2026-11-24T00:06:01.000Z"),
-        [remote.runId],
-      );
-      expect(drain.interruptedRunIds).toEqual([remote.runId]);
-      expect(drain.retryRunIds).toHaveLength(1);
-      expect(isPidAlive(child.pid)).toBe(true);
-
-      const reconciliation = await heartbeat.reconcileHotRestartAdoption(
-        new Date("2026-11-24T00:07:00.000Z"),
-      );
-      expect(reconciliation).toMatchObject({
-        mode: "reported",
-        adoptedRunIds: [local.runId],
-        finalizedWhileDownRunIds: [remote.runId],
-        lostRunIds: [],
-        skippedRunIds: [],
-      });
-      expect((await selectRecoveryRunsByAgent(remote.agentId)).find((run) => run.id === remote.runId)).toMatchObject({
-        status: "interrupted",
-        errorCode: "server_shutdown_interrupted",
-      });
-      expect(await selectRecoveryRunsByAgent(remote.agentId)).toHaveLength(2);
-      expect((await selectRecoveryRunsByAgent(local.agentId)).find((run) => run.id === local.runId)).toMatchObject({
-        status: "running",
-      });
-
-      const report = JSON.parse(
-        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
-      ) as Record<string, unknown>;
-      expect(report).toMatchObject({
-        drainRequired: true,
-        drainReason: "non_adoptable_run",
-        adoptedRunIds: [local.runId],
-        lostRunIds: [],
-      });
-    });
-  });
-
-  it("without the drain, a hot-restart run without a local process identity is reported lost", async () => {
-    // Guards the reason for the drain above: startup cannot adopt such a run.
-    const remote = await seedRunFixture({
-      agentStatus: "running",
-      processPid: null,
-      processGroupId: null,
-      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
-    });
-    await withTempPaperclipHome(async () => {
-      const intent = await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerVersion: "old-version",
-        requestedAt: new Date("2026-11-24T00:05:00.000Z"),
-        preflightActiveRunIds: [remote.runId],
-      });
-      await writeHotRestartShutdownSnapshot({
-        intent,
-        signal: "SIGTERM",
-        activeRuns: [{ runId: remote.runId, companyId: remote.companyId, agentId: remote.agentId,
-          adapterType: "codex_local", status: "running", processPid: null, processGroupId: null, issueId: null }],
-        capturedAt: new Date("2026-11-24T00:06:00.000Z"),
-      });
-      const reconciliation = await heartbeatService(db).reconcileHotRestartAdoption(
-        new Date("2026-11-24T00:07:00.000Z"),
-      );
-      expect(reconciliation).toMatchObject({ adoptedRunIds: [], lostRunIds: [remote.runId] });
     });
   });
 

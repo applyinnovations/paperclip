@@ -812,21 +812,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         continue;
       }
 
-      const hasSelectiveAcpDrain =
+      const hasSelectiveDrain =
         (intent.drainReason === "active_acp_run" || intent.drainReason === "non_adoptable_run") &&
         (intent.drainRunIds?.length ?? 0) > 0;
       if (
-        hasSelectiveAcpDrain &&
+        hasSelectiveDrain &&
         intent.drainRunIds?.includes(candidate.runId)
       ) {
-        // A selective ACP drain is expected to persist a terminal row before
-        // the new server starts. If the process was terminated but that write
-        // failed, surface the run as lost instead of hiding it as an expected
-        // drain skip.
+        // A selective drain (ACP or non-adoptable runs) is expected to persist
+        // a terminal row before the new server starts. If the process was
+        // terminated but that write failed, surface the run as lost instead of
+        // hiding it as an expected drain skip.
         classify(candidate, "lost", "selective_drain_not_finalized", patch);
         continue;
       }
-      if (intent.drainRequired && !hasSelectiveAcpDrain) {
+      if (intent.drainRequired && !hasSelectiveDrain) {
         classify(candidate, "skipped", "drain_required", patch);
         continue;
       }
