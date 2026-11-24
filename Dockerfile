@@ -217,6 +217,12 @@ ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pa
 # Empty for local builds, preserving the server's normal version fallbacks.
 ARG PAPERCLIP_BUILD_VERSION=""
 ARG PAPERCLIP_BUILD_COMMIT=""
+# NODE_OPTIONS=--disable-sigusr1 covers every other Node process in the
+# container (the Deployment's `node -e` probes, agent CLIs). They run as the same
+# uid, and a plugin worker may `process.kill(-1, "SIGUSR1")`; without the flag
+# any of them would open an inspector on 127.0.0.1:9229 and run the worker's
+# code with full filesystem access (APP-37). The CMD flag below repeats it.
+ENV NODE_OPTIONS=--disable-sigusr1
 ENV NODE_ENV=production \
   HOME=/paperclip \
   HOST=0.0.0.0 \
@@ -244,7 +250,10 @@ EXPOSE 3100
 # tini reaps adopted orphans and forwards signals, so the exec chain below and
 # graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
 ENTRYPOINT ["/usr/bin/tini", "-s", "--", "docker-entrypoint.sh"]
-CMD ["node", "server/dist-runtime/index.mjs"]
+# --disable-sigusr1: plugin workers run as the same uid and the permission model
+# does not restrict process.kill, so without it a worker could SIGUSR1 the server
+# into opening its inspector and run code in the server process (APP-37).
+CMD ["node", "--disable-sigusr1", "server/dist-runtime/index.mjs"]
 
 # Cloud image variant (build with `--target cloud`): the production image
 # plus built bundled sandbox-provider plugins. Managed instances receive a

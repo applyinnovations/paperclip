@@ -3,12 +3,19 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
-import { expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createPluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const providerRoot = path.join(repoRoot, "packages/plugins/sandbox-providers/daytona");
 const pluginId = "fixture-daytona-provider";
+
+// The provider is bundled into a tmp dir here, outside the trusted plugin roots,
+// so it would run sandboxed and its fixture SDK could not append to the journal.
+// In production the bundled Daytona provider loads from a trusted root and runs
+// unsandboxed (an environment.drivers.register exception); match that here.
+beforeEach(() => vi.stubEnv("PAPERCLIP_PLUGIN_WORKER_SANDBOX", "off"));
+afterEach(() => vi.unstubAllEnvs());
 
 it.each(["release", "cancel", "stop", "destroy", "resume", "stalled-close"] as const)("preserves worker ownership after %s of a bound duplex channel", async mode => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-daytona-worker-close-"));
