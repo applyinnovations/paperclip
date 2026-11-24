@@ -895,10 +895,34 @@ export interface PluginConfig {
   configJson: Record<string, unknown>;
   /** Most recent config validation error, if any. */
   lastError: string | null;
+  /**
+   * Set when the config comes from a file the server manages
+   * (`PAPERCLIP_PLUGIN_CONFIG_FILE`): the API refuses writes and the UI shows
+   * it read-only. Absent otherwise.
+   */
+  managedBy?: "file";
   /** Timestamp when the config row was created. */
   createdAt: Date;
   /** Timestamp of the most recent config update. */
   updatedAt: Date;
+}
+
+/**
+ * `GET /api/plugins/:pluginId/config` for a (plugin, company) pair that
+ * `PAPERCLIP_PLUGIN_CONFIG_FILE` manages but that has no stored config yet
+ * (its entry has not applied: it failed validation, or the file has not been
+ * read). Read-only like any managed config; there is no row, so no id or
+ * timestamps.
+ */
+export interface PluginConfigManagedWithoutRow {
+  id: null;
+  pluginId: string;
+  companyId: string;
+  configJson: Record<string, never>;
+  lastError: null;
+  managedBy: "file";
+  createdAt: null;
+  updatedAt: null;
 }
 
 /**
