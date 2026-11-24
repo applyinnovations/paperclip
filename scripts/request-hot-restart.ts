@@ -2,31 +2,42 @@
 import { createDb } from "../packages/db/src/index.js";
 import { loadConfig } from "../server/src/config.js";
 import {
+  findListeningProcessPid,
   resolveHotRestartIntentPath,
   writeHotRestartIntent,
 } from "../server/src/services/hot-restart.js";
 
 function usage(): never {
   console.error([
-    "Usage: tsx scripts/request-hot-restart.ts --server-pid <pid> [--drain-required]",
+    "Usage: tsx scripts/request-hot-restart.ts (--server-pid <pid> | --server-port <port>) [--drain-required]",
     "",
     "Writes an instance-scoped hot-restart intent plus a legacy home-root handoff marker.",
+    "--server-port resolves the PID of the process listening on that TCP port (Linux /proc).",
   ].join("\n"));
   process.exit(2);
 }
 
+function readPositiveInteger(raw: string | undefined, max = Number.MAX_SAFE_INTEGER) {
+  if (!raw) usage();
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > max) usage();
+  return parsed;
+}
+
 function readArgs(argv: string[]) {
   let serverPid: number | null = null;
+  let serverPort: number | null = null;
   let drainRequired = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--server-pid") {
-      const raw = argv[index + 1];
-      if (!raw) usage();
-      const parsed = Number(raw);
-      if (!Number.isInteger(parsed) || parsed <= 0) usage();
-      serverPid = parsed;
+      serverPid = readPositiveInteger(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (arg === "--server-port") {
+      serverPort = readPositiveInteger(argv[index + 1], 65_535);
       index += 1;
       continue;
     }
@@ -39,8 +50,8 @@ function readArgs(argv: string[]) {
     usage();
   }
 
-  if (!serverPid) usage();
-  return { serverPid, drainRequired };
+  if ((serverPid === null) === (serverPort === null)) usage();
+  return { serverPid, serverPort, drainRequired };
 }
 
 function normalizeApiBase(raw: string | undefined) {
@@ -96,7 +107,9 @@ async function readPreflightActiveRunIds() {
   }
 }
 
-const { serverPid, drainRequired } = readArgs(process.argv.slice(2));
+const args = readArgs(process.argv.slice(2));
+const { drainRequired } = args;
+const serverPid = args.serverPid ?? await findListeningProcessPid(args.serverPort!);
 const preflightActiveRunIds = drainRequired ? [] : await readPreflightActiveRunIds();
 const previousServerInfo = await readPreviousServerInfo();
 const intent = await writeHotRestartIntent({

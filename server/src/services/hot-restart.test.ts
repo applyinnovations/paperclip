@@ -2,7 +2,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import http from "node:http";
 import {
+  findListeningProcessPid,
   findMissingHotRestartSnapshotRunIds,
   isObservedHotRestartTargetAlive,
   parseHotRestartIntent,
@@ -533,5 +535,89 @@ describe("hot-restart path compatibility", () => {
         }],
       },
     })).toEqual(["missing-run"]);
+  });
+});
+
+describe("findListeningProcessPid", () => {
+  const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+  // 0x0C1C = 3100. State 0A is LISTEN, 01 is ESTABLISHED.
+  const listen3100 = "   0: 00000000:0C1C 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0 100 0 0 10 0\n";
+  const client3100 = "   1: 0100007F:0C1C 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1000        0 5151 1 0 20 4 30 10 -1\n";
+
+  async function withProcFixture<T>(
+    layout: { tcp?: string; tcp6?: string; fds: Record<string, string[]> },
+    fn: (procRoot: string) => Promise<T>,
+  ) {
+    const procRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-proc-fixture-"));
+    try {
+      await fs.mkdir(path.join(procRoot, "net"));
+      if (layout.tcp !== undefined) await fs.writeFile(path.join(procRoot, "net", "tcp"), header + layout.tcp);
+      if (layout.tcp6 !== undefined) await fs.writeFile(path.join(procRoot, "net", "tcp6"), header + layout.tcp6);
+      await fs.mkdir(path.join(procRoot, "self"));
+      for (const [pid, targets] of Object.entries(layout.fds)) {
+        const fdDir = path.join(procRoot, pid, "fd");
+        await fs.mkdir(fdDir, { recursive: true });
+        for (const [index, target] of targets.entries()) {
+          await fs.symlink(target, path.join(fdDir, String(index)));
+        }
+      }
+      return await fn(procRoot);
+    } finally {
+      await fs.rm(procRoot, { recursive: true, force: true });
+    }
+  }
+
+  it("returns the process holding the listening socket, not a client of the port", async () => {
+    await withProcFixture({
+      tcp: listen3100 + client3100,
+      tcp6: "",
+      fds: {
+        "1": ["/dev/null"],
+        "7": ["/dev/null", "socket:[4242]"],
+        "12": ["socket:[5151]"],
+      },
+    }, async (procRoot) => {
+      await expect(findListeningProcessPid(3100, { procRoot, platform: "linux" })).resolves.toBe(7);
+    });
+  });
+
+  it("finds an IPv6 listener", async () => {
+    await withProcFixture({
+      tcp: "",
+      tcp6: "   0: 00000000000000000000000000000000:0C1C 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9001 1 0 100 0 0 10 0\n",
+      fds: { "8": ["socket:[9001]"] },
+    }, async (procRoot) => {
+      await expect(findListeningProcessPid(3100, { procRoot, platform: "linux" })).resolves.toBe(8);
+    });
+  });
+
+  it("fails when nothing listens, when the owner is not visible, or when several processes listen", async () => {
+    await withProcFixture({ tcp: client3100, fds: { "12": ["socket:[5151]"] } }, async (procRoot) => {
+      await expect(findListeningProcessPid(3100, { procRoot, platform: "linux" }))
+        .rejects.toThrow("No process is listening on TCP port 3100");
+    });
+    await withProcFixture({ tcp: listen3100, fds: { "1": ["/dev/null"] } }, async (procRoot) => {
+      await expect(findListeningProcessPid(3100, { procRoot, platform: "linux" }))
+        .rejects.toThrow("no process visible to this user holds it");
+    });
+    await withProcFixture({ tcp: listen3100, fds: { "7": ["socket:[4242]"], "9": ["socket:[4242]"] } }, async (procRoot) => {
+      await expect(findListeningProcessPid(3100, { procRoot, platform: "linux" }))
+        .rejects.toThrow("More than one process listens on TCP port 3100 (7, 9)");
+    });
+  });
+
+  it("refuses to guess off Linux", async () => {
+    await expect(findListeningProcessPid(3100, { platform: "darwin" })).rejects.toThrow("needs Linux /proc");
+  });
+
+  it.runIf(process.platform === "linux")("resolves this process from a real listener", async () => {
+    const server = http.createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as { port: number };
+      await expect(findListeningProcessPid(port)).resolves.toBe(process.pid);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

@@ -956,6 +956,24 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/request-hot-restart.ts --s
 systemctl restart paperclip.service
 ```
 
+In a container, the server's PID depends on what the image's init started
+first, so name the server by the port it serves instead. `--server-port`
+resolves the PID of the process listening on that TCP port through Linux
+`/proc`; run it as the server's user. A Kubernetes `preStop` exec hook in the
+standard image (which carries `tsx` and needs a writable `/tmp` for its cache):
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: [timeout, "20", node, --import, ./server/node_modules/tsx/dist/loader.mjs,
+        scripts/request-hot-restart.ts, --server-port, "3100"]
+```
+
+If the hook fails or times out, no marker is written and the server shuts down
+with the normal drain. The hook's time counts against
+`terminationGracePeriodSeconds`.
+
 The staged command records the target server's boot identity and operating
 system process start time with the PID. It reads process metadata through
 `/proc` on Linux, `ps` on macOS and BSD, and PowerShell on Windows. These
@@ -968,7 +986,7 @@ at least one identity source. Supported-platform process probes fail explicitly
 instead of silently treating a live PID as either the original owner or a
 recycled process when identity cannot be established.
 
-Use `--drain-required` only when the deploy intentionally requires the old terminate-and-retry behavior. Without that flag, the old server verifies that the marker targets its own PID, stops new scheduler work, waits for any queue-claim callback already in flight, snapshots currently running heartbeat run IDs and child PIDs, and skips the shutdown drain so eligible detached local-agent processes can keep running. ACP-backed local runs use server-owned stdio and cannot survive their parent server, so the old server instead persists their complete snapshot, changes the marker to `drainRequired` with `drainReason: "active_acp_run"`, and drains only those runs to bounded conversation retries. These retries resume the prior session when compatible, otherwise carry the full task conversation into a fresh session. They do not automatically replay tool calls or require receipts for every prior action. Detached CLI runs remain eligible for adoption during the same mixed restart. If an ACP process terminates but its terminal run update does not persist, startup classifies it as lost with reason `selective_drain_not_finalized` rather than treating the drain as successful. On startup the new server writes `$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json` with `previousServerPid`, `newServerPid`, `previousServerVersion`, `newServerVersion`, `drainReason`, `adoptedRunIds`, `finalizedWhileDownRunIds`, `lostRunIds`, and per-run classifications before the normal orphan reaper runs.
+Use `--drain-required` only when the deploy intentionally requires the old terminate-and-retry behavior. Without that flag, the old server verifies that the marker targets its own PID, stops new scheduler work, waits for any queue-claim callback already in flight, snapshots currently running heartbeat run IDs and child PIDs, and skips the shutdown drain so eligible detached local-agent processes can keep running. ACP-backed local runs use server-owned stdio and cannot survive their parent server, so the old server instead persists their complete snapshot, changes the marker to `drainRequired` with `drainReason: "active_acp_run"`, and drains only those runs to bounded conversation retries. These retries resume the prior session when compatible, otherwise carry the full task conversation into a fresh session. They do not automatically replay tool calls or require receipts for every prior action. Detached CLI runs remain eligible for adoption during the same mixed restart. A legacy run of a local CLI adapter with no persisted process identity (`processPid` and `processGroupId` both null), which is every run on a remote sandbox target because its process lives on another host or pod, cannot be adopted either: startup would report it lost for `missing_process_metadata` and the orphan reaper would fail it as `process_lost` without a retry. The old server drains those runs to the same interrupted-and-retried path. They join the ACP drain when there is one; otherwise the marker becomes `drainRequired` with `drainReason: "non_adoptable_run"`, and the other runs stay eligible for adoption. The shutting-down server applies this rule, so the first restart onto a release that carries it still runs the old rule. If an ACP process terminates but its terminal run update does not persist, startup classifies it as lost with reason `selective_drain_not_finalized` rather than treating the drain as successful. On startup the new server writes `$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json` with `previousServerPid`, `newServerPid`, `previousServerVersion`, `newServerVersion`, `drainReason`, `adoptedRunIds`, `finalizedWhileDownRunIds`, `lostRunIds`, and per-run classifications before the normal orphan reaper runs.
 
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat
