@@ -2271,7 +2271,10 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     // Claude writes no auth file back to the grant, so two runs share no
     // mutable state and must not wait for each other.
     const subscription = { ...input, binding: { ...binding, method: "subscription" as const }, responsibleUserId: "alice", config: { model: "same-model" } };
-    const account = (await service.list(companyId, "alice")).find(account => account.provider === "anthropic" && account.method === "subscription")!;
+    // Pick alice's own account: list() orders by random connection id, and
+    // earlier tests leave shared Anthropic subscriptions visible to alice.
+    const account = (await service.list(companyId, "alice")).find(account => account.provider === "anthropic" && account.method === "subscription"
+      && account.ownership === "personal" && account.ownerUserId === "alice")!;
     await service.setDefault(companyId, "alice", account.grantId);
     const [first, second] = await Promise.all([prepareManagedAiRuntime(db, subscription), prepareManagedAiRuntime(db, subscription)]);
     try {
@@ -2769,7 +2772,9 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const target = { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "daytona", runner: { execute: vi.fn(async () => ({ exitCode: 0, signal: null, stdout: "", stderr: "", timedOut: false, pid: null, startedAt: null })) } } as const;
     const resolveTarget = vi.spyOn(targetModule, "resolveEnvironmentExecutionTarget").mockResolvedValue(target);
     const release = vi.fn(async () => undefined);
-    const acquire = vi.fn(async () => ({ lease: { id: randomUUID(), provider: "daytona", providerLeaseId: "test-sandbox", metadata: {} }, leaseContext: {} }));
+    // A sandbox lease records its realized directory; the Test then has no
+    // lease metadata to persist for this unsaved fixture lease.
+    const acquire = vi.fn(async () => ({ lease: { id: randomUUID(), provider: "daytona", providerLeaseId: "test-sandbox", metadata: { remoteCwd: "/workspace" } }, leaseContext: {} }));
     const runtime = vi.spyOn(runtimeModule, "environmentRuntimeService").mockReturnValue({ acquireRunLease: acquire, realizeWorkspace: vi.fn(async () => ({ cwd: "/workspace" })), getDriver: () => ({ releaseRunLease: release }) } as any);
     const probe = vi.spyOn(requireServerAdapter("paperclip_runner"), "testEnvironment").mockImplementation(async context => ({ adapterType: "paperclip_runner", status: context.executionTarget ? "pass" : "fail", testedAt: new Date().toISOString(), checks: [{ code: context.executionTarget ? "codex_hello_probe_passed" : "host_probe_failed", level: context.executionTarget ? "info" : "error", message: "fixture" }] }));
     const app = express();
