@@ -2,6 +2,7 @@ import { restorePointSavesIgnoredFile } from "./git-restore-point.js";
 import { validateGitWorkspaceContents, type GitWorkspaceContents } from "./git-workspace-contents.js";
 import { recoverGitExpirationLocks, type GitExpirationLockLocation } from "./git-workspace-expiration-locks.js";
 import fs from "node:fs/promises";
+import { logger } from "../middleware/logger.js";
 import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -756,6 +757,8 @@ export async function finishGitCacheTrash(workspace: Workspace) {
     const expected = path.join(await fs.realpath(path.dirname(recipe.worktreePath)), path.basename(recipe.worktreePath), ".git");
     if (pointer !== expected) throw new GitCacheRestorationFailure();
     await fs.rm(state.worktreeAdmin, { recursive: true, force: true });
+    logger.info({ issueId: workspace.sourceIssueId ?? null, workspaceId: workspace.id, worktreePath: recipe.worktreePath,
+      worktreeAdmin: state.worktreeAdmin, reason: "git_cache_trash" }, "removed expired git worktree registration");
   }
   if (await exists(recipe.worktreePath)) return;
   for (const checkout of recipe.contents?.checkouts ?? []) {
