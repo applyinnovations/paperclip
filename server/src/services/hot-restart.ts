@@ -231,6 +231,79 @@ export async function readProcessStartedAt(
   return null;
 }
 
+const TCP_LISTEN_STATE = "0A";
+
+function readListeningSocketInodes(table: string, port: number) {
+  const inodes = new Set<string>();
+  for (const line of table.split("\n").slice(1)) {
+    // sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 10) continue;
+    const localPort = Number.parseInt(fields[1]?.split(":").pop() ?? "", 16);
+    if (localPort !== port || fields[3] !== TCP_LISTEN_STATE) continue;
+    const inode = fields[9];
+    if (inode && inode !== "0") inodes.add(inode);
+  }
+  return inodes;
+}
+
+/**
+ * Finds the PID of the process that listens on a TCP port, through `/proc`
+ * (Linux only). A container restart hook (for example a Kubernetes `preStop`
+ * exec) can name the server by the port it serves instead of a PID, which
+ * depends on how many processes the image's init started first.
+ *
+ * Reading another process's file descriptors needs the same user (or
+ * CAP_SYS_PTRACE), so run it as the server's user. Fails when no visible
+ * process, or more than one, holds a listening socket on the port.
+ */
+export async function findListeningProcessPid(
+  port: number,
+  options: { procRoot?: string; platform?: NodeJS.Platform } = {},
+) {
+  if ((options.platform ?? process.platform) !== "linux") {
+    throw new Error("Resolving a server PID from its port needs Linux /proc; pass --server-pid instead");
+  }
+  const procRoot = options.procRoot ?? "/proc";
+  const inodes = new Set<string>();
+  for (const table of ["tcp", "tcp6"]) {
+    const raw = await fs.readFile(path.join(procRoot, "net", table), "utf8").catch(() => "");
+    for (const inode of readListeningSocketInodes(raw, port)) inodes.add(inode);
+  }
+  if (inodes.size === 0) {
+    throw new Error(`No process is listening on TCP port ${port}`);
+  }
+
+  const owners = new Set<number>();
+  for (const entry of await fs.readdir(procRoot)) {
+    if (!/^\d+$/.test(entry)) continue;
+    const fdDir = path.join(procRoot, entry, "fd");
+    // Processes that exit or belong to another user are not readable; skip them.
+    const fds = await fs.readdir(fdDir).catch(() => [] as string[]);
+    for (const fd of fds) {
+      const target = await fs.readlink(path.join(fdDir, fd)).catch(() => null);
+      const inode = target?.match(/^socket:\[(\d+)\]$/)?.[1];
+      if (inode && inodes.has(inode)) {
+        owners.add(Number(entry));
+        break;
+      }
+    }
+  }
+  if (owners.size === 0) {
+    throw new Error(
+      `A socket listens on TCP port ${port}, but no process visible to this user holds it; `
+      + "run as the server's user",
+    );
+  }
+  if (owners.size > 1) {
+    throw new Error(
+      `More than one process listens on TCP port ${port} (${[...owners].sort((a, b) => a - b).join(", ")}); `
+      + "pass --server-pid instead",
+    );
+  }
+  return [...owners][0]!;
+}
+
 export function isObservedHotRestartTargetAlive(
   intent: HotRestartIntent,
   observation: {

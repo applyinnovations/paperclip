@@ -956,6 +956,24 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/request-hot-restart.ts --s
 systemctl restart paperclip.service
 ```
 
+In a container, the server's PID depends on what the image's init started
+first, so name the server by the port it serves instead. `--server-port`
+resolves the PID of the process listening on that TCP port through Linux
+`/proc`; run it as the server's user. A Kubernetes `preStop` exec hook in the
+standard image (which carries `tsx` and needs a writable `/tmp` for its cache):
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: [timeout, "20", node, --import, ./server/node_modules/tsx/dist/loader.mjs,
+        scripts/request-hot-restart.ts, --server-port, "3100"]
+```
+
+If the hook fails or times out, no marker is written and the server shuts down
+with the normal drain. The hook's time counts against
+`terminationGracePeriodSeconds`.
+
 The staged command records the target server's boot identity and operating
 system process start time with the PID. It reads process metadata through
 `/proc` on Linux, `ps` on macOS and BSD, and PowerShell on Windows. These
