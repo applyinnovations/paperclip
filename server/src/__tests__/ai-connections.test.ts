@@ -1644,6 +1644,38 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     } finally { fetchSpy.mockRestore(); }
   });
 
+  it("never revokes a shared Google sign-in on a run's failure when remote subscription delivery is enabled", async () => {
+    const secret = "shared-google-revoke-check-secret";
+    const account = await service.save(companyId, "alice", { provider: "anthropic", method: "subscription", ownership: "shared", name: "Shared Google revoke check", loginSessionId: "fixture", agentIds: [], allAgents: true }, secret);
+    // A Google sign-in has no usage probe. Store this shared grant as one.
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    await db.update(toolConnections).set({ config: { ...connection.config, ai: { provider: "google", method: "subscription" } } })
+      .where(eq(toolConnections.id, account.connectionId));
+    const generation = createHash("sha256").update(secret).digest("hex").slice(0, 16);
+    const fail = () => service.markAuthenticationFailed({ companyId, agentId, runStartedAt: new Date(), attribution: {
+      provider: "google", method: "subscription", connectionId: account.connectionId, grantId: account.grantId,
+      mode: "shared", responsibleUserId: null, identity: `${account.grantId}:shared:${generation}`,
+    } as never });
+    const status = async () => (await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0].status;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const previous = process.env.PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION;
+    try {
+      process.env.PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION = "true";
+      await fail();
+      await fail();
+      expect(await status()).toBe("active");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      // Without the opt-in, the existing behaviour stands: no probe, revoke.
+      delete process.env.PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION;
+      await fail();
+      expect(await status()).toBe("needs_reauthorization");
+    } finally {
+      fetchSpy.mockRestore();
+      if (previous === undefined) delete process.env.PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION;
+      else process.env.PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION = previous;
+    }
+  });
+
   it("vaults routed credentials, enforces compatibility and access, and configures both Codex runners", async () => {
     const routing = { kind: "openrouter", protocol: "responses", auth: "bearer", models: [{ id: "openai/gpt-5.4" }] } as const;
     const saved = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Routed test", ownership: "personal", apiKey: "fixture", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "fixture-routed-credential");

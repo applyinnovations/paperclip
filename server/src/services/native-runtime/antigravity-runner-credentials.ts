@@ -40,12 +40,14 @@ export async function prepareAntigravityRunnerCredentials(input: {
   remote: boolean;
   managedHome?: string;
   lifecycleMode?: "per_turn" | "warm";
+  /** The operator's opt-in (antigravityRemoteSubscriptionEnabled) to deliver a subscription remotely. */
+  remoteSubscription?: boolean;
 }): Promise<{ environment: NodeJS.ProcessEnv; home: string | null; credential?: string }> {
   const environment = { ...input.environment };
   for (const key of [AUTH_SECRET, "GEMINI_HOME", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_ACCESS_TOKEN"]) delete environment[key];
   if (environment.GEMINI_API_KEY?.trim()) return { environment, home: null };
   delete environment.GEMINI_API_KEY;
-  if (input.remote) throw new Error("Google Antigravity subscription authentication is not qualified for remote environments. Select a Google API key or use the Paperclip host.");
+  if (input.remote && !input.remoteSubscription) throw new Error("Google Antigravity subscription authentication is not qualified for remote environments. Select a Google API key or use the Paperclip host.");
   if (input.lifecycleMode === "warm") throw new Error("Google Antigravity subscription authentication requires turn-by-turn sessions; warm sessions are not qualified.");
   const home = input.managedHome?.trim();
   if (!home) throw new Error("Google Antigravity requires a selected managed Google account or Google API key.");
@@ -118,23 +120,35 @@ export async function prepareAntigravityCredentialRecovery(input: {
   }
 }
 
+/** Where the Runner's private runtime home lives. Local by default; a remote
+ * Runner's home is read and scrubbed through its execution target. */
+export type AntigravityRuntimeFiles = {
+  /** Reads one file; rejects with code ENOENT when it is absent. */
+  read(name: string): Promise<string>;
+  remove(names: string[]): Promise<void>;
+};
+
 /** Lifecycle callbacks copy into this invocation's home, never a shared login. */
 export function antigravityCredentialTurn(input: {
   managedHome: string;
   runtimeHome: string;
   credential: string;
+  runtimeFiles?: AntigravityRuntimeFiles;
 }) {
   const runtimeDirectory = join(input.runtimeHome, "antigravity-acp");
+  const readRuntime = input.runtimeFiles
+    ? (name: string) => input.runtimeFiles!.read(name)
+    : (name: string) => readLocalAiCredentialFile(join(runtimeDirectory, name));
   const destination = join(input.managedHome, "antigravity-acp", TOKEN_FILE);
   let pendingStage: { path: string; directoryDev: number; directoryIno: number; dev?: number; ino?: number } | undefined;
   return {
     copyBack: async () => {
       let serialized: string;
       try {
-        try { serialized = await readLocalAiCredentialFile(join(runtimeDirectory, TOKEN_FILE)); }
+        try { serialized = await readRuntime(TOKEN_FILE); }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          serialized = await readLocalAiCredentialFile(join(runtimeDirectory, REFRESH_FILE));
+          serialized = await readRuntime(REFRESH_FILE);
         }
       } catch (error) {
         // A provider that never started has no refresh to preserve.
@@ -279,6 +293,10 @@ export function antigravityCredentialTurn(input: {
       });
     },
     remove: async () => {
+      if (input.runtimeFiles) {
+        await input.runtimeFiles.remove([TOKEN_FILE, REFRESH_FILE, `${REFRESH_FILE}.tmp`]);
+        return;
+      }
       const directory = await openRunnerWorkspaceFile(runtimeDirectory, constants.O_RDONLY | constants.O_DIRECTORY)
         .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
       if (!directory) return;

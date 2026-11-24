@@ -135,4 +135,14 @@ describe("Google Antigravity setup admission", () => {
     expect(mocks.credentials).not.toHaveBeenCalled();
     expect(mocks.probe).not.toHaveBeenCalled();
   });
+
+  it("reports an untested remote sign-in, without reading credentials, only when remote subscription delivery is enabled", async () => {
+    vi.stubEnv("PAPERCLIP_ANTIGRAVITY_REMOTE_SUBSCRIPTION", "true");
+    try {
+      const result = await testAntigravityConnection({ ...context, executionTarget: { kind: "remote" } as AdapterEnvironmentTestContext["executionTarget"] }, model);
+      expect(result).toMatchObject({ status: "warn", checks: [{ code: "antigravity_remote_subscription_untested", level: "warn" }] });
+      expect(mocks.credentials).not.toHaveBeenCalled();
+      expect(mocks.probe).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
 });

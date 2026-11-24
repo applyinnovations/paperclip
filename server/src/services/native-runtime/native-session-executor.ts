@@ -88,6 +88,7 @@ import { resolveAcpxQualification, resolveAntigravityCandidateAdmission, resolve
 import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
 import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prepareAntigravityRunnerCredentials } from "./antigravity-runner-credentials.js";
+import { antigravityRemoteSubscriptionEnabled, remoteAntigravityRuntimeFiles } from "./antigravity-remote-subscription.js";
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
 import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
@@ -16123,6 +16124,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const antigravityCredential = isAntigravity ? await prepareAntigravityRunnerCredentials({
     environment: effectiveRunnerEnvironmentBase, remote: Boolean(remoteTarget), managedHome: input.managedAiCredentialHome,
     lifecycleMode: input.execution.session.lifecyclePolicy.mode,
+    remoteSubscription: antigravityRemoteSubscriptionEnabled(),
   }) : null;
   if (antigravityCredential) effectiveRunnerEnvironmentBase = antigravityCredential.environment;
   if (relayAssignedMcp) {
@@ -16663,10 +16665,16 @@ async function createRunnerdBackendWithinSessionClaim(
     }
     if (antigravityCredential?.home && antigravityCredential.credential && !boundManagedSessions.has(session)) {
       boundManagedSessions.add(session);
-      const runtimeHome = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "acpx", "acpx",
-        acpxRuntimeSessionDirectoryName(nativeSessionKey(input.execution)), "antigravity-home");
+      // The launch runtime directory already ends in "acpx"; ACPX adds its
+      // own namespace beneath it (the same layout as Grok's home below).
+      const relativeHome = `acpx/acpx/${acpxRuntimeSessionDirectoryName(nativeSessionKey(input.execution))}/antigravity-home`;
+      const runtimeHome = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", relativeHome);
+      const remoteHome = remoteRunnerFilesystemRoot ? posix.join(remoteRunnerFilesystemRoot, relativeHome) : null;
+      if (remoteTarget && (!remoteHome || !remoteCommandRunner)) throw new Error("Google Antigravity remote credential handoff is unavailable.");
       return bindAntigravityCredentialTurn(session, {
         managedHome: antigravityCredential.home, credential: antigravityCredential.credential, runtimeHome,
+        ...(remoteHome && remoteCommandRunner
+          ? { runtimeFiles: remoteAntigravityRuntimeFiles({ runner: remoteCommandRunner, runtimeHome: remoteHome }) } : {}),
       });
     }
     if (isGrok && grokCredential?.home && !boundManagedSessions.has(session)) {
