@@ -77,6 +77,7 @@ import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
 import { githubAppWebhookVerifier } from "./github-app-webhooks.js";
 import { githubApprovalsTokenSource } from "./github-approvals-token.js";
+import { githubAppWebhookRedeliverer } from "./github-app-webhook-redelivery.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -774,6 +775,7 @@ export function buildHostServices(
     githubAppTokens?: Pick<ReturnType<typeof githubAppInstallationTokenSource>, "resolve">;
     githubAppWebhooks?: ReturnType<typeof githubAppWebhookVerifier>;
     githubApprovalsTokens?: Pick<ReturnType<typeof githubApprovalsTokenSource>, "resolve">;
+    githubAppRedeliveries?: Pick<ReturnType<typeof githubAppWebhookRedeliverer>, "redeliverFailed">;
   } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
@@ -1863,6 +1865,57 @@ export function buildHostServices(
           appId: result.appId,
           installationId: result.installationId,
           repository: result.repository,
+          companyId,
+        };
+      },
+      async redeliverFailedDeliveries(params) {
+        // The host client handler has already pinned companyId to the invocation's company.
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const since = new Date(params.since);
+        if (!Number.isFinite(since.getTime())) {
+          throw new Error("githubApp.redeliverFailedDeliveries requires since as an ISO time");
+        }
+        const result = await (options.githubAppRedeliveries ?? githubAppWebhookRedeliverer()).redeliverFailed(
+          companyId,
+          since,
+        );
+        if (result.status === "not_applicable") return null;
+        if (result.status !== "done") {
+          await logActivity(db, {
+            companyId,
+            actorType: "plugin",
+            actorId: pluginId,
+            action: "plugin.github_app_webhooks.redelivery_failed",
+            entityType: "plugin",
+            entityId: pluginId,
+            details: { reason: result.error },
+          }).catch(() => undefined);
+          throw new Error(result.error);
+        }
+        if (result.redelivered.length > 0 || result.failed.length > 0) {
+          await logActivity(db, {
+            companyId,
+            actorType: "plugin",
+            actorId: pluginId,
+            action: "plugin.github_app_webhooks.redelivered",
+            entityType: "plugin",
+            entityId: pluginId,
+            details: {
+              appId: result.appId,
+              since: result.since,
+              redelivered: result.redelivered,
+              failed: result.failed,
+              skipped: result.skipped,
+            },
+          }).catch(() => undefined);
+        }
+        return {
+          redelivered: result.redelivered,
+          skipped: result.skipped,
+          failed: result.failed,
+          since: result.since,
+          appId: result.appId,
           companyId,
         };
       },

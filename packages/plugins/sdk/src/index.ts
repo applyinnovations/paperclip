@@ -251,6 +251,7 @@ export type {
   PluginGitHubAppInstallationToken,
   PluginGitHubAppWebhookVerification,
   PluginGitHubApprovalsToken,
+  PluginGitHubAppRedeliveryResult,
   PluginActivityClient,
   PluginActivityLogEntry,
   PluginStateClient,

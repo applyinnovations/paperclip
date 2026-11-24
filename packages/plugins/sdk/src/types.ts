@@ -720,6 +720,24 @@ export interface PluginGitHubApprovalsToken {
   companyId: string;
 }
 
+/** The outcome of `ctx.githubApp.redeliverFailedDeliveries`. Never carries delivery payloads. */
+export interface PluginGitHubAppRedeliveryResult {
+  /**
+   * Delivery GUIDs (`X-GitHub-Delivery`) GitHub accepted a redelivery for, oldest first.
+   * Each one arrives again through the normal webhook route under the same GUID.
+   */
+  redelivered: string[];
+  /** Deliveries in the window that were not redelivered because an attempt succeeded. */
+  skipped: number;
+  /** GUIDs GitHub refused to redeliver. A later call may pick them up again. */
+  failed: string[];
+  /** The start of the window searched (ISO), after capping `since` to GitHub's three-day retention. */
+  since: string;
+  appId: string;
+  /** The company the deliveries were redelivered for: always the invocation's company. */
+  companyId: string;
+}
+
 /** The host's verdict on a GitHub App webhook delivery. */
 export type PluginGitHubAppWebhookVerification =
   | {
@@ -781,6 +799,17 @@ export interface PluginGitHubAppClient {
    * `getInstallationToken`, a `companyId` other than the invocation's company is denied.
    */
   getApprovalsToken(options: { repository: string; companyId?: string }): Promise<PluginGitHubApprovalsToken | null>;
+
+  /**
+   * Ask GitHub to redeliver the company App's webhook deliveries that failed since `since`
+   * (an ISO time; capped to GitHub's three-day retention), e.g. on startup after downtime.
+   * Requires `github.app.webhooks.redeliver`. A delivery is redelivered when none of its
+   * attempts got a 2xx response; redeliveries arrive through `onWebhook` like any delivery,
+   * so verify and deduplicate them on `X-GitHub-Delivery` as usual. No payloads are returned.
+   * Resolves `null` when the company has no GitHub App. As with `getInstallationToken`, a
+   * `companyId` other than the invocation's company is denied.
+   */
+  redeliverFailedDeliveries(options: { since: string; companyId?: string }): Promise<PluginGitHubAppRedeliveryResult | null>;
 }
 
 /**
@@ -2376,7 +2405,7 @@ export interface PluginContext {
   /** Resolve secret references. Requires `secrets.read-ref`. */
   secrets: PluginSecretsClient;
 
-  /** Operator-owned GitHub App tokens and webhook verification. Requires `github.app.*`. */
+  /** Operator-owned GitHub App tokens, webhook verification and redelivery. Requires `github.app.*`. */
   githubApp: PluginGitHubAppClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */

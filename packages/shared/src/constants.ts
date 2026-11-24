@@ -1435,11 +1435,13 @@ export const PLUGIN_CAPABILITIES = [
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",
-  // Operator-owned GitHub Apps: mint the invocation company's installation token, and
-  // verify App webhook deliveries on the host. The App private key and webhook secret
-  // never reach the plugin.
+  // Operator-owned GitHub Apps: mint the invocation company's installation token, verify
+  // App webhook deliveries on the host, and have the host ask GitHub to redeliver the
+  // company App's failed deliveries. The App private key, the App JWT and the webhook
+  // secret never reach the plugin.
   "github.app.token",
   "github.app.webhooks.verify",
+  "github.app.webhooks.redeliver",
   // The shared approvals App: a token scoped to one operator-allowlisted repository of the
   // invocation's company, for posting gate results. The key never reaches the plugin.
   "github.approvals.token",

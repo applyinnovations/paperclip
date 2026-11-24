@@ -693,6 +693,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             ...(options.companyId ? { companyId: options.companyId } : {}),
           });
         },
+        async redeliverFailedDeliveries(options) {
+          return callHost("githubApp.redeliverFailedDeliveries", {
+            since: options.since,
+            ...(options.companyId ? { companyId: options.companyId } : {}),
+          });
+        },
       },
 
       activity: {
