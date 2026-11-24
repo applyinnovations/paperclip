@@ -45,15 +45,30 @@ export function newRunUlidDns(now: () => number = Date.now): string {
 
 export interface LabelsInput {
   runId: string;
-  agentId: string;
+  /** The run's agent. Absent or not a valid label value: the label is omitted. */
+  agentId?: string | null;
   companyId: string;
   adapterType: string;
 }
 
+// Kubernetes label values: at most 63 chars, alphanumeric at both ends, with
+// '-', '_' and '.' allowed in between.
+const LABEL_VALUE_RE = /^(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)$/;
+
+export function isValidLabelValue(value: string): boolean {
+  return LABEL_VALUE_RE.test(value);
+}
+
 export function paperclipLabels(input: LabelsInput): Record<string, string> {
+  // A wrong agent id is worse than none: Grafana groups sandbox memory and OOM
+  // kills by this label. So never substitute another id; omit the label when
+  // the host did not send a usable one.
+  const agentId = typeof input.agentId === "string" && isValidLabelValue(input.agentId)
+    ? input.agentId
+    : null;
   return {
     "paperclip.io/run-id": input.runId,
-    "paperclip.io/agent-id": input.agentId,
+    ...(agentId ? { "paperclip.io/agent-id": agentId } : {}),
     "paperclip.io/company-id": input.companyId,
     "paperclip.io/adapter": input.adapterType,
     "paperclip.io/managed-by": "paperclip-k8s-plugin",

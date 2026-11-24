@@ -5,6 +5,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // lease is handed out only once its pod can take an exec.
 const h = vi.hoisted(() => ({
   waitForReady: vi.fn(async () => ({ phase: "Running", active: 1 })),
+  sandboxClaim: vi.fn(async (..._args: unknown[]) => ({ uid: "uid-1" })),
+  jobClaim: vi.fn(async (..._args: unknown[]) => ({ uid: "uid-job" })),
   release: vi.fn(async () => undefined),
   jobWait: vi.fn(),
 }));
@@ -20,7 +22,7 @@ vi.mock("../../src/sandbox-cr-orchestrator.js", async (importActual) => {
   return {
     ...actual,
     sandboxCrOrchestrator: {
-      claim: vi.fn(async () => ({ uid: "uid-1" })),
+      claim: h.sandboxClaim,
       findPod: vi.fn(async () => "pc-pod"),
       waitForCompletion: h.waitForReady,
       release: h.release,
@@ -34,7 +36,7 @@ vi.mock("../../src/job-orchestrator.js", async (importActual) => {
   return {
     ...actual,
     jobOrchestrator: {
-      claim: vi.fn(async () => ({ uid: "uid-job" })),
+      claim: h.jobClaim,
       findPod: vi.fn(async () => "pc-job-pod"),
       waitForCompletion: h.jobWait,
       release: vi.fn(async () => undefined),
@@ -50,14 +52,25 @@ vi.mock("../../src/scoped-network-egress.js", async (importActual) => {
 
 import plugin from "../../src/plugin.js";
 
-function acquire(config: Record<string, unknown> = {}) {
+function acquire(config: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
   return plugin.definition.onEnvironmentAcquireLease!({
     driverKey: "kubernetes",
     companyId: "company-1",
     environmentId: "env-1",
     runId: "run-1",
     config: { inCluster: true, ...config },
+    ...extra,
   } as never);
+}
+
+type Manifest = {
+  metadata: { labels: Record<string, string> };
+  spec: { template?: { metadata: { labels: Record<string, string> } }; podTemplate?: { metadata: { labels: Record<string, string> } } };
+};
+
+function podLabels(claim: typeof h.sandboxClaim): Record<string, string> {
+  const manifest = claim.mock.calls.at(-1)![2] as Manifest;
+  return (manifest.spec.podTemplate ?? manifest.spec.template)!.metadata.labels;
 }
 
 beforeEach(() => {
@@ -65,6 +78,30 @@ beforeEach(() => {
   h.waitForReady.mockImplementation(async () => ({ phase: "Running", active: 1 }));
   h.release.mockClear();
   h.jobWait.mockClear();
+  h.sandboxClaim.mockClear();
+  h.jobClaim.mockClear();
+});
+
+describe("onEnvironmentAcquireLease pod labels", () => {
+  const agentId = "0d9c52f6-2f30-4d3e-9a01-aaaaaaaa0001";
+
+  for (const backend of ["sandbox-cr", "job"] as const) {
+    const claim = backend === "job" ? h.jobClaim : h.sandboxClaim;
+
+    it(`labels the ${backend} pod with the run's agent id, not the run id`, async () => {
+      await acquire({ backend }, { agentId });
+      const labels = podLabels(claim);
+      expect(labels["paperclip.io/agent-id"]).toBe(agentId);
+      expect(labels["paperclip.io/run-id"]).toBe("run-1");
+    });
+
+    it(`omits the agent-id label on the ${backend} pod when the host sends no agent id`, async () => {
+      await acquire({ backend });
+      const labels = podLabels(claim);
+      expect(labels).not.toHaveProperty("paperclip.io/agent-id");
+      expect(labels["paperclip.io/run-id"]).toBe("run-1");
+    });
+  }
 });
 
 describe("onEnvironmentAcquireLease readiness", () => {
