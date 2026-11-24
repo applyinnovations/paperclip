@@ -94,6 +94,26 @@ Keep provider-level egress defaults narrow, then grant only the destinations a t
 
 The provider creates a workload-owned policy selected by the task run label, so the additional destinations do not become reachable from other concurrent agent pods. Cilium mode enforces FQDNs directly. Standard NetworkPolicy mode cannot express FQDNs, so an FQDN grant permits public IPv4 TCP 80/443 for that run while excluding private, loopback, link-local, CGNAT, and multicast ranges. Network failures that look policy-related include the grant path in stderr, and the sandbox exposes the effective policy through `PAPERCLIP_NETWORK_EGRESS_*` environment variables.
 
+### Host disk used by file sync
+
+Native file sync never stages inbound transfers on the server: the archive is
+built in-process and streamed into the pod. Outbound transfers (workspace
+restore, git bundles, artifacts) must land on the server's disk before they are
+checked and extracted, so the worker reserves each one's bytes from a single
+staging budget first. Excess syncs wait their turn; a sync that alone exceeds
+the budget fails with an error naming the budget.
+
+| Env var (worker) | Default | Meaning |
+| --- | --- | --- |
+| `PAPERCLIP_K8S_SYNC_STAGING_BUDGET_BYTES` | `1Gi` | Most bytes all outbound syncs may stage in the server's temp dir at once. Bytes, or `K`/`M`/`G`/`Ki`/`Mi`/`Gi`. An invalid value logs a warning and uses the default. |
+
+Plugin workers receive only the env vars they are granted, so set it on the
+server and grant it to this plugin (`plugins.workerEnv` in the managed instance
+config). Size the server's temp volume as this budget plus what else writes
+there, including the restored copies the server keeps until it merges them.
+Each sync operation logs `kubernetes file sync operation` with `direction`,
+`runId`, `bytesTransferred`, `bytesStaged` and `stagingWaitMs`.
+
 ## Subscription sign-in (login PTY)
 
 The driver advertises `supportsLoginPty`, so Paperclip's provider-generic sign-in flows can create a Claude (`claude setup-token`) or ChatGPT (`codex login --device-auth`) subscription connection in the company's own sandbox. The login runs on a terminal exec (`tty=true`) in a fresh Sandbox pod, never in the Paperclip server or plugin worker process.

@@ -40,7 +40,13 @@ import {
 import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
-import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
+import {
+  performSyncIn,
+  performSyncOut,
+  type PodStreamExec,
+  type SyncOperationTelemetry,
+} from "./file-sync.js";
+import { getSyncStagingBudget, SYNC_STAGING_BUDGET_ENV } from "./staging-budget.js";
 import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
@@ -132,6 +138,30 @@ function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
     return remoteCwd.trim();
   }
   throw new Error("Kubernetes file sync requires a workspace remote dir on the lease metadata.");
+}
+
+/**
+ * Per-operation file-sync telemetry: one log line per operation with its
+ * direction, run, bytes moved, bytes staged on host disk and the time it queued
+ * for the staging budget, so `/tmp` sizing can be checked against real traffic.
+ */
+function syncTelemetryLogger(
+  params: PluginEnvironmentSyncInParams | PluginEnvironmentSyncOutParams,
+): (telemetry: SyncOperationTelemetry) => void {
+  const runId = typeof params.lease.metadata?.runId === "string" ? params.lease.metadata.runId : null;
+  return (telemetry) => {
+    const budget = getSyncStagingBudget();
+    pluginContext?.logger.info("kubernetes file sync operation", {
+      ...telemetry,
+      runId,
+      issueId: params.issueId ?? null,
+      environmentId: params.environmentId,
+      providerLeaseId: params.lease.providerLeaseId,
+      stagingBudgetBytes: budget.capacityBytes,
+      stagingReservedBytes: budget.reservedBytes,
+      stagingQueued: budget.waitingCount,
+    });
+  };
 }
 
 /**
@@ -305,7 +335,12 @@ async function resolveLoginPodExec(target: LoginLeaseTarget): Promise<LoginPodEx
 const plugin = definePlugin({
   async setup(ctx) {
     pluginContext = ctx;
-    ctx.logger.info("Kubernetes sandbox provider plugin ready");
+    const budget = getSyncStagingBudget((raw) =>
+      ctx.logger.warn(`Ignoring invalid ${SYNC_STAGING_BUDGET_ENV}; using the default`, { value: raw }),
+    );
+    ctx.logger.info("Kubernetes sandbox provider plugin ready", {
+      syncStagingBudgetBytes: budget.capacityBytes,
+    });
   },
 
   async onHealth() {
@@ -607,6 +642,7 @@ const plugin = definePlugin({
       // exposes one. Flag the job backend so the server keeps the base64 fallback
       // rather than routing its sync to a hook that would reject immediately.
       nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
+      runId: params.runId,
     };
 
     // Only the Sandbox shutdown time is an absolute, controller-enforced
@@ -714,6 +750,9 @@ const plugin = definePlugin({
       // See acquireLease: only the sandbox-cr backend has a pod-exec channel for
       // native sync, so a resumed job lease must keep the base64 fallback.
       nativeFileSyncUnsupported: leaseBackend !== "sandbox-cr",
+      runId:
+        params.runId ??
+        (typeof params.leaseMetadata?.runId === "string" ? params.leaseMetadata.runId : undefined),
     };
 
     return {
@@ -1206,8 +1245,10 @@ const plugin = definePlugin({
   // Opt-in native inbound transfer. Defining this hook (with onEnvironmentSyncOut)
   // makes the worker advertise `environmentSyncIn`/`environmentSyncOut`, so the
   // host runner routes workspace/asset transfers through a single pod exec per
-  // operation (host tar streamed over the exec stdin → in-pod `head -c <N> | tar
-  // -x` → stage-then-atomic-`mv -f`) instead of the base64-over-exec chunk loop.
+  // operation (in-process host tar streamed over the exec stdin → in-pod `head -c
+  // <N> | tar -x` → stage-then-atomic-`mv -f`; outbound archives staged on host
+  // disk under the worker-wide staging budget) instead of the base64-over-exec
+  // chunk loop.
   // Only the sandbox-cr backend is supported; the job backend carries no file
   // path. Providers that do not define these keep the byte-identical fallback.
   async onEnvironmentSyncIn(
@@ -1220,6 +1261,7 @@ const plugin = definePlugin({
       operations: params.operations,
       remoteDir,
       timeoutMs,
+      onOperation: syncTelemetryLogger(params),
     });
   },
 
@@ -1234,6 +1276,7 @@ const plugin = definePlugin({
       operations: params.operations,
       remoteDir,
       timeoutMs,
+      onOperation: syncTelemetryLogger(params),
     });
   },
 

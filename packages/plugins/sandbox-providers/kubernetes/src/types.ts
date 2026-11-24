@@ -111,4 +111,10 @@ export interface KubernetesLeaseMetadata {
    * sync may be used when the worker advertises the verbs.
    */
   nativeFileSyncUnsupported?: boolean;
+  /**
+   * The run this lease serves (the latest one for a resumed lease). Recorded so
+   * per-operation file-sync telemetry can name its run: the sync hooks carry
+   * the lease but no run id.
+   */
+  runId?: string;
 }

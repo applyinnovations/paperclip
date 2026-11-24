@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,9 @@ import {
   performSyncOut,
   splitLinkEntryOnce,
   type PodStreamExec,
+  type SyncOperationTelemetry,
 } from "../../src/file-sync.js";
+import { StagingBudget, StagingBudgetExceededError } from "../../src/staging-budget.js";
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -1127,5 +1129,310 @@ describe("kubernetes onEnvironmentSyncIn in-process tar exclude semantics", () =
     await expect(fs.lstat(path.join(remoteDir, "out/node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.lstat(path.join(remoteDir, "out/pkg/node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.lstat(path.join(remoteDir, "out/pkg/._sidecar"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host /tmp bounds (APP-14). Sync-in streams with nothing staged on host disk;
+// sync-out stages under a worker-wide byte budget, so peak host staging is
+// bounded however many syncs run at once.
+// ---------------------------------------------------------------------------
+const HOST_STAGING_PREFIX = "paperclip-k8s-sync-";
+
+async function hostStagingDirs(): Promise<string[]> {
+  return (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith(HOST_STAGING_PREFIX));
+}
+
+async function treeBytes(root: string): Promise<number> {
+  let total = 0;
+  for (const entry of await fs.readdir(root, { withFileTypes: true }).catch(() => [])) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) total += await treeBytes(full);
+    else total += (await fs.lstat(full).catch(() => ({ size: 0 }))).size;
+  }
+  return total;
+}
+
+// Runs every exec in its own TMPDIR so host staging can be measured without
+// other test files' temp dirs in the way.
+async function withIsolatedTmpdir<T>(fn: (tmp: string) => Promise<T>): Promise<T> {
+  const previous = process.env.TMPDIR;
+  const tmp = await makeTmp("k8s-isolated-tmp-");
+  process.env.TMPDIR = tmp;
+  try {
+    return await fn(tmp);
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+}
+
+// Stub pod exec that streams fixed bytes on stdout without running a shell.
+function makeBytesExec(bytes: Buffer): PodStreamExec {
+  return makeArchiveExec(bytes);
+}
+
+describe("kubernetes onEnvironmentSyncIn streams without host staging", () => {
+  it("never writes a sync-in archive or staging copy to host disk, for file and directory mappings", async () => {
+    await withIsolatedTmpdir(async () => {
+      const remoteDir = await makeTmp("k8s-sandbox-");
+      const host = await makeTmp("k8s-host-");
+      await fs.writeFile(path.join(host, "a.txt"), "alpha".repeat(1000));
+      await fs.writeFile(path.join(host, "empty.txt"), "");
+      await fs.mkdir(path.join(host, "tree/sub"), { recursive: true });
+      await fs.writeFile(path.join(host, "tree/sub/b.txt"), "bravo");
+      await fs.chmod(path.join(host, "a.txt"), 0o640);
+
+      const { exec: realExec } = makeRealExec();
+      const seen: string[][] = [];
+      const exec: PodStreamExec = async (command, io) => {
+        seen.push(await hostStagingDirs());
+        return realExec(command, io);
+      };
+      const telemetry: SyncOperationTelemetry[] = [];
+      const result = await performSyncIn({
+        exec,
+        remoteDir,
+        timeoutMs: 30_000,
+        onOperation: (entry) => telemetry.push(entry),
+        operations: [
+          {
+            operationId: "op",
+            files: [
+              { sourcePath: path.join(host, "a.txt"), targetPath: path.join(remoteDir, "a.txt"), kind: "file" },
+              { sourcePath: path.join(host, "empty.txt"), targetPath: path.join(remoteDir, "e/empty.txt"), kind: "file" },
+              { sourcePath: path.join(host, "tree"), targetPath: path.join(remoteDir, "tree"), kind: "directory" },
+            ],
+          },
+        ],
+      });
+
+      expect(seen).toEqual([[], []]);
+      expect(await hostStagingDirs()).toEqual([]);
+      expect(await fs.readFile(path.join(remoteDir, "a.txt"), "utf8")).toBe("alpha".repeat(1000));
+      expect((await fs.stat(path.join(remoteDir, "a.txt"))).mode & 0o777).toBe(0o640);
+      expect(await fs.readFile(path.join(remoteDir, "e/empty.txt"), "utf8")).toBe("");
+      expect(await fs.readFile(path.join(remoteDir, "tree/sub/b.txt"), "utf8")).toBe("bravo");
+      expect(result.operations[0].filesTransferred).toBe(3);
+      expect(telemetry).toEqual([
+        expect.objectContaining({ direction: "in", operationId: "op", filesTransferred: 3, bytesStaged: 0, stagingWaitMs: 0 }),
+      ]);
+    });
+  });
+
+  it("fails loud when a file source changes size after the archive was sized", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const host = await makeTmp("k8s-host-");
+    const source = path.join(host, "grows.txt");
+    await fs.writeFile(source, "short");
+    const { exec: realExec } = makeRealExec();
+    const exec: PodStreamExec = async (command, io) => {
+      await fs.writeFile(source, "now considerably longer than announced");
+      return realExec(command, io);
+    };
+    await expect(
+      performSyncIn({
+        exec,
+        remoteDir,
+        timeoutMs: 30_000,
+        operations: [{ operationId: "op", files: [{ sourcePath: source, targetPath: path.join(remoteDir, "grows.txt"), kind: "file" }] }],
+      }),
+    ).rejects.toThrow(/changed during the sync/);
+    await expect(fs.stat(path.join(remoteDir, "grows.txt"))).rejects.toThrow();
+  });
+
+  it("fails loud when a directory source changes after the archive was sized", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const host = await makeTmp("k8s-host-");
+    await fs.writeFile(path.join(host, "a.txt"), "a");
+    const { exec: realExec } = makeRealExec();
+    const exec: PodStreamExec = async (command, io) => {
+      await fs.writeFile(path.join(host, "a.txt"), "x".repeat(4096));
+      return realExec(command, io);
+    };
+    await expect(
+      performSyncIn({
+        exec,
+        remoteDir,
+        timeoutMs: 30_000,
+        operations: [{ operationId: "op", files: [{ sourcePath: host, targetPath: path.join(remoteDir, "out"), kind: "directory" }] }],
+      }),
+    ).rejects.toThrow(/changed (or became unreadable )?during the sync/);
+  });
+});
+
+describe("kubernetes onEnvironmentSyncOut host staging budget", () => {
+  it.skipIf(process.platform !== "linux")("never stages more than the budget across many concurrent syncs, queueing the excess", async () => {
+    await withIsolatedTmpdir(async (tmp) => {
+      const remoteDir = await makeTmp("k8s-sandbox-");
+      await fs.writeFile(path.join(remoteDir, "payload.bin"), Buffer.alloc(256 * 1024, 7));
+      // Each sync stages its archive plus the extracted copy (its target is under
+      // the temp dir): about 2 × 258 KiB. The budget admits two at a time.
+      const budget = new StagingBudget(1100 * 1024);
+      const { exec } = makeRealExec();
+      const telemetry: SyncOperationTelemetry[] = [];
+      let peakReserved = 0;
+      let peakStagedOnDisk = 0;
+      let peakQueued = 0;
+      let sampling = true;
+      const sampler = (async () => {
+        while (sampling) {
+          peakReserved = Math.max(peakReserved, budget.reservedBytes);
+          peakQueued = Math.max(peakQueued, budget.waitingCount);
+          let staged = 0;
+          for (const dir of await hostStagingDirs()) staged += await treeBytes(path.join(tmp, dir));
+          peakStagedOnDisk = Math.max(peakStagedOnDisk, staged);
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      })();
+
+      const targets = await Promise.all(Array.from({ length: 8 }, (_, i) => fs.mkdtemp(path.join(tmp, `out-${i}-`))));
+      try {
+        await Promise.all(
+          targets.map((target, i) =>
+            performSyncOut({
+              exec,
+              remoteDir,
+              timeoutMs: 60_000,
+              stagingBudget: budget,
+              onOperation: (entry) => telemetry.push(entry),
+              operations: [{ operationId: `op-${i}`, files: [{ kind: "directory", sourcePath: remoteDir, targetPath: target }] }],
+            }),
+          ),
+        );
+      } finally {
+        sampling = false;
+        await sampler;
+      }
+
+      for (const target of targets) {
+        expect((await fs.readFile(path.join(target, "payload.bin"))).length).toBe(256 * 1024);
+      }
+      expect(peakReserved).toBeLessThanOrEqual(budget.capacityBytes);
+      expect(peakStagedOnDisk).toBeLessThanOrEqual(budget.capacityBytes);
+      expect(peakQueued).toBeGreaterThan(0);
+      expect(budget.reservedBytes).toBe(0);
+      expect(await hostStagingDirs()).toEqual([]);
+      expect(telemetry).toHaveLength(8);
+      for (const entry of telemetry) {
+        expect(entry.direction).toBe("out");
+        expect(entry.bytesStaged).toBe(entry.bytesTransferred * 2);
+      }
+      expect(telemetry.some((entry) => entry.stagingWaitMs > 0)).toBe(true);
+    });
+  });
+
+  it.skipIf(process.platform !== "linux")("fails a sync that alone exceeds the budget clearly, writing nothing on the host", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    await fs.writeFile(path.join(remoteDir, "big.bin"), Buffer.alloc(64 * 1024, 1));
+    const target = path.join(hostOut, "big.bin");
+    const budget = new StagingBudget(16 * 1024);
+    const { exec, calls } = makeRealExec();
+    const failure = performSyncOut({
+      exec,
+      remoteDir,
+      timeoutMs: 30_000,
+      stagingBudget: budget,
+      operations: [{ operationId: "op", files: [{ kind: "file", sourcePath: path.join(remoteDir, "big.bin"), targetPath: target }] }],
+    });
+    await expect(failure).rejects.toBeInstanceOf(StagingBudgetExceededError);
+    await expect(failure).rejects.toThrow(/16384-byte sync staging budget/);
+    await expect(fs.stat(target)).rejects.toThrow();
+    expect(budget.reservedBytes).toBe(0);
+    // The pod's archive snapshot is removed on exit, success or not. The fake
+    // exec settles as soon as the host aborts, before the pod script exits.
+    const snapshot = calls[0].script.match(/_pc_arc='([^']+)'/)?.[1];
+    expect(snapshot).toMatch(/^\/tmp\/\.paperclip-upload-[0-9a-f-]+\.tar$/);
+    await vi.waitFor(() => expect(fs.stat(snapshot!)).rejects.toMatchObject({ code: "ENOENT" }), { timeout: 5_000 });
+  });
+
+  it.skipIf(process.platform !== "linux")("removes the pod-side archive snapshot after a successful sync", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    await fs.writeFile(path.join(remoteDir, "result.txt"), "done");
+    const { exec, calls } = makeRealExec();
+    await performSyncOut({
+      exec,
+      remoteDir,
+      timeoutMs: 30_000,
+      stagingBudget: new StagingBudget(1024 * 1024),
+      operations: [{ operationId: "op", files: [{ kind: "directory", sourcePath: remoteDir, targetPath: hostOut }] }],
+    });
+    expect(await fs.readFile(path.join(hostOut, "result.txt"), "utf8")).toBe("done");
+    const snapshot = calls[0].script.match(/_pc_arc='([^']+)'/)?.[1];
+    await expect(fs.stat(snapshot!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform !== "linux")("keeps a synced-back file's own mode when the mapping sets none", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    await fs.writeFile(path.join(remoteDir, "report.txt"), "report");
+    await fs.chmod(path.join(remoteDir, "report.txt"), 0o644);
+    const { exec } = makeRealExec();
+    await performSyncOut({
+      exec,
+      remoteDir,
+      timeoutMs: 30_000,
+      stagingBudget: new StagingBudget(1024 * 1024),
+      operations: [{ operationId: "op", files: [{ kind: "file", sourcePath: path.join(remoteDir, "report.txt"), targetPath: path.join(hostOut, "report.txt") }] }],
+    });
+    const umask = process.umask();
+    expect((await fs.stat(path.join(hostOut, "report.txt"))).mode & 0o777).toBe(0o644 & ~umask);
+  });
+
+  async function syncOutBytes(bytes: Buffer, budget: StagingBudget) {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const target = path.join(await makeTmp("k8s-hostout-"), "restored");
+    const telemetry: SyncOperationTelemetry[] = [];
+    const run = performSyncOut({
+      exec: makeBytesExec(bytes),
+      remoteDir,
+      timeoutMs: 30_000,
+      stagingBudget: budget,
+      onOperation: (entry) => telemetry.push(entry),
+      operations: [{ operationId: "op", files: [{ kind: "directory", sourcePath: path.join(remoteDir, "out"), targetPath: target }] }],
+    });
+    return { run, target, telemetry };
+  }
+
+  it("fails closed when the sandbox sends more bytes than it declared", async () => {
+    const budget = new StagingBudget(1024 * 1024);
+    const archive = craftTarball([{ path: "a.txt", body: "a" }]);
+    const { run, target } = await syncOutBytes(
+      Buffer.concat([Buffer.from(`PCSYNC1 ${archive.length}\n`), archive, Buffer.alloc(512)]),
+      budget,
+    );
+    await expect(run).rejects.toThrow(/more than the \d+ archive bytes the sandbox declared/);
+    await expect(fs.stat(target)).rejects.toThrow();
+    expect(budget.reservedBytes).toBe(0);
+  });
+
+  it("fails closed when the sandbox sends fewer bytes than it declared", async () => {
+    const budget = new StagingBudget(1024 * 1024);
+    const archive = craftTarball([{ path: "a.txt", body: "a" }]);
+    const { run, target } = await syncOutBytes(
+      Buffer.concat([Buffer.from(`PCSYNC1 ${archive.length + 512}\n`), archive]),
+      budget,
+    );
+    await expect(run).rejects.toThrow(/ended after \d+ of the \d+ archive bytes/);
+    await expect(fs.stat(target)).rejects.toThrow();
+    expect(budget.reservedBytes).toBe(0);
+  });
+
+  it("rejects a malformed size frame", async () => {
+    const budget = new StagingBudget(1024 * 1024);
+    const { run } = await syncOutBytes(Buffer.from("PCSYNC1 12x\n"), budget);
+    await expect(run).rejects.toThrow(/malformed archive size frame/);
+    expect(budget.reservedBytes).toBe(0);
+  });
+
+  it("makes an unframed archive reserve the whole budget, so it can only run alone", async () => {
+    const budget = new StagingBudget(1024 * 1024);
+    const { run, target, telemetry } = await syncOutBytes(craftTarball([{ path: "a.txt", body: "alpha" }]), budget);
+    await run;
+    expect(await fs.readFile(path.join(target, "a.txt"), "utf8")).toBe("alpha");
+    expect(telemetry[0].bytesStaged).toBe(budget.capacityBytes);
+    expect(budget.reservedBytes).toBe(0);
   });
 });
