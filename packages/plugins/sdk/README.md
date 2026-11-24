@@ -698,15 +698,15 @@ board user's comment does in the web app.
 
 ### Review and approval stage decisions
 
-When a participant approves an issue's execution-policy review or approval stage, or requests changes, the host emits `issue.execution_decision.recorded` with a `PluginIssueExecutionDecisionRecordedPayload`: `issueId`, `issueIdentifier`, `decisionId`, `stageId`, `stageType` (`"review" | "approval"`), `outcome` (`"approved" | "changes_requested"`), `actorAgentId`, `actorUserId`, `reviewedSha` and `createdAt`. `ctx.issues.listExecutionDecisions(issueId, companyId)` returns every decision on the issue, oldest first, as `PluginIssueExecutionDecision` (the same fields plus `body`).
+When a participant approves an issue's execution-policy review or approval stage, or requests changes, the host emits `issue.execution_decision.recorded` with a `PluginIssueExecutionDecisionRecordedPayload`: `issueId`, `issueIdentifier`, `decisionId`, `stageId`, `stageType` (`"review" | "approval"`), `outcome` (`"approved" | "changes_requested"`), `actorAgentId`, `actorUserId`, `reviewedShas`, `reviewedSha` (deprecated) and `createdAt`. `ctx.issues.listExecutionDecisions(issueId, companyId)` returns every decision on the issue, oldest first, as `PluginIssueExecutionDecision` (the same fields plus `body`).
 
-`reviewedSha` is the commit the reviewer names in the decision body with a `Reviewed-SHA: <40 lowercase hex>` line (case-insensitive key; the last such line governs; `null` when absent or invalid). Use `parseReviewedSha` from `@paperclipai/shared` to apply the same rule elsewhere.
+`reviewedShas` lists every commit the reviewer names in the decision body with a `Reviewed-SHA: <40 lowercase hex>` line (case-insensitive key; one line per commit, so one decision can cover several pull requests; invalid values are skipped; `[]` when there are none). `reviewedSha` is deprecated: it is the commit on the last such line, or `null` when that line is absent or invalid. Use `parseReviewedShas` (or `parseReviewedSha`) from `@paperclipai/shared` to apply the same rule elsewhere.
 
 ```ts
 ctx.events.on("issue.execution_decision.recorded", async (event) => {
   const decision = event.payload as PluginIssueExecutionDecisionRecordedPayload;
-  if (decision.stageType !== "review" || decision.outcome !== "approved" || !decision.reviewedSha) return;
-  await approveCommit(decision.issueId, decision.reviewedSha);
+  if (decision.stageType !== "review" || decision.outcome !== "approved") return;
+  for (const sha of decision.reviewedShas) await approveCommit(decision.issueId, sha);
 });
 ```
 

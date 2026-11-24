@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createIssueThreadInteractionSchema, parseReviewedSha, pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { createIssueThreadInteractionSchema, parseReviewedSha, parseReviewedShas, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import type {
   PaperclipPluginManifestV1,
   PluginCapability,
@@ -120,9 +120,13 @@ export interface TestHarness {
     issueInteractions?: IssueThreadInteraction[];
     /**
      * Execution-policy stage decisions for `ctx.issues.listExecutionDecisions`.
-     * Omit `reviewedSha` to derive it from `body` as the host does.
+     * Omit `reviewedShas` or `reviewedSha` to derive it from `body` as the
+     * host does.
      */
-    issueExecutionDecisions?: Array<Omit<PluginIssueExecutionDecision, "reviewedSha"> & { reviewedSha?: string | null }>;
+    issueExecutionDecisions?: Array<
+      Omit<PluginIssueExecutionDecision, "reviewedSha" | "reviewedShas">
+        & { reviewedSha?: string | null; reviewedShas?: string[] }
+    >;
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
     agents?: Agent[];
@@ -2650,7 +2654,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       }
       for (const row of input.issueExecutionDecisions ?? []) {
         const list = issueExecutionDecisions.get(row.issueId) ?? [];
-        list.push({ ...row, reviewedSha: row.reviewedSha === undefined ? parseReviewedSha(row.body) : row.reviewedSha });
+        list.push({
+          ...row,
+          reviewedShas: row.reviewedShas === undefined ? parseReviewedShas(row.body) : row.reviewedShas,
+          reviewedSha: row.reviewedSha === undefined ? parseReviewedSha(row.body) : row.reviewedSha,
+        });
         list.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
         issueExecutionDecisions.set(row.issueId, list);
       }

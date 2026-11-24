@@ -39,6 +39,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const REVIEWED_SHA = "0123456789abcdef0123456789abcdef01234567";
+const SECOND_REVIEWED_SHA = "fedcba9876543210fedcba9876543210fedcba98";
 const EVENT_TYPE = "issue.execution_decision.recorded";
 
 describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
@@ -214,6 +215,7 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       outcome: "approved",
       actorAgentId: seeded.reviewerAgentId,
       actorUserId: null,
+      reviewedShas: [REVIEWED_SHA],
       reviewedSha: REVIEWED_SHA,
       createdAt: row!.createdAt.toISOString(),
     });
@@ -232,6 +234,7 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       outcome: "approved",
       actorAgentId: seeded.reviewerAgentId,
       actorUserId: null,
+      reviewedShas: [REVIEWED_SHA],
       reviewedSha: REVIEWED_SHA,
       createdAt: row!.createdAt.toISOString(),
       body,
@@ -257,6 +260,7 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       outcome: "changes_requested",
       actorAgentId: seeded.reviewerAgentId,
       actorUserId: null,
+      reviewedShas: [],
       reviewedSha: null,
     });
   });
@@ -278,6 +282,28 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       stageId,
       outcome: "approved",
       reviewedSha: REVIEWED_SHA,
+    });
+  });
+
+  it("emits every reviewed SHA when one approval covers several pull requests", async () => {
+    const seeded = await seedCompany("XDP");
+    const { issueId, stageId } = await seedPendingReview({ ...seeded, identifier: "XDP-1" });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const body = `Both PRs approved.\n\nReviewed-SHA: ${REVIEWED_SHA}\nReviewed-SHA: ${SECOND_REVIEWED_SHA}`;
+
+    const res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: body });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const [event] = await waitForDecisionEvents(1);
+    expect(event!.payload).toMatchObject({
+      issueId,
+      stageId,
+      outcome: "approved",
+      reviewedShas: [REVIEWED_SHA, SECOND_REVIEWED_SHA],
+      // The single-value field keeps its last-line meaning for older plugins.
+      reviewedSha: SECOND_REVIEWED_SHA,
     });
   });
 
@@ -329,12 +355,13 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       {
         issueId, issueIdentifier: "XDL-1", decisionId: first, stageId, stageType: "review",
         outcome: "changes_requested", actorAgentId: null, actorUserId: "board-user",
-        reviewedSha: null, createdAt: older.toISOString(), body: "Needs work",
+        reviewedShas: [], reviewedSha: null, createdAt: older.toISOString(), body: "Needs work",
       },
       {
         issueId, issueIdentifier: "XDL-1", decisionId: second, stageId, stageType: "review",
         outcome: "approved", actorAgentId: seeded.reviewerAgentId, actorUserId: null,
-        reviewedSha: REVIEWED_SHA, createdAt: newer.toISOString(), body: `Reviewed-SHA: ${REVIEWED_SHA}`,
+        reviewedShas: [REVIEWED_SHA], reviewedSha: REVIEWED_SHA, createdAt: newer.toISOString(),
+        body: `Reviewed-SHA: ${REVIEWED_SHA}`,
       },
     ]);
 
