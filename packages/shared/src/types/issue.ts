@@ -838,6 +838,13 @@ export interface IssueExecutionState {
   monitor?: IssueExecutionMonitorState | null;
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
+  /**
+   * True when the executor entered the review cycle by marking the work `done`
+   * (explicit completion). False or absent when the executor only requested
+   * review (`in_review`) with delivery still outstanding: approving the final
+   * stage then hands the issue back to the executor instead of closing it.
+   */
+  completionRequested?: boolean;
 }
 
 export interface IssueExecutionDecision {

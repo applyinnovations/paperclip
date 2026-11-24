@@ -541,6 +541,7 @@ export const issueExecutionStateSchema = z.object({
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
+  completionRequested: z.boolean().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
