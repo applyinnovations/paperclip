@@ -73,6 +73,40 @@ export interface RuntimeProgressReporter {
   fail(doneBytes?: number, totalBytes?: number | null): Promise<void>;
 }
 
+/**
+ * One transfer as seen by the host, for per-run start/stop timing. `start` is
+ * emitted when the reporter is created (immediately before the transfer) and
+ * `end` once with the transferred bytes when the reporter reaches a terminal
+ * line. A transfer that throws before any terminal line only has `start`.
+ */
+export type RuntimeTransferEvent =
+  | { kind: "start"; id: number; phase: RuntimeProgressPhase; label: string | null; target: RuntimeProgressTarget; atMs: number }
+  | { kind: "end"; id: number; phase: RuntimeProgressPhase; label: string | null; target: RuntimeProgressTarget; atMs: number; bytes: number; outcome: "completed" | "failed" };
+
+export type RuntimeTransferObserver = (event: RuntimeTransferEvent) => void;
+
+// Held on globalThis so every copy of this module (CJS/ESM or duplicated
+// installs) reports to the one observer the host installed.
+const OBSERVER_SLOT = Symbol.for("paperclip.runtimeTransferObserver");
+type ObserverHost = { [OBSERVER_SLOT]?: RuntimeTransferObserver | null };
+let nextTransferId = 1;
+
+/** Installs (or clears, with `null`) the process-wide transfer observer. */
+export function setRuntimeTransferObserver(observer: RuntimeTransferObserver | null): void {
+  (globalThis as ObserverHost)[OBSERVER_SLOT] = observer;
+}
+
+export function hasRuntimeTransferObserver(): boolean {
+  return Boolean((globalThis as ObserverHost)[OBSERVER_SLOT]);
+}
+
+function notifyTransferObserver(event: RuntimeTransferEvent): void {
+  const observer = (globalThis as ObserverHost)[OBSERVER_SLOT];
+  if (!observer) return;
+  // Diagnostics only: an observer failure never changes the transfer.
+  try { observer(event); } catch {}
+}
+
 const BYTES_PER_MB = 1024 * 1024;
 
 function formatMb(bytes: number): string {
@@ -102,6 +136,11 @@ export function createRuntimeProgressReporter(
   let lastDoneBytes = 0;
   let lastTotalBytes: number | null = null;
   let completed = false;
+  const transfer = { id: nextTransferId++, phase: options.phase, label: options.label ?? null, target: options.target };
+  notifyTransferObserver({ kind: "start", ...transfer, atMs: Date.now() });
+  function settle(outcome: "completed" | "failed", bytes: number): void {
+    notifyTransferObserver({ kind: "end", ...transfer, atMs: Date.now(), bytes: Math.max(0, bytes), outcome });
+  }
 
   function buildLine(doneBytes: number, totalBytes: number | null): string {
     if (totalBytes != null && totalBytes > 0) {
@@ -142,7 +181,10 @@ export function createRuntimeProgressReporter(
         if (terminal || stepOk || elapsedOk) {
           await emit(doneBytes, totalBytes);
         }
-        if (terminal) completed = true;
+        if (terminal) {
+          completed = true;
+          settle("completed", doneBytes);
+        }
         return;
       }
 
@@ -161,6 +203,7 @@ export function createRuntimeProgressReporter(
           : total != null && total > 0
             ? total
             : lastDoneBytes;
+      settle("completed", done);
       await options.sink(buildLine(done, total));
     },
     async fail(doneBytes, totalBytes) {
@@ -168,6 +211,7 @@ export function createRuntimeProgressReporter(
       completed = true;
       const total = totalBytes !== undefined ? totalBytes : lastTotalBytes;
       const done = doneBytes !== undefined ? doneBytes : lastDoneBytes;
+      settle("failed", done);
       await options.sink(buildFailLine(done, total));
     },
   };

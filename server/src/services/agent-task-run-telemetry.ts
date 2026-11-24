@@ -4,6 +4,7 @@ import { trackAgentTaskRun } from "@paperclipai/shared/telemetry";
 import { parseObject } from "../adapters/utils.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { logHeartbeatRunStartStopTiming } from "./heartbeat-run-start-stop-timing.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type TelemetryRun = Pick<HeartbeatRun,
@@ -55,6 +56,10 @@ function resolveDurationSeconds(
  * remove the delay.
  */
 export async function emitAgentTaskRun(db: Db, run: TelemetryRun): Promise<void> {
+  // Not Telemetry: every terminal status write passes through here, so this
+  // is also where the run's start/stop timing server log line is written. It
+  // is independent of the telemetry client and runs in the background.
+  void logHeartbeatRunStartStopTiming(db, run.id);
   try {
     const client = getTelemetryClient();
     if (!client) return;

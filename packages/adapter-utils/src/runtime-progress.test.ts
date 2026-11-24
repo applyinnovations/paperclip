@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createRuntimeProgressReporter } from "./runtime-progress.js";
+import { createRuntimeProgressReporter, hasRuntimeTransferObserver, setRuntimeTransferObserver, type RuntimeTransferEvent } from "./runtime-progress.js";
 
 const MB = 1024 * 1024;
 
@@ -277,5 +277,45 @@ describe("createRuntimeProgressReporter", () => {
     await failed.complete(); // suppressed — already failed
     expect(failLines).toHaveLength(2);
     expect(failLines.at(-1)).toContain("failed at 20%");
+  });
+});
+
+describe("runtime transfer observer", () => {
+  it("reports each transfer's start and a single end with the transferred bytes", async () => {
+    const events: RuntimeTransferEvent[] = [];
+    setRuntimeTransferObserver((event) => { events.push(event); });
+    try {
+      const reporter = createRuntimeProgressReporter({ sink: () => {}, phase: "Syncing", label: "workspace", direction: "to", target: "sandbox" });
+      await reporter.report(5 * MB, 10 * MB);
+      await reporter.report(10 * MB, 10 * MB);
+      await reporter.complete(10 * MB, 10 * MB);
+      const failed = createRuntimeProgressReporter({ sink: () => {}, phase: "Restoring", direction: "from", target: "sandbox" });
+      await failed.fail(3, null);
+    } finally {
+      setRuntimeTransferObserver(null);
+    }
+    expect(events.map((event) => [event.kind, event.phase, event.kind === "end" ? event.bytes : null, event.kind === "end" ? event.outcome : null]))
+      .toEqual([
+        ["start", "Syncing", null, null],
+        ["end", "Syncing", 10 * MB, "completed"],
+        ["start", "Restoring", null, null],
+        ["end", "Restoring", 3, "failed"],
+      ]);
+    expect(events[0]!.id).toBe(events[1]!.id);
+    expect(events[0]!.label).toBe("workspace");
+  });
+
+  it("keeps reporting when the observer throws and is silent once cleared", async () => {
+    setRuntimeTransferObserver(() => { throw new Error("observer broke"); });
+    const lines: string[] = [];
+    try {
+      expect(hasRuntimeTransferObserver()).toBe(true);
+      const reporter = createRuntimeProgressReporter({ sink: (line) => { lines.push(line); }, phase: "Syncing", direction: "to", target: "sandbox" });
+      await reporter.complete(MB, MB);
+    } finally {
+      setRuntimeTransferObserver(null);
+    }
+    expect(hasRuntimeTransferObserver()).toBe(false);
+    expect(lines).toHaveLength(1);
   });
 });

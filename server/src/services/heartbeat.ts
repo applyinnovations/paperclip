@@ -42,6 +42,7 @@ import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, r
 import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { createRunLogWriterAuthority } from "./heartbeat/run-log-authority.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
+import { describeHeartbeatRunReuse, installHeartbeatRunTransferObserver, recordHeartbeatRunAttemptEnded, recordHeartbeatRunReuse } from "./heartbeat-run-start-stop-timing.js";
 import { readRecoverableRunLog } from "./native-runtime/native-run-log-recovery.js";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
@@ -856,6 +857,7 @@ export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
 ) {
+  installHeartbeatRunTransferObserver();
   const { finalizeAgentStatus } = createHeartbeatAgentStatus(db);
   const {
     getAgent,
@@ -1872,7 +1874,8 @@ export function heartbeatService(
       onNativeExecutionLeaseAcquired?: () => Promise<void>;
     } = {},
   ) {
-    return withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions));
+    return withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions))
+      .finally(() => recordHeartbeatRunAttemptEnded(runId));
   }
 
   const { deferRunForProviderLimit } = createProviderLimitWait(db, {
@@ -3210,6 +3213,13 @@ export function heartbeatService(
         },
         evaluateSessionCompaction,
       });
+      recordHeartbeatRunReuse(run.id, describeHeartbeatRunReuse({
+        workspace: configFreshnessResultMetadata.workspace,
+        session: configFreshnessResultMetadata.session,
+        sessionResumed: Boolean(runtimeForAdapter.sessionId || runtimeForAdapter.sessionParams),
+        sessionCompaction,
+        credentialCompatible: taskSessionCredentialCompatible,
+      }));
 
       const runOutput = createHeartbeatRunOutput(db, {
         run, runId, issueId, runLogStore, identityRedactor, secretKeys,

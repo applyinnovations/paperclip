@@ -77,7 +77,7 @@ export {
   parseEnvBindings,
   parseEnvVars,
 } from "./env-bindings.js";
-export { createRuntimeProgressReporter } from "./runtime-progress.js";
+export { createRuntimeProgressReporter, setRuntimeTransferObserver, hasRuntimeTransferObserver } from "./runtime-progress.js";
 export type {
   RuntimeProgressSink,
   RuntimeProgressPhase,
@@ -88,6 +88,8 @@ export type {
   RuntimeStatusPhase,
   RuntimeStatusSink,
   RuntimeStatusUpdate,
+  RuntimeTransferEvent,
+  RuntimeTransferObserver,
 } from "./runtime-progress.js";
 export { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling } from "./billing.js";
 export {
