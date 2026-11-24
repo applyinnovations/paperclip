@@ -2277,14 +2277,35 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   };
 }
 
+const WORKSPACE_RESTAMPABLE_ON_REUSE_CONFIG_CATEGORIES =
+  new Set<EffectiveRunWorkspaceConfigCategory>(["environment", "realization"]);
+
+function isEnvironmentOnlyWorkspaceConfigDrift(
+  decision: ExecutionWorkspaceConfigFreshnessDecision,
+) {
+  return (
+    decision.changedCategories.length > 0 &&
+    decision.changedCategories.every((category) =>
+      WORKSPACE_RESTAMPABLE_ON_REUSE_CONFIG_CATEGORIES.has(category),
+    )
+  );
+}
+
 export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   requestedShouldReuseExisting: boolean;
   workspaceConfigFreshness: ExecutionWorkspaceConfigFreshnessDecision;
 }): ExecutionWorkspaceReuseProvisioningPolicy {
   const shouldRestoreExistingWorkspace = input.requestedShouldReuseExisting;
+  // Explicit reuse restores the old workspace even on replacement-class drift.
+  // Repo/strategy/mode drift stays visible: the stored fingerprint is kept so
+  // every run reports it. Drift limited to the execution environment or its
+  // realization describes where the run executes, not what the restored
+  // workspace contains, so re-stamp it once the restore succeeds instead of
+  // reporting "replace" on every later run while nothing is replaced.
   const replacementClassDrift =
     input.requestedShouldReuseExisting &&
-    input.workspaceConfigFreshness.action === "replace";
+    input.workspaceConfigFreshness.action === "replace" &&
+    !isEnvironmentOnlyWorkspaceConfigDrift(input.workspaceConfigFreshness);
 
   return {
     shouldRestoreExistingWorkspace,

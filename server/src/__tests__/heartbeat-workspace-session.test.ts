@@ -1777,6 +1777,107 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
+  it("re-stamps the fingerprint when explicit reuse restores across environment-only drift", () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      environment: {
+        selectedEnvironmentId: "environment-2",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+      },
+      realization: {
+        environmentDriver: "sandbox",
+        environmentProvider: "daytona",
+      },
+    });
+
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: true,
+      workspaceConfigFreshness: decision,
+    });
+
+    expect(decision.action).toBe("replace");
+    expect(decision.changedCategories.length).toBeGreaterThan(0);
+    expect(
+      decision.changedCategories.every((category) =>
+        ["environment", "realization"].includes(category),
+      ),
+    ).toBe(true);
+    expect(policy).toEqual({
+      shouldRestoreExistingWorkspace: true,
+      shouldRefreshWorkspaceConfigSnapshot: false,
+      shouldPersistLatestWorkspaceConfigMetadata: true,
+    });
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: {
+        config: { provisionCommand: "pnpm install" },
+        ...persistedWorkspaceConfigFingerprint(base),
+      },
+      source: "task_session",
+      createdByRuntime: false,
+      strategyType: "project_primary",
+      configSnapshot: { provisionCommand: "pnpm install" },
+      shouldReuseExisting: policy.shouldRestoreExistingWorkspace,
+      shouldRefreshConfigSnapshot: policy.shouldRefreshWorkspaceConfigSnapshot,
+      workspaceConfigMetadata: policy.shouldPersistLatestWorkspaceConfigMetadata ? next : null,
+      baseRef: "origin/main",
+      baseRefSha: "main-sha",
+    });
+
+    expect(metadata?.configFingerprint).toMatchObject({
+      workspaceHash: next.fingerprint,
+    });
+
+    // The next run with the same environment now reuses instead of reporting
+    // "replace" again.
+    const nextRunDecision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: metadata,
+      nextMetadata: next,
+    });
+    expect(nextRunDecision.action).toBe("reuse");
+  });
+
+  it("keeps the stored fingerprint when environment drift comes with repo drift under explicit reuse", () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      repoRef: "origin/release",
+      workspaceStrategy: {
+        type: "git_worktree",
+        baseRef: "origin/release",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
+        worktreeParentDir: ".paperclip/worktrees",
+      },
+      environment: {
+        selectedEnvironmentId: "environment-2",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+      },
+    });
+
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: true,
+      workspaceConfigFreshness: decision,
+    });
+
+    expect(decision.action).toBe("replace");
+    expect(decision.changedCategories).toEqual(
+      expect.arrayContaining(["repo", "environment"]),
+    );
+    expect(policy.shouldPersistLatestWorkspaceConfigMetadata).toBe(false);
+  });
+
   it("fails loudly when explicit reuse restore errors", async () => {
     const base = buildWorkspaceConfigMetadata();
     const next = buildWorkspaceConfigMetadata({
