@@ -232,6 +232,26 @@ export async function streamSandboxLogs(
   if (text.length > 0) await onChunk("stdout", text);
 }
 
+/**
+ * Move a Sandbox's `spec.shutdownTime`. A JSON Patch `replace`, so it fails
+ * (rather than adds the field) on a Sandbox created without a shutdown time.
+ */
+export async function patchSandboxShutdownTime(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  shutdownTime: string,
+): Promise<void> {
+  await clients.custom.patchNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace,
+    plural: SANDBOX_PLURAL,
+    name,
+    body: [{ op: "replace", path: "/spec/shutdownTime", value: shutdownTime }],
+  });
+}
+
 export async function deleteSandboxCr(
   clients: KubeClients,
   namespace: string,
