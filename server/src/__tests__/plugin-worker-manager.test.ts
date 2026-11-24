@@ -81,6 +81,47 @@ describe("worker configuration completion", () => {
   });
 });
 
+describe("worker ready notifications", () => {
+  // The plugin loader replays stored company config on every `ready` it did
+  // not start itself (APP-329), so `ready` must reach manager listeners for a
+  // crash respawn on the same handle and for a replacement handle.
+  it("notifies for the first start, an automatic crash respawn and a replacement handle", async () => {
+    const manager = createPluginWorkerManager();
+    const ready = vi.fn();
+    const unsubscribe = manager.onWorkerReady!(ready);
+    const startOptions = {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
+      crashRecovery: { minBackoffMs: 10 },
+    };
+    try {
+      const handle = await manager.startWorker("test.plugin", startOptions);
+      expect(ready).toHaveBeenCalledTimes(1);
+      const pid = handle.diagnostics().pid!;
+      process.kill(pid, "SIGKILL");
+      await vi.waitFor(() => expect(ready).toHaveBeenCalledTimes(2), { timeout: 5_000, interval: 20 });
+      expect(manager.getWorker("test.plugin")).toBe(handle);
+      expect(handle.diagnostics().pid).not.toBe(pid);
+
+      await manager.stopWorker("test.plugin");
+      await manager.startWorker("test.plugin", startOptions);
+      expect(manager.getWorker("test.plugin")).not.toBe(handle);
+      expect(ready).toHaveBeenCalledTimes(3);
+      expect(ready.mock.calls.every(([pluginId]) => pluginId === "test.plugin")).toBe(true);
+
+      unsubscribe();
+      const replacement = manager.getWorker("test.plugin")!;
+      const replacementPid = replacement.diagnostics().pid!;
+      process.kill(replacementPid, "SIGKILL");
+      await vi.waitFor(() => {
+        expect(replacement.diagnostics().pid).not.toBe(replacementPid);
+        expect(manager.isRunning("test.plugin")).toBe(true);
+      }, { timeout: 5_000, interval: 20 });
+      expect(ready).toHaveBeenCalledTimes(3);
+    } finally { unsubscribe(); await manager.stopAll(); }
+  });
+});
+
 describe("plugin worker unavailable refusals", () => {
   it("refuses calls to a stopped or missing worker with a typed, unsent error", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
