@@ -253,6 +253,24 @@ describe("inspect an ordinary lease", () => {
     expect(await inspect()).toEqual({ providerLeaseId: lease.providerLeaseId, state: "destroyed" });
   });
 
+  it("proves a stop-and-retain lease's Sandbox absent once it has been deleted", async () => {
+    // A run interrupted by a restart leaves its lease pending_cleanup /
+    // sandbox_stop_pending; the Sandbox then expires at its shutdownTime.
+    const lease = await acquire(undefined);
+    const leaseMetadata = {
+      ...lease.metadata,
+      sandboxStopAndRetain: {
+        schema: "paperclip.sandbox-stop-and-retain.v1", requestId: OPERATION, companyId: COMPANY,
+        runId: RUN, provider: "kubernetes", providerLeaseId: lease.providerLeaseId,
+      },
+    };
+    h.sandboxes.delete(lease.providerLeaseId!);
+    expect(await plugin.definition.onEnvironmentInspectLease!({
+      driverKey: "kubernetes", companyId: COMPANY, environmentId: ENVIRONMENT, config: CONFIG,
+      providerLeaseId: lease.providerLeaseId!, leaseMetadata,
+    })).toEqual({ providerLeaseId: lease.providerLeaseId, state: "destroyed" });
+  });
+
   it("propagates errors other than not-found instead of guessing", async () => {
     (h.clients.custom as { getNamespacedCustomObject: ReturnType<typeof vi.fn> }).getNamespacedCustomObject
       .mockRejectedValueOnce(Object.assign(new Error("forbidden"), { code: 403 }));
