@@ -173,6 +173,41 @@ describe("Sandbox shutdown time", () => {
     expect(h.patches).toHaveLength(patchesAtRelease);
   });
 
+  it("keeps the shortest deadline ahead of a command on a lease acquired mid-second", async () => {
+    vi.useFakeTimers({ now: Date.UTC(2026, 10, 24, 3, 0, 0, 750), toFake: ["Date", "setInterval", "clearInterval"] });
+    const config = { ...CONFIG, podActivityDeadlineSec: 1 };
+    const lease = await acquire({ config });
+    let shutdownMs = sandboxShutdownMs(h.manifests[0]!);
+    // Created 250 ms from expiry: 03:00:01.750 rounded down.
+    expect(shutdownMs - Date.now()).toBe(250);
+
+    let finish!: () => void;
+    h.exec = () =>
+      new Promise((resolve) => {
+        finish = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+      });
+    const run = plugin.definition.onEnvironmentExecute!({
+      driverKey: "kubernetes",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config,
+      lease,
+      command: "claude",
+      args: [],
+      timeoutMs: HOUR,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    for (let elapsed = 0; elapsed < 10_000; elapsed += 10) {
+      const last = h.patches.at(-1);
+      if (last) shutdownMs = Math.max(shutdownMs, Date.parse(last.shutdownTime));
+      expect(shutdownMs).toBeGreaterThan(Date.now());
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    finish();
+    await run;
+    await release(lease);
+  });
+
   it("never moves the attested deadline of a lease with a caller deadline", async () => {
     vi.useFakeTimers({ now: Date.UTC(2026, 10, 24, 3, 0, 0), toFake: ["Date", "setInterval", "clearInterval"] });
     const requestedExpiresAt = new Date(Date.now() + 20 * MIN).toISOString();

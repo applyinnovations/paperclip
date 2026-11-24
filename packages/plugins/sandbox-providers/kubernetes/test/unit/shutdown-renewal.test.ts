@@ -33,10 +33,11 @@ function setup(startMs = Date.UTC(2026, 10, 24, 3, 0, 0)) {
 }
 
 describe("renewalStepMs", () => {
-  it("is a quarter of the deadline, capped at five minutes and at least a second", () => {
+  it("is a quarter of the deadline, capped at five minutes", () => {
     expect(renewalStepMs(HOUR, 5 * MIN)).toBe(5 * MIN);
     expect(renewalStepMs(4 * MIN, 5 * MIN)).toBe(MIN);
-    expect(renewalStepMs(100, 5 * MIN)).toBe(1000);
+    // The smallest accepted podActivityDeadlineSec (1 s) is not clamped up to its own length.
+    expect(renewalStepMs(1000, 5 * MIN)).toBe(250);
   });
 });
 
@@ -108,11 +109,51 @@ describe("createShutdownRenewer", () => {
     expect(t.patches).toEqual([new Date(t.now + HOUR).toISOString()]);
   });
 
-  it("rounds the shutdown time down to whole seconds", async () => {
+  it("rounds the shutdown time up to whole seconds, so a full deadline is left", async () => {
     const t = setup(Date.UTC(2026, 10, 24, 3, 0, 0, 750));
     t.renewer.hold("pc-s", { ttlMs: HOUR, patchShutdownTime: t.patch });
     await t.renewer.touch("pc-s");
-    expect(t.patches[0]).toBe("2026-11-24T04:00:00.000Z");
+    expect(t.patches[0]).toBe("2026-11-24T04:00:01.000Z");
+  });
+
+  it("keeps the shortest deadline (1 s) ahead of a command started mid-second", async () => {
+    // Acquired at .750 with podActivityDeadlineSec 1: the Sandbox was created
+    // with shutdownTime rounded down to the next whole second, 250 ms away.
+    let nowMs = Date.UTC(2026, 10, 24, 3, 0, 0, 750);
+    let shutdownMs = Math.floor((nowMs + 1000) / 1000) * 1000;
+    let timer: { fn: () => void; ms: number; next: number } | null = null;
+    const renewer = createShutdownRenewer({
+      now: () => nowMs,
+      setInterval: (fn, ms) => (timer = { fn, ms, next: nowMs + ms }),
+      clearInterval: () => {
+        timer = null;
+      },
+    });
+    renewer.hold("pc-min", {
+      ttlMs: 1000,
+      shutdownMs,
+      patchShutdownTime: async (iso) => {
+        shutdownMs = Math.max(shutdownMs, Date.parse(iso));
+      },
+    });
+    expect(timer!.ms).toBe(250);
+
+    let finish!: () => void;
+    const command = renewer.track("pc-min", () => new Promise<void>((resolve) => (finish = resolve)));
+    await Promise.resolve();
+    // A command of 10 s, checked every 10 ms against the controller's deadline.
+    for (let elapsed = 0; elapsed < 10_000; elapsed += 10) {
+      nowMs += 10;
+      if (timer && nowMs >= timer.next) {
+        timer.next += timer.ms;
+        timer.fn();
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+      }
+      expect(shutdownMs - nowMs).toBeGreaterThanOrEqual(500);
+    }
+    finish();
+    await command;
+    renewer.forget("pc-min");
   });
 
   it("logs a failed patch, does not fail the command, and retries on the next tick", async () => {

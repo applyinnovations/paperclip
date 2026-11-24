@@ -9,6 +9,14 @@
  * is running in the pod, on a timer. A lease with no activity is not renewed,
  * so an orphan is still reaped one deadline after its last use.
  *
+ * While a command runs, the timer fires every `renewalStepMs` (a quarter of the
+ * deadline, at most 5 min) and patches once the deadline has fallen a step
+ * behind now + deadline. New shutdown times are rounded *up* to whole seconds
+ * (the API server stores seconds), so a patch always leaves at least the full
+ * deadline ahead. Together that keeps the deadline at least half of
+ * `podActivityDeadlineSec` ahead of now during a command, for every accepted
+ * value down to 1 s.
+ *
  * Renewal is best effort: a failed patch is logged and retried on the next
  * touch or tick, and never fails the command that triggered it.
  */
@@ -52,8 +60,13 @@ export interface ShutdownRenewer {
   tick(): Promise<void>;
 }
 
+/**
+ * The timer period and the minimum extension worth a patch: a quarter of the
+ * deadline, capped at `maxStepMs`. Never more than a quarter, so even the
+ * shortest deadline (1 s) is renewed well before it passes.
+ */
 export function renewalStepMs(ttlMs: number, maxStepMs: number): number {
-  return Math.max(1000, Math.min(maxStepMs, Math.floor(ttlMs / 4)));
+  return Math.max(1, Math.min(maxStepMs, Math.floor(ttlMs / 4)));
 }
 
 export function createShutdownRenewer(options: ShutdownRenewerOptions = {}): ShutdownRenewer {
@@ -84,7 +97,8 @@ export function createShutdownRenewer(options: ShutdownRenewerOptions = {}): Shu
 
   function renewIfDue(leaseId: string, entry: Entry): Promise<void> {
     if (entry.patching) return entry.patching;
-    const target = Math.floor((now() + entry.ttlMs) / 1000) * 1000;
+    // Round up: rounding down would leave less than a full deadline ahead.
+    const target = Math.ceil((now() + entry.ttlMs) / 1000) * 1000;
     if (target - entry.shutdownMs < renewalStepMs(entry.ttlMs, maxStepMs)) return Promise.resolve();
     entry.patching = entry
       .patchShutdownTime(new Date(target).toISOString())
