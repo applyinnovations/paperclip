@@ -9,11 +9,17 @@ const h = vi.hoisted(() => ({
   jobWait: vi.fn(),
   claim: vi.fn(async (_clients: unknown, _namespace: string, _manifest: unknown) => ({ uid: "uid-1" })),
   createSecret: vi.fn(async () => undefined),
+  // The tenant quota as the plugin reads it; null means the read is forbidden.
+  quota: null as unknown,
+  readQuota: vi.fn(),
+  readPod: vi.fn(),
 }));
 
 vi.mock("../../src/kube-client.js", () => ({
   createKubeConfig: vi.fn(() => ({})),
-  makeKubeClients: vi.fn(() => ({})),
+  makeKubeClients: vi.fn(() => ({
+    core: { readNamespacedResourceQuota: h.readQuota, readNamespacedPod: h.readPod },
+  })),
 }));
 vi.mock("../../src/tenant-orchestrator.js", () => ({ ensureTenant: vi.fn(async () => undefined) }));
 vi.mock("../../src/secret-manager.js", () => ({ createPerRunSecret: h.createSecret }));
@@ -53,6 +59,7 @@ vi.mock("../../src/scoped-network-egress.js", async (importActual) => {
 import plugin from "../../src/plugin.js";
 import { SandboxAcquireDeadlineError } from "../../src/acquire-deadline.js";
 import { SandboxCrTimeoutError } from "../../src/sandbox-cr-orchestrator.js";
+import { SandboxQuotaExceededError } from "../../src/quota.js";
 
 function acquire(config: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
   return plugin.definition.onEnvironmentAcquireLease!({
@@ -74,26 +81,30 @@ beforeEach(() => {
   h.claim.mockClear();
   h.createSecret.mockReset();
   h.createSecret.mockImplementation(async () => undefined);
+  h.quota = null;
+  h.readQuota.mockReset();
+  h.readQuota.mockImplementation(async () => {
+    if (h.quota === null) throw Object.assign(new Error("forbidden"), { code: 403 });
+    return h.quota;
+  });
+  h.readPod.mockReset();
+  h.readPod.mockRejectedValue(Object.assign(new Error("not found"), { code: 404 }));
 });
 
 describe("onEnvironmentAcquireLease readiness", () => {
   it("waits for the Sandbox to be Ready on the start-up budget before handing out the lease", async () => {
     const lease = await acquire({ podStartTimeoutSec: 240 });
     expect(h.waitForReady).toHaveBeenCalledTimes(1);
-    expect(h.waitForReady).toHaveBeenCalledWith(expect.anything(), expect.any(String), lease.providerLeaseId, {
-      timeoutMs: 240_000,
-      pollMs: 1000,
-    });
+    expect(h.waitForReady).toHaveBeenCalledWith(expect.anything(), expect.any(String), lease.providerLeaseId,
+      expect.objectContaining({ timeoutMs: 240_000, pollMs: 1000 }));
     expect(h.release).not.toHaveBeenCalled();
     expect((lease.metadata as { podName?: string }).podName).toBe("pc-pod");
   });
 
   it("defaults the start-up budget to 300 s", async () => {
     await acquire();
-    expect(h.waitForReady).toHaveBeenCalledWith(expect.anything(), expect.any(String), expect.any(String), {
-      timeoutMs: 300_000,
-      pollMs: 1000,
-    });
+    expect(h.waitForReady).toHaveBeenCalledWith(expect.anything(), expect.any(String), expect.any(String),
+      expect.objectContaining({ timeoutMs: 300_000, pollMs: 1000 }));
   });
 
   it("releases the Sandbox and fails when it never becomes Ready", async () => {
@@ -171,5 +182,57 @@ describe("onEnvironmentAcquireLease and the host's acquire deadline", () => {
     h.waitForReady.mockRejectedValueOnce(new Error("Sandbox is Terminating"));
     h.release.mockRejectedValueOnce(Object.assign(new Error("not found"), { code: 404 }));
     await expect(acquire()).rejects.toThrow("Sandbox is Terminating");
+  });
+});
+
+describe("onEnvironmentAcquireLease and a full tenant quota", () => {
+  const inSeconds = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+  const quota = (podsUsed: string) => ({
+    status: { hard: { pods: "16", "requests.memory": "16Gi" }, used: { pods: podsUsed, "requests.memory": "8Gi" } },
+  });
+
+  // The Sandbox stays Pending: the readiness wait polls, running onPending each
+  // time, until it gives up at its timeout as the real wait does.
+  function stayPending() {
+    h.waitForReady.mockImplementation(async (...args: unknown[]) => {
+      const opts = args[3] as { timeoutMs: number; onPending?: () => Promise<void> };
+      for (let poll = 0; poll < 10; poll++) await opts.onPending?.();
+      throw new SandboxCrTimeoutError("ns", String(args[2]), opts.timeoutMs);
+    });
+  }
+
+  it("fails at once with the quota named, not the deadline error, and deletes the Sandbox", async () => {
+    h.quota = quota("16");
+    stayPending();
+    const started = Date.now();
+    const error = await acquire({}, { acquireDeadlineAt: inSeconds(30) }).catch(value => value);
+    expect(error).toBeInstanceOf(SandboxQuotaExceededError);
+    expect(error).not.toBeInstanceOf(SandboxAcquireDeadlineError);
+    expect(error.message).toContain("quota paperclip-quota exhausted: pods 16/16");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(h.readQuota).toHaveBeenCalledWith({ name: "paperclip-quota", namespace: expect.any(String) });
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("acquires as before when the quota has room", async () => {
+    h.quota = quota("13");
+    h.waitForReady.mockImplementationOnce(async (...args: unknown[]) => {
+      const opts = args[3] as { onPending?: () => Promise<void> };
+      await opts.onPending?.();
+      await opts.onPending?.();
+      return { phase: "Running", active: 1 };
+    });
+    const lease = await acquire({}, { acquireDeadlineAt: inSeconds(30) });
+    expect((lease.metadata as { podName?: string }).podName).toBe("pc-pod");
+    expect(h.release).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the deadline error when the quota cannot be read", async () => {
+    h.quota = null;
+    stayPending();
+    const error = await acquire({}, { acquireDeadlineAt: inSeconds(30) }).catch(value => value);
+    expect(error).toBeInstanceOf(SandboxAcquireDeadlineError);
+    expect(h.readQuota).toHaveBeenCalledTimes(1);
+    expect(h.release).toHaveBeenCalledTimes(1);
   });
 });

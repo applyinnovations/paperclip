@@ -1,6 +1,7 @@
 import type { KubeClients } from "./kube-client.js";
 import { buildNetworkPolicyManifests } from "./network-policy.js";
 import { buildCiliumNetworkPolicyManifest } from "./cilium-network-policy.js";
+import { TENANT_RESOURCE_QUOTA_NAME } from "./quota.js";
 
 export interface EnsureTenantInput {
   namespace: string;
@@ -22,7 +23,7 @@ export interface EnsureTenantInput {
 const SERVICE_ACCOUNT_NAME = "paperclip-tenant-sa";
 const ROLE_NAME = "paperclip-tenant-role";
 const ROLE_BINDING_NAME = "paperclip-tenant-rb";
-const RESOURCE_QUOTA_NAME = "paperclip-quota";
+const RESOURCE_QUOTA_NAME = TENANT_RESOURCE_QUOTA_NAME;
 const LIMIT_RANGE_NAME = "paperclip-limits";
 
 /**

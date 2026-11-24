@@ -163,6 +163,12 @@ A failed acquire hands no lease to the server, so nothing would ever release its
 - **Bounded by the server's deadline.** Newer servers send `acquireDeadlineAt`, the time their `environmentAcquireLease` RPC gives up. The readiness wait ends 5 s before it, so the provider has time to delete the Sandbox and answer. A Sandbox is not created at all when less than 5 s is left. The wait is the earlier of this and `podStartTimeoutSec`.
 - **Creation recovery.** The driver declares `creationOperationVersion: 1`. About a minute after a failed acquire, the server asks `onEnvironmentInspectLease` for the workload labelled with that attempt. The provider checks the run and company labels, returns a cleanup envelope, and the server deletes the workload through `onEnvironmentDestroyLease`. Destroy checks the labels again first. This also covers a server that exits mid-acquire. Any other inspection returns `unknown`.
 
+### When the tenant quota is full
+
+A Sandbox whose pod `paperclip-quota` refuses stays Pending until a slot frees, so its acquire would otherwise end in the deadline error above with the cause hidden. While the Sandbox has no pod, each readiness poll reads `paperclip-quota` and compares it with what this Sandbox's pod needs (one pod plus its container requests and limits). When `used + needed > hard` for any of them on two polls in a row, the acquire fails at once with `SandboxQuotaExceededError`, e.g. `quota paperclip-quota exhausted: pods 16/16`, and the Sandbox is deleted as for any failed acquire.
+
+The check needs `get` on `resourcequotas/paperclip-quota` in the tenant namespace (the provisioner Role's `resourceNames` grant; `list` is not used). If the quota is missing or the read fails or is forbidden, the check turns itself off for that acquire, logs one warning, and the wait behaves as before.
+
 ## Security baseline
 
 Every agent pod is:

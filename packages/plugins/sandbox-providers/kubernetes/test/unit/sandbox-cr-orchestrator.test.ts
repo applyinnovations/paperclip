@@ -254,6 +254,25 @@ describe("waitForSandboxReady", () => {
     ).rejects.toBeInstanceOf(SandboxCrTimeoutError);
   });
 
+  it("runs onPending on each Pending poll and stops when it throws", async () => {
+    const get = vi.fn().mockResolvedValue(makeCr("Pending"));
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const stop = new Error("quota full");
+    const onPending = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(stop);
+    await expect(
+      waitForSandboxReady(clients as never, "ns", "pc-abc", { timeoutMs: 5000, pollMs: 10, onPending }),
+    ).rejects.toBe(stop);
+    expect(onPending).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not run onPending once the Sandbox is Ready", async () => {
+    const get = vi.fn().mockResolvedValue(makeCr("Ready"));
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const onPending = vi.fn();
+    await waitForSandboxReady(clients as never, "ns", "pc-abc", { timeoutMs: 5000, pollMs: 10, onPending });
+    expect(onPending).not.toHaveBeenCalled();
+  });
+
   it("throws an error describing the failure when Sandbox fails", async () => {
     const get = vi.fn().mockResolvedValue({
       metadata: { uid: "u1" },

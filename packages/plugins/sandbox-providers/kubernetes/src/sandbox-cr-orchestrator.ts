@@ -254,13 +254,14 @@ export async function deleteSandboxCr(
  * individual execInPod() calls.
  *
  * Throws SandboxCrTimeoutError if Ready is not reached within timeoutMs.
- * Throws if the Sandbox transitions to Failed.
+ * Throws if the Sandbox transitions to Failed, or whatever opts.onPending
+ * throws on a Pending poll.
  */
 export async function waitForSandboxReady(
   clients: KubeClients,
   namespace: string,
   name: string,
-  opts: { timeoutMs: number; pollMs?: number } = {
+  opts: { timeoutMs: number; pollMs?: number; onPending?: () => Promise<void> } = {
     timeoutMs: 120_000,
     pollMs: 2000,
   },
@@ -296,7 +297,8 @@ export async function waitForSandboxReady(
         `Sandbox ${namespace}/${name} is Terminating — cannot wait for Ready`,
       );
     }
-    // Pending — keep polling
+    // Pending — let the caller check why (e.g. tenant quota), then keep polling
+    await opts.onPending?.();
     await sleep(pollMs);
   }
 

@@ -55,7 +55,12 @@ export interface SandboxOrchestrator {
     clients: KubeClients,
     namespace: string,
     name: string,
-    opts: { timeoutMs: number; pollMs?: number },
+    opts: {
+      timeoutMs: number;
+      pollMs?: number;
+      /** Runs on each poll that finds the workload not yet Ready; throw to stop waiting. */
+      onPending?: () => Promise<void>;
+    },
   ): Promise<SandboxStatus>;
 
   // Optional warm-pool / Kata-FC extension slots. Job-backed implementation
