@@ -37,6 +37,7 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
+import { diagnoseSandboxStart } from "./sandbox-start-diagnosis.js";
 import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
@@ -577,6 +578,10 @@ const plugin = definePlugin({
         await sandboxCrOrchestrator.waitForCompletion(clients, namespace, jobName, {
           timeoutMs: config.podStartTimeoutSec * 1000,
           pollMs: 1000,
+          // Fail now, with the cause, when the pod can never start; report a
+          // full quota or node as capacity, which the host may wait out.
+          diagnose: () => diagnoseSandboxStart(clients, namespace, jobName),
+          failFastOnCapacity: params.hostQueuesOnCapacity === true,
         });
       } catch (readyError) {
         try {

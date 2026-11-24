@@ -26,6 +26,13 @@ const manifest: PaperclipPluginManifestV1 = {
       // Subscription sign-in (`claude setup-token`, `codex login --device-auth`)
       // runs on a terminal exec in the lease's Sandbox pod. sandbox-cr backend only.
       supportsLoginPty: true,
+      // acquireLease waits up to podStartTimeoutSec (default 300 s) for the
+      // Sandbox pod to be Ready, after setting up the tenant. Without this the
+      // host gave up at its generic 30 s RPC default while the plugin kept
+      // going, leaving a Sandbox nothing held (APP-114, APP-127). An
+      // environment that raises podStartTimeoutSec past ~540 s must also raise
+      // its own `timeoutMs`, which takes precedence over this default.
+      defaultAcquireTimeoutMs: 600_000,
       configSchema: {
         type: "object",
         properties: {
