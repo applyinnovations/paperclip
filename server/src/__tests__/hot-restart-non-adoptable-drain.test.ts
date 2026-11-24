@@ -13,7 +13,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
@@ -129,8 +129,14 @@ describeEmbeddedPostgres("hot restart drains runs it cannot adopt", () => {
   afterEach(async () => {
     for (const child of childProcesses) child.kill("SIGKILL");
     childProcesses.clear();
-    // Every test seeds its own company, so rows need no cleanup; only let the
-    // scheduled retry runs settle before the next test.
+    // Every test seeds its own company, but a hot-restart shutdown snapshots
+    // every running run, so a run left running (an adopted run, a scheduled
+    // retry) would show up in the next test's restart. End them all.
+    const now = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: now, updatedAt: now, errorCode: "test_cleanup" })
+      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     vi.clearAllMocks();
   });
