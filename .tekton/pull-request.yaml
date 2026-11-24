@@ -38,7 +38,7 @@ spec:
         - name: run
           computeResources:
             requests: { cpu: "1", memory: 10Gi }
-            limits: { cpu: "12", memory: 24Gi }
+            limits: { memory: 24Gi }
   timeouts:
     pipeline: 90m
   pipelineSpec:
