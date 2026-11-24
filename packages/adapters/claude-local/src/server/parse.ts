@@ -239,6 +239,26 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+// Drop every stdout line that is a JSON object (a stream-json event). Only the
+// CLI's own plain-text output remains.
+function stripClaudeStreamEventLines(stdout: string): string {
+  return stdout
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) return true;
+      try {
+        const value = JSON.parse(trimmed);
+        return value === null || typeof value !== "object";
+      } catch {
+        // A truncated event line (the process was killed mid-write) is still
+        // agent output, not a CLI message.
+        return false;
+      }
+    })
+    .join("\n");
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
@@ -250,7 +270,11 @@ export function detectClaudeLoginRequired(input: {
   // The legacy login-prompt markers keep their broad scope. They match against
   // every output line, which includes the parsed result, the parsed errors, and
   // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // Raw stdout is scanned only for plain-text lines the CLI prints itself.
+  // Stream-json event lines carry the agent's own assistant text and tool
+  // output (a grep of this codebase prints "not logged in"), so they never
+  // count as a login prompt. See APP-199.
+  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), stripClaudeStreamEventLines(input.stdout), input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())

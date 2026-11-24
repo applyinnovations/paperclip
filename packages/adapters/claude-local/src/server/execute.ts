@@ -404,6 +404,13 @@ export async function runClaudeLogin(input: {
   });
 }
 
+/** True when the CLI was killed by a signal rather than exiting on its own. */
+export function wasClaudeProcessKilled(proc: { exitCode: number | null; signal: string | null }): boolean {
+  if (proc.signal) return true;
+  // 128 + signal number: 137 = SIGKILL (OOM killer), 143 = SIGTERM.
+  return proc.exitCode === 137 || proc.exitCode === 143;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
@@ -1003,11 +1010,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
     const { proc, parsedStream, parsed } = attempt;
-    const loginMeta = detectClaudeLoginRequired({
+    const detectedLogin = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
       stderr: proc.stderr,
     });
+    // A process killed by a signal (OOM kill: exit 137, SIGKILL/SIGTERM) never
+    // reached an auth decision. Classifying it claude_auth_required revokes the
+    // account for every agent that shares it (APP-199).
+    const loginMeta = wasClaudeProcessKilled(proc)
+      ? { ...detectedLogin, requiresLogin: false }
+      : detectedLogin;
     const errorMeta =
       loginMeta.loginUrl != null
         ? {
