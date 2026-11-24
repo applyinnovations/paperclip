@@ -7,6 +7,7 @@ import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment, resol
 import { logger } from "../middleware/logger.js";
 import { resolveAntigravityCandidateAdmission } from "./native-runtime/acpx-qualification.js";
 import { antigravityCredentialTurn, prepareAntigravityRunnerCredentials } from "./native-runtime/antigravity-runner-credentials.js";
+import { antigravityRemoteSubscriptionEnabled } from "./native-runtime/antigravity-remote-subscription.js";
 import { resolvePaperclipRunnerBinary } from "./native-runtime/native-codex-runner.js";
 
 const TRANSPORT_KEYS = ["PATH", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"];
@@ -41,7 +42,14 @@ export function antigravityConnectionProbeFailure(companyId: string, error: unkn
 
 /** The ordinary Test uses the selected managed account and no model turn. */
 export async function testAntigravityConnection(context: AdapterEnvironmentTestContext, model: string): Promise<AdapterEnvironmentTestResult> {
-  if (context.executionTarget?.kind === "remote") throw new Error("Google Antigravity candidate testing requires the Paperclip host.");
+  if (context.executionTarget?.kind === "remote") {
+    if (!antigravityRemoteSubscriptionEnabled()) throw new Error("Google Antigravity candidate testing requires the Paperclip host.");
+    // Reading the account would need the runtime inside the environment; the
+    // run itself verifies the selected account before any model turn.
+    return { adapterType: "paperclip_runner", status: "warn", testedAt: new Date().toISOString(),
+      checks: [{ code: "antigravity_remote_subscription_untested", level: "warn",
+        message: "Google sign-in is delivered to this environment when the agent runs. Test does not run Google Antigravity remotely; the first run checks the account." }] };
+  }
   const admission = resolveAntigravityCandidateAdmission({ companyId: context.companyId, model });
   if (!admission) throw new Error("Google Antigravity is not available for this company.");
   const configured = context.config.env;

@@ -45,6 +45,7 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { aiConnectionConfigurationFailure, aiConnectionCredentialNotSharedFailure } from "./ai-connection-configuration-failure.js";
 import { quotaCredentialRecovery, quotaCredentialHash } from "./quota-credential-recovery.js";
 import { prepareAntigravityCredentialRecovery } from "./native-runtime/antigravity-runner-credentials.js";
+import { antigravityRemoteSubscriptionEnabled } from "./native-runtime/antigravity-remote-subscription.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
@@ -1124,6 +1125,19 @@ export function aiConnectionService(db: Db) {
     ));
     if (!connection) return true;
     const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+    if (metadata.success && metadata.data.provider === "google" && metadata.data.method === "subscription"
+      && antigravityRemoteSubscriptionEnabled()) {
+      // Sandboxed runs fail for reasons they cannot tell apart from a rejected
+      // token, and Google has no usage probe to confirm one. Never revoke the
+      // shared sign-in on a run's word; record it for an explicit reconnect.
+      await logActivity(db, {
+        companyId: input.companyId, actorType: "system", actorId: input.runId ? "heartbeat" : "adapter_test",
+        agentId: input.agentId, runId: input.runId, action: "ai_connection.authentication_failure_unconfirmed",
+        entityType: "tool_connection", entityId: connection.id,
+        details: { provider: attribution.provider, grantId: grant.id, probeStatus: "unavailable", probeErrorCode: null },
+      });
+      return false;
+    }
     if (!metadata.success || !supportsAiConnectionUsage(metadata.data.provider, metadata.data.method)) return true;
     let probe: Awaited<ReturnType<typeof probeAiConnectionUsage>>;
     try {
