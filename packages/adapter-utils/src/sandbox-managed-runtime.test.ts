@@ -416,6 +416,9 @@ function recordingFilesystemClient(
 describe("sandbox managed runtime", () => {
   const cleanupDirs: string[] = [];
 
+  // The first case pays the cold import of the merge lock's server utilities (about 3 s
+  // locally); a 5 s default times out on a loaded CI node and its late spy restore
+  // then breaks the next case.
   it.each([
     { isolation: undefined, detect: false },
     { isolation: undefined, detect: true },
@@ -450,7 +453,7 @@ describe("sandbox managed runtime", () => {
       expect(merge.mock.calls.every(([input]) => input.workspaceSnapshotIsolation === isolation)).toBe(true);
       expect(await readFile(path.join(local, "file.txt"), "utf8")).toBe("after");
     } finally { capture.mockRestore(); merge.mockRestore(); }
-  });
+  }, 30_000);
 
   it.each(["host_current", "adopt_remote", "durable_seed"] as const)("stages and restores both project repositories with independent Git histories (%s)", async (mode) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-multi-repo-"));
