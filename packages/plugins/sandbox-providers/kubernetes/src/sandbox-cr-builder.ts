@@ -15,7 +15,9 @@
  * also bounds its lifetime if the Paperclip server cannot release it.
  */
 
-export interface BuildSandboxCrManifestInput {
+import type { ExtraPodConfig } from "./pod-spec-builder.js";
+
+export interface BuildSandboxCrManifestInput extends ExtraPodConfig {
   namespace: string;
   sandboxName: string;
   adapterType: string;
@@ -131,7 +133,7 @@ export function buildSandboxCrManifest(
                // HOME=/home/node is inside the readOnly root filesystem.
                // Claude (and most agent runtimes) silently exit with code 0
                // and no output when HOME is unwritable, so set this explicitly.
-              env: [{ name: "HOME", value: "/home/paperclip" }],
+              env: [{ name: "HOME", value: "/home/paperclip" }, ...(input.extraEnv ?? [])],
               envFrom: [{ secretRef: { name: input.envSecretName } }],
               securityContext: {
                 runAsNonRoot: true,
@@ -156,6 +158,7 @@ export function buildSandboxCrManifest(
                 { name: "home", mountPath: "/home/paperclip" },
                 { name: "cache", mountPath: "/home/paperclip/.cache" },
                 { name: "tmp", mountPath: "/tmp" },
+                ...(input.extraVolumeMounts ?? []),
               ],
             },
           ],
@@ -166,6 +169,7 @@ export function buildSandboxCrManifest(
             // The run points HOME, XDG_* and provider homes under /tmp, so package
             // stores and build caches land here; 2Gi evicted agents mid-run.
             { name: "tmp", emptyDir: { sizeLimit: "8Gi" } },
+            ...(input.extraVolumes ?? []),
           ],
         },
       },

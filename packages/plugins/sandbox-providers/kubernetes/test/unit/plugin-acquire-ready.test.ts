@@ -106,3 +106,23 @@ describe("onEnvironmentAcquireLease readiness", () => {
     expect(h.jobWait).not.toHaveBeenCalled();
   });
 });
+
+describe("onEnvironmentAcquireLease extra pod config", () => {
+  it("puts the configured extra volumes, mounts and env into the Sandbox pod", async () => {
+    const { sandboxCrOrchestrator } = await import("../../src/sandbox-cr-orchestrator.js");
+    const claim = vi.mocked(sandboxCrOrchestrator.claim);
+    claim.mockClear();
+    await acquire({
+      extraVolumes: [{ name: "git-mirror", persistentVolumeClaim: { claimName: "git-mirror", readOnly: true } }],
+      extraVolumeMounts: [{ name: "git-mirror", mountPath: "/mnt/git-mirror", readOnly: true }],
+      extraEnv: [{ name: "GIT_MIRROR", value: "/mnt/git-mirror" }],
+    });
+    const manifest = claim.mock.calls[0]![2] as {
+      spec: { podTemplate: { spec: { volumes: unknown[]; containers: { env: unknown[]; volumeMounts: unknown[] }[] } } };
+    };
+    const pod = manifest.spec.podTemplate.spec;
+    expect(pod.volumes).toContainEqual({ name: "git-mirror", persistentVolumeClaim: { claimName: "git-mirror", readOnly: true } });
+    expect(pod.containers[0]!.volumeMounts).toContainEqual({ name: "git-mirror", mountPath: "/mnt/git-mirror", readOnly: true });
+    expect(pod.containers[0]!.env).toContainEqual({ name: "GIT_MIRROR", value: "/mnt/git-mirror" });
+  });
+});
