@@ -6,18 +6,24 @@
  * SINGLE exec per operation instead of the default base64 chunk loop (which
  * costs one exec per ~4 MB chunk — see `upload-interceptor.ts`).
  *
- * The transport is pure streaming: raw tar bytes move over the exec's stdin /
- * stdout channels straight to and from a host file on disk, so neither the host
- * nor the pod ever holds the whole payload in memory.
+ * The transport is streaming:
  *
- *   - syncIn:  build one host tarball of the operation's payload on disk, stream
- *              its raw bytes over the exec's stdin into `head -c <N> | tar -x`
- *              inside the pod (N is the exact archive size, known host-side, so
- *              the pod command self-terminates without depending on stdin EOF),
- *              then stage-then-`mv -f` each single file onto its target so an
- *              interrupted transfer never leaves a truncated file.
- *   - syncOut: run `tar -c … -f -` inside the pod over one exec, streaming the
- *              archive on stdout straight into a host file, then reassemble it.
+ *   - syncIn:  build the operation's tar in-process and stream it straight over
+ *              the exec's stdin into `head -c <N> | tar -x` inside the pod. The
+ *              exec channel never delivers stdin EOF, so the pod reads exactly N
+ *              bytes; N is known without staging the archive (arithmetic from
+ *              `stat` for single files, a counting pack for a directory), and the
+ *              stream fails loud if a source changes so it no longer yields N.
+ *              Each single file is staged-then-`mv -f`'d onto its target so an
+ *              interrupted transfer never leaves a truncated file. Nothing is
+ *              written to host disk.
+ *   - syncOut: run `tar -c` inside the pod into a snapshot in the pod's own
+ *              `/tmp`, then send it as `PCSYNC1 <bytes>\n` + the archive. The
+ *              host reserves those bytes from the worker-wide staging budget
+ *              (`staging-budget.ts`) before writing any of them, stages the
+ *              archive in a host temp file, member-confines it and extracts.
+ *              Excess syncs queue for the budget instead of filling `/tmp`; one
+ *              that alone exceeds the budget fails with a clear error.
  *
  * The exec primitive is injected as `PodStreamExec` so this module stays free of
  * any `@kubernetes/client-node` coupling and is unit-testable against a
@@ -33,24 +39,26 @@
  * the rename). All interpolated paths are single-quoted. Sandbox-authored
  * tarballs (outbound) are member-confined before host extraction.
  *
- * Memory + disk posture: because the archive streams to/from disk, a transfer of
- * any size keeps host and pod memory flat — there is no whole-payload buffer and
- * therefore no 100 MB in-memory cap (the old base64-buffered transport needed
- * one). Inbound bytes are host-authored (the tar this module builds), so they
- * need no untrusted-size bound. Outbound bytes are authored by the untrusted
- * pod, which controls how much it emits, so the sink `Writable` is wrapped in a
- * streamed-bytes guard that fails the transfer closed above `maxOutputBytes`
- * before it can fill the host's disk; the pod's stderr is separately capped in
- * `execInPodStreaming`.
+ * Memory + disk posture: transfers stream, so host and pod memory stay flat
+ * for a payload of any size. Inbound bytes are host-authored and never touch
+ * host disk. Outbound bytes are authored by the untrusted pod, which controls
+ * how much it emits, so the host never writes more than the pod declared, never
+ * more than `maxOutputBytes`, and never more than it has reserved from the
+ * staging budget; the pod's stderr is separately capped in `execInPodStreaming`.
  */
 import path from "node:path";
 import os from "node:os";
-import { promises as fs, createReadStream, createWriteStream } from "node:fs";
-import { Transform } from "node:stream";
+import { promises as fs, createReadStream } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { Readable, Writable } from "node:stream";
 import { finished } from "node:stream/promises";
-import type { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import * as tar from "tar";
+import {
+  getSyncStagingBudget,
+  type StagingBudget,
+  type StagingReservation,
+} from "./staging-budget.js";
 import type {
   PluginEnvironmentSyncResult,
   PluginPostUploadCommand,
@@ -154,6 +162,22 @@ async function withHostTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 /**
+ * `withHostTempDir` for a transfer that stages bytes under the staging budget:
+ * `fn` hands its reservation to `hold`, which is released only after the temp
+ * dir, and so every staged byte, has been removed.
+ */
+async function withBudgetedTempDir<T>(
+  fn: (dir: string, hold: (reservation: StagingReservation) => void) => Promise<T>,
+): Promise<T> {
+  const held: StagingReservation[] = [];
+  try {
+    return await withHostTempDir((dir) => fn(dir, (reservation) => held.push(reservation)));
+  } finally {
+    for (const reservation of held) reservation.release();
+  }
+}
+
+/**
  * POSIX-sh preamble defining a `_pc_resolve` canonicalizer (prefer `realpath`,
  * fall back to `readlink -f`; fail closed with exit 40 if neither exists so the
  * host-side lexical check is never the only line of defense) and `_pc_root` =
@@ -192,23 +216,22 @@ function canonicalizerPreamble(quotedRoot: string): string[] {
 }
 
 /**
- * Stream a host file's raw bytes into the pod command's stdin over one exec and
- * assert it exited 0; otherwise throw with the captured stderr so a failed
- * transfer surfaces fail-loud to the orchestrator (never a silent partial
- * success). The pod command bounds its own read (`head -c <N>`), so stdin EOF is
- * never load-bearing.
+ * Stream `source` into the pod command's stdin over one exec and assert it
+ * exited 0; otherwise throw with the captured stderr so a failed transfer
+ * surfaces fail-loud to the orchestrator (never a silent partial success). The
+ * exec channel never delivers stdin EOF, so the pod command bounds its own read
+ * (`head -c <N>`); `source` must yield exactly N bytes (see `exactLength`).
  */
-async function streamFileToPodStdin(input: {
+async function streamToPodStdin(input: {
   exec: PodStreamExec;
   script: string;
-  filePath: string;
+  source: Readable;
   timeoutMs: number;
   label: string;
 }): Promise<void> {
-  const source = createReadStream(input.filePath);
   try {
     const result = await input.exec(["/bin/sh", "-c", input.script], {
-      stdin: source,
+      stdin: input.source,
       timeoutMs: input.timeoutMs,
       maxStderrBytes: SYNC_STDERR_CAP_BYTES,
     });
@@ -219,47 +242,249 @@ async function streamFileToPodStdin(input: {
       );
     }
   } finally {
-    source.destroy();
+    input.source.destroy();
   }
 }
 
 /**
- * Run the pod command over one exec and stream its stdout straight into a host
- * file, guarding the byte count against `maxOutputBytes` so an untrusted pod
- * cannot fill the host disk. Resolves only after the file is fully flushed, so a
- * caller that reads it back always sees the complete archive; throws fail-loud on
- * a non-zero exit, a tripped disk guard, or a stream error, writing no file the
- * caller then trusts.
+ * Pass `source` through, failing the stream unless it yields exactly
+ * `expectedBytes`. Sync-in announces the archive size to the pod up front
+ * (`head -c <N>`) without staging the archive, so the bytes are produced twice
+ * (once to size, once to send); a source that changes in between must fail the
+ * transfer loud, never hand the pod a truncated or overlong archive.
  */
-async function streamPodStdoutToFile(input: {
+function exactLength(source: AsyncIterable<unknown>, expectedBytes: number, label: string): Readable {
+  return Readable.from(
+    (async function* () {
+      let total = 0;
+      const iterator = source[Symbol.asyncIterator]();
+      while (true) {
+        let next: IteratorResult<unknown>;
+        try {
+          next = await iterator.next();
+        } catch (err) {
+          // e.g. node-tar finding a file shorter or longer than it stat'ed.
+          throw new Error(
+            `Kubernetes ${label} source changed or became unreadable during the sync: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (next.done) break;
+        const bytes = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value as Uint8Array);
+        total += bytes.length;
+        if (total > expectedBytes) {
+          await iterator.return?.();
+          throw new Error(
+            `Kubernetes ${label} source grew while streaming (more than the ${expectedBytes} bytes announced); a source changed during the sync.`,
+          );
+        }
+        yield bytes;
+      }
+      if (total !== expectedBytes) {
+        throw new Error(
+          `Kubernetes ${label} source shrank while streaming (${total} of the ${expectedBytes} bytes announced); a source changed during the sync.`,
+        );
+      }
+    })(),
+    { objectMode: false },
+  );
+}
+
+// Outbound archives are framed by the in-pod script as `PCSYNC1 <bytes>\n`
+// followed by exactly <bytes> of tar, so the host learns the size before it
+// writes a byte and can reserve it from the staging budget.
+const SYNC_FRAME_MAGIC = Buffer.from("PCSYNC1 ", "ascii");
+const SYNC_FRAME_MAX_HEADER_BYTES = SYNC_FRAME_MAGIC.length + 17;
+
+/**
+ * Shell lines that snapshot an outbound archive into the pod's own `/tmp`
+ * (an emptyDir separate from the workspace, so the snapshot is never inside the
+ * tree being archived), then emit it framed with its exact size. The caller's
+ * `tar` writes to `"$_pc_arc"`. The snapshot is removed on any exit.
+ */
+function outboundArchiveFraming(): { prologue: string[]; epilogue: string[]; cleanup: string } {
+  const archive = shQuote(`/tmp/${SCRATCH_PREFIX}-${randomUUID()}.tar`);
+  return {
+    prologue: [
+      `_pc_arc=${archive};`,
+      // Turn a hang-up or broken pipe (the host aborted the transfer) into a
+      // normal exit, so the EXIT trap still removes the snapshot.
+      `trap 'exit 129' HUP; trap 'exit 141' PIPE; trap 'exit 143' TERM;`,
+      // Create the snapshot fresh (noclobber) and owner-only; `tar -f` and the
+      // redirect below truncate it in place, keeping that mode. The umask stays
+      // in the subshell so the rest of the script (snapshot copies) is unchanged.
+      `( umask 077 && set -C && : > "$_pc_arc" ) || { echo "archive scratch failed" >&2; exit 46; };`,
+    ],
+    epilogue: [
+      `_pc_size=$(wc -c < "$_pc_arc" | tr -d ' ') || { echo "archive size failed" >&2; exit 43; };`,
+      `printf 'PCSYNC1 %s\\n' "$_pc_size" || exit 43;`,
+      `cat -- "$_pc_arc" || { echo "archive send failed" >&2; exit 43; };`,
+    ],
+    cleanup: `rm -f -- "$_pc_arc"`,
+  };
+}
+
+function guardExceededError(label: string, limit: number): Error {
+  return new Error(
+    `Kubernetes ${label} payload exceeded the ${limit}-byte streamed-output disk guard; the sandbox emitted more bytes than allowed.`,
+  );
+}
+
+/**
+ * The host side of an outbound transfer: parses the size frame, reserves the
+ * staged bytes from the worker-wide budget BEFORE writing any of them (holding
+ * the write callback while queued, so exec flow control pauses the pod), then
+ * writes exactly the declared bytes to `filePath`.
+ *
+ * `stagingFactor` is how many times the archive size the caller will hold on
+ * host disk (the archive, plus an extracted copy when it extracts into a temp
+ * dir first). A stream without the frame (an older or hostile pod) reserves the
+ * WHOLE budget and is capped at what fits, so it can only ever run alone.
+ */
+class StagedArchiveSink extends Writable {
+  reservation: StagingReservation | null = null;
+  written = 0;
+  private header: Buffer | null = Buffer.alloc(0);
+  private declared: number | null = null;
+  private limit = 0;
+  private file: FileHandle | null = null;
+  private readonly abort = new AbortController();
+
+  constructor(
+    private readonly opts: {
+      filePath: string;
+      budget: StagingBudget;
+      stagingFactor: number;
+      maxOutputBytes: number;
+      label: string;
+    },
+  ) {
+    super();
+  }
+
+  override _write(chunk: Buffer, _encoding: BufferEncoding, cb: (error?: Error | null) => void): void {
+    this.accept(chunk).then(() => cb(), cb);
+  }
+
+  override _final(cb: (error?: Error | null) => void): void {
+    this.finish().then(() => cb(), cb);
+  }
+
+  override _destroy(error: Error | null, cb: (error?: Error | null) => void): void {
+    this.abort.abort(error ?? new Error(`Kubernetes ${this.opts.label} was aborted`));
+    const file = this.file;
+    this.file = null;
+    void (file?.close() ?? Promise.resolve()).catch(() => undefined).then(() => cb(error));
+  }
+
+  private async accept(chunk: Buffer): Promise<void> {
+    if (this.header === null) return this.writeBody(chunk);
+    const buffered = Buffer.concat([this.header, chunk]);
+    const prefix = Math.min(buffered.length, SYNC_FRAME_MAGIC.length);
+    if (!buffered.subarray(0, prefix).equals(SYNC_FRAME_MAGIC.subarray(0, prefix))) {
+      this.header = null;
+      await this.admit(null);
+      return this.writeBody(buffered);
+    }
+    const newline = buffered.indexOf(0x0a);
+    if (newline === -1) {
+      if (buffered.length > SYNC_FRAME_MAX_HEADER_BYTES) throw this.malformed();
+      this.header = buffered;
+      return;
+    }
+    const sizeText = buffered.subarray(SYNC_FRAME_MAGIC.length, newline).toString("ascii");
+    if (!/^\d{1,16}$/.test(sizeText)) throw this.malformed();
+    this.header = null;
+    await this.admit(Number(sizeText));
+    return this.writeBody(buffered.subarray(newline + 1));
+  }
+
+  private async finish(): Promise<void> {
+    if (this.header !== null) {
+      // Ended before a full frame: nothing staged when nothing arrived (a
+      // failing script), otherwise treat what arrived as an unframed archive.
+      const pending = this.header;
+      this.header = null;
+      if (pending.length === 0) {
+        await fs.writeFile(this.opts.filePath, Buffer.alloc(0), { flag: "wx" });
+        return;
+      }
+      await this.admit(null);
+      await this.writeBody(pending);
+    }
+    if (this.declared !== null && this.written !== this.declared) {
+      throw new Error(
+        `Kubernetes ${this.opts.label} ended after ${this.written} of the ${this.declared} archive bytes the sandbox declared.`,
+      );
+    }
+    const file = this.file;
+    this.file = null;
+    await file?.close();
+  }
+
+  private async admit(declared: number | null): Promise<void> {
+    const { budget, stagingFactor, maxOutputBytes, label } = this.opts;
+    let reserve: number;
+    if (declared !== null) {
+      if (maxOutputBytes >= 0 && declared > maxOutputBytes) throw guardExceededError(label, maxOutputBytes);
+      this.declared = declared;
+      this.limit = declared;
+      reserve = declared * stagingFactor;
+    } else {
+      reserve = budget.capacityBytes;
+      this.limit = Math.floor(budget.capacityBytes / stagingFactor);
+      if (maxOutputBytes >= 0) this.limit = Math.min(this.limit, maxOutputBytes);
+    }
+    this.reservation = await budget.acquire(reserve, { signal: this.abort.signal, label: `Kubernetes ${label}` });
+    this.file = await fs.open(this.opts.filePath, "wx");
+  }
+
+  private async writeBody(bytes: Buffer): Promise<void> {
+    if (bytes.length === 0) return;
+    this.written += bytes.length;
+    if (this.written > this.limit) {
+      throw this.declared === null
+        ? guardExceededError(this.opts.label, this.limit)
+        : new Error(
+            `Kubernetes ${this.opts.label} sent more than the ${this.declared} archive bytes the sandbox declared.`,
+          );
+    }
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesWritten } = await this.file!.write(bytes, offset, bytes.length - offset);
+      offset += bytesWritten;
+    }
+  }
+
+  private malformed(): Error {
+    return new Error(`Kubernetes ${this.opts.label} received a malformed archive size frame from the sandbox.`);
+  }
+}
+
+const NO_RESERVATION: StagingReservation = { bytes: 0, waitMs: 0, release: () => undefined };
+
+/**
+ * Run the pod command over one exec and stage its framed stdout archive in a
+ * host file, under the worker-wide staging budget. Resolves once the file is
+ * fully flushed, with the reservation the CALLER must release after it is done
+ * with every staged byte (archive and any extracted copy). Throws fail-loud on
+ * a non-zero exit, a size beyond the guard or budget, or a stream error, having
+ * released the reservation.
+ */
+async function receiveStagedArchive(input: {
   exec: PodStreamExec;
   script: string;
   filePath: string;
+  budget: StagingBudget;
+  stagingFactor: number;
   maxOutputBytes: number;
   timeoutMs: number;
   label: string;
-}): Promise<void> {
-  const fileStream = createWriteStream(input.filePath);
-  let written = 0;
-  const guard = new Transform({
-    transform(chunk: Buffer, _enc, cb) {
-      written += chunk.length;
-      if (input.maxOutputBytes >= 0 && written > input.maxOutputBytes) {
-        cb(
-          new Error(
-            `Kubernetes ${input.label} payload exceeded the ${input.maxOutputBytes}-byte streamed-output disk guard; the sandbox emitted more bytes than allowed.`,
-          ),
-        );
-        return;
-      }
-      cb(null, chunk);
-    },
-  });
-  guard.pipe(fileStream);
-  const flushed = finished(fileStream);
+}): Promise<{ reservation: StagingReservation; archiveBytes: number }> {
+  const sink = new StagedArchiveSink(input);
+  const flushed = finished(sink);
   try {
     const result = await input.exec(["/bin/sh", "-c", input.script], {
-      stdout: guard,
+      stdout: sink,
       timeoutMs: input.timeoutMs,
       maxStderrBytes: SYNC_STDERR_CAP_BYTES,
     });
@@ -270,12 +495,13 @@ async function streamPodStdoutToFile(input: {
         `Kubernetes ${input.label} failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
       );
     }
+    return { reservation: sink.reservation ?? NO_RESERVATION, archiveBytes: sink.written };
   } catch (err) {
     // Tear the sink down so a tripped guard / rejected exec never leaves the
-    // file stream open (and its `finished` promise dangling as unhandled).
-    guard.destroy();
-    fileStream.destroy();
+    // file open or a queued reservation behind.
+    sink.destroy();
     await flushed.catch(() => undefined);
+    sink.reservation?.release();
     throw err;
   }
 }
@@ -322,45 +548,131 @@ function escapeRegExpChar(char: string): string {
   return /[\\^$.*+?()[\]{}|/]/.test(char) ? `\\${char}` : char;
 }
 
+// node-tar ends an archive with two zero blocks and does not pad to a record.
+const TAR_BLOCK_BYTES = 512;
+const TAR_EOF_BYTES = 2 * TAR_BLOCK_BYTES;
+
 /**
- * Build a host-side tarball in-process (node-tar, no `tar` child process),
- * mirroring the runtime's own `createTarballFromDirectory`: archive the named
- * top-level entries (no "." self entry), skip `._*` AppleDouble sidecars, honor
+ * A host-side archive that is produced on demand, never written to disk:
+ * `bytes` is its exact size (announced to the pod's `head -c`) and `open()`
+ * streams it, failing loud if a source changed so the stream no longer matches.
+ */
+interface StreamedArchive {
+  bytes: number;
+  open(): Readable;
+}
+
+/**
+ * Archive a directory in-process (node-tar, no `tar` child process), mirroring
+ * the runtime's own `createTarballFromDirectory`: archive the named top-level
+ * entries (no "." self entry), skip `._*` AppleDouble sidecars, honor
  * `exclude`, and map `followSymlinks` onto dereferencing, so the pod-side
  * `tar -x` sees the same plain ustar/pax member layout as the base64 fallback's
- * tar. node-tar never writes xattrs or macOS metadata. An empty entry set writes
- * a valid empty tar (1024-byte zero EOF marker).
+ * tar. node-tar never writes xattrs or macOS metadata. An empty entry set is a
+ * valid empty tar (the 1024-byte zero EOF marker).
+ *
+ * Nothing is staged: the archive is packed once to measure it and again to
+ * send it. `portable` leaves atime/ctime and owner names out of the headers so
+ * an unchanged tree packs to identical bytes both times (the sandbox runs as a
+ * fixed non-root user, so archive owners never applied anyway).
  */
-async function createHostTarball(input: {
+async function streamedDirectoryArchive(input: {
   localDir: string;
-  archivePath: string;
   exclude?: string[];
   followSymlinks?: boolean;
-  entries?: string[];
-}): Promise<void> {
+}): Promise<StreamedArchive> {
   const excludes = ["._*", ...(input.exclude ?? [])].map(compileTarExclude);
-  const entries =
-    input.entries ??
-    (await fs.readdir(input.localDir)).sort((left, right) => left.localeCompare(right));
-  if (entries.length === 0) {
-    await fs.writeFile(input.archivePath, Buffer.alloc(1024));
-    return;
-  }
-  await tar.c(
-    {
-      file: input.archivePath,
-      cwd: input.localDir,
-      follow: input.followSymlinks === true,
-      // A stat/read failure (e.g. a dangling link under `followSymlinks`) fails
-      // the transfer loud, as the `tar` CLI's non-zero exit did.
-      strict: true,
-      filter: (memberPath) => {
-        const name = memberPath.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
-        return !excludes.some((exclude) => exclude.test(name));
+  const entries = (await fs.readdir(input.localDir)).sort((left, right) => left.localeCompare(right));
+  const pack = (): AsyncIterable<unknown> => {
+    if (entries.length === 0) {
+      return (async function* () {
+        yield Buffer.alloc(TAR_EOF_BYTES);
+      })();
+    }
+    const packer = tar.c(
+      {
+        cwd: input.localDir,
+        follow: input.followSymlinks === true,
+        portable: true,
+        // A stat/read failure (e.g. a dangling link under `followSymlinks`) fails
+        // the transfer loud, as the `tar` CLI's non-zero exit did.
+        strict: true,
+        filter: (memberPath) => {
+          const name = memberPath.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+          return !excludes.some((exclude) => exclude.test(name));
+        },
       },
-    },
-    entries,
-  );
+      entries,
+    );
+    // The iterator surfaces the first error; later ones (a pack keeps reporting
+    // after the consumer stops) must not escape as unhandled.
+    packer.on("error", () => undefined);
+    return packer as unknown as AsyncIterable<unknown>;
+  };
+  let bytes = 0;
+  for await (const chunk of pack()) bytes += (chunk as Uint8Array).length;
+  return { bytes, open: () => exactLength(pack(), bytes, "syncIn directory transfer") };
+}
+
+/**
+ * Archive single files under flat index names (`0`, `1`, …) straight from
+ * their sources, with no staging copy: each member is a ustar header, the
+ * file's bytes, and zero padding to the block, so the exact size follows from
+ * `stat`. Each source is opened once and re-checked through its descriptor, so
+ * a file replaced or resized after sizing fails the transfer loud. Like the
+ * `copyFile` staging it replaces, a symlinked source is followed and must
+ * resolve to a regular file; the member carries the source's permission bits.
+ */
+async function streamedFileArchive(sources: string[], names: string[]): Promise<StreamedArchive & { payloadBytes: number }> {
+  const stats = await Promise.all(sources.map((source) => fs.stat(source)));
+  let bytes = TAR_EOF_BYTES;
+  let payloadBytes = 0;
+  stats.forEach((stat, i) => {
+    if (!stat.isFile()) throw new Error(`Kubernetes syncIn file source is not a regular file: ${sources[i]}`);
+    bytes += TAR_BLOCK_BYTES + Math.ceil(stat.size / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES;
+    payloadBytes += stat.size;
+  });
+  const uid = process.getuid?.() ?? 0;
+  const gid = process.getgid?.() ?? 0;
+  async function* members(): AsyncGenerator<Buffer> {
+    for (let i = 0; i < sources.length; i += 1) {
+      const size = stats[i].size;
+      const handle = await fs.open(sources[i], "r");
+      try {
+        const current = await handle.stat();
+        if (!current.isFile() || current.size !== size) {
+          throw new Error(`Kubernetes syncIn file source changed during the sync: ${sources[i]}`);
+        }
+        const header = Buffer.alloc(TAR_BLOCK_BYTES);
+        new tar.Header({
+          path: names[i],
+          type: "File",
+          size,
+          mode: current.mode & 0o7777,
+          mtime: current.mtime,
+          uid,
+          gid,
+        }).encode(header, 0);
+        yield header;
+        if (size > 0) {
+          let read = 0;
+          for await (const chunk of handle.createReadStream({ start: 0, end: size - 1, autoClose: false })) {
+            read += (chunk as Buffer).length;
+            yield chunk as Buffer;
+          }
+          if (read !== size) {
+            throw new Error(`Kubernetes syncIn file source changed during the sync: ${sources[i]}`);
+          }
+          const padding = (TAR_BLOCK_BYTES - (size % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES;
+          if (padding > 0) yield Buffer.alloc(padding);
+        }
+      } finally {
+        await handle.close();
+      }
+    }
+    yield Buffer.alloc(TAR_EOF_BYTES);
+  }
+  return { bytes, payloadBytes, open: () => exactLength(members(), bytes, "syncIn file transfer") };
 }
 
 /**
@@ -642,92 +954,78 @@ async function syncInFileMappings(input: {
     assertConfinedSandboxPath(remoteDir, mapping.targetPath, "target");
   }
 
-  return withHostTempDir(async (tmp) => {
-    // Stage each source under a flat index name so one tar carries the whole
-    // operation; the index maps back to the mapping for mode + rename below.
-    const stage = path.join(tmp, "stage");
-    await fs.mkdir(stage);
-    let bytesTransferred = 0;
-    const indexNames: string[] = [];
-    for (let i = 0; i < mappings.length; i += 1) {
-      const name = String(i);
-      await fs.copyFile(mappings[i].sourcePath, path.join(stage, name));
-      bytesTransferred += (await fs.stat(mappings[i].sourcePath)).size;
-      indexNames.push(name);
-    }
+  // Tar each source under a flat index name, straight from its source with no
+  // host staging; the index maps back to the mapping for mode + rename below.
+  const indexNames = mappings.map((_, i) => String(i));
+  const archive = await streamedFileArchive(
+    mappings.map((mapping) => mapping.sourcePath),
+    indexNames,
+  );
+  // Reserved staging dir is a DIRECT child of the workspace root (created
+  // `0700`), so a secret is never world-readable and the closing `mv -f` is an
+  // atomic same-filesystem rename.
+  const remoteStage = path.posix.join(remoteDir, scratchName());
+  const parentDirs = [...new Set(mappings.map((m) => path.posix.dirname(m.targetPath)))];
 
-    const archivePath = path.join(tmp, "sync-in.tar");
-    await createHostTarball({ localDir: stage, archivePath, entries: indexNames });
-    // Exact archive size: the pod reads precisely this many bytes so its extract
-    // pipeline self-terminates without depending on stdin EOF delivery.
-    const archiveBytes = (await fs.stat(archivePath)).size;
-
-    // Reserved staging dir is a DIRECT child of the workspace root (created
-    // `0700`), so a secret is never world-readable and the closing `mv -f` is an
-    // atomic same-filesystem rename.
-    const remoteStage = path.posix.join(remoteDir, scratchName());
-    const parentDirs = [...new Set(mappings.map((m) => path.posix.dirname(m.targetPath)))];
-
-    const script: string[] = [...canonicalizerPreamble(shQuote(remoteDir))];
-    // Sweep the staging dir on ANY exit so a failed transfer leaves no scratch.
-    script.push(`trap 'rm -rf ${shQuote(remoteStage)}' EXIT;`);
-    script.push(`mkdir -p -m 700 ${shQuote(remoteStage)} || { echo "stage mkdir failed" >&2; exit 46; };`);
-    // Confine the deepest existing ancestor of each target parent BEFORE creating
-    // it: `mkdir -p` follows a sandbox-planted symlink ancestor and would
-    // otherwise materialize the directory OUTSIDE the root before any post-mkdir
-    // check could reject it (P0 escape). Confine-then-create closes that window.
-    for (const dir of parentDirs) {
-      script.push(
-        `_pc_confine_ancestor ${shQuote(dir)} || { echo "ESCAPE" >&2; exit 42; };`,
-        `mkdir -p ${shQuote(dir)} || { echo "mkdir failed" >&2; exit 46; };`,
-      );
-    }
-    // Re-confine every (now-materialized) target parent dir through realpath before
-    // any bytes land: a sandbox-planted symlink parent is caught here too.
-    for (const dir of parentDirs) {
-      script.push(
-        `_pc_d=$(_pc_resolve ${shQuote(dir)}) || { echo "ESCAPE" >&2; exit 42; };`,
-        `case "$_pc_d/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
-      );
-    }
-    // Read exactly the archive's bytes off stdin and extract the whole payload
-    // into the staging dir in one pipeline.
+  const script: string[] = [...canonicalizerPreamble(shQuote(remoteDir))];
+  // Sweep the staging dir on ANY exit so a failed transfer leaves no scratch.
+  script.push(`trap 'rm -rf ${shQuote(remoteStage)}' EXIT;`);
+  script.push(`mkdir -p -m 700 ${shQuote(remoteStage)} || { echo "stage mkdir failed" >&2; exit 46; };`);
+  // Confine the deepest existing ancestor of each target parent BEFORE creating
+  // it: `mkdir -p` follows a sandbox-planted symlink ancestor and would
+  // otherwise materialize the directory OUTSIDE the root before any post-mkdir
+  // check could reject it (P0 escape). Confine-then-create closes that window.
+  for (const dir of parentDirs) {
     script.push(
-      `head -c ${archiveBytes} | tar -xf - -C ${shQuote(remoteStage)} || { echo "extract failed" >&2; exit 43; };`,
+      `_pc_confine_ancestor ${shQuote(dir)} || { echo "ESCAPE" >&2; exit 42; };`,
+      `mkdir -p ${shQuote(dir)} || { echo "mkdir failed" >&2; exit 46; };`,
     );
-    // Promote each staged file onto its target: chmod the temp first (secret
-    // lands at its mode from the instant it exists at targetPath), then bind the
-    // parent-dir re-check and the rename into a `/proc/self/fd`-pinned open so an
-    // ancestor swap after the check cannot redirect the rename.
-    mappings.forEach((mapping, i) => {
-      const staged = path.posix.join(remoteStage, indexNames[i]);
-      const parentDir = path.posix.dirname(mapping.targetPath);
-      const base = path.posix.basename(mapping.targetPath);
-      if (typeof mapping.mode === "number") {
-        script.push(
-          `chmod ${(mapping.mode & 0o7777).toString(8).padStart(3, "0")} ${shQuote(staged)} || { echo "chmod failed" >&2; exit 48; };`,
-        );
-      }
+  }
+  // Re-confine every (now-materialized) target parent dir through realpath before
+  // any bytes land: a sandbox-planted symlink parent is caught here too.
+  for (const dir of parentDirs) {
+    script.push(
+      `_pc_d=$(_pc_resolve ${shQuote(dir)}) || { echo "ESCAPE" >&2; exit 42; };`,
+      `case "$_pc_d/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
+    );
+  }
+  // Read exactly the archive's bytes off stdin and extract the whole payload
+  // into the staging dir in one pipeline.
+  script.push(
+    `head -c ${archive.bytes} | tar -xf - -C ${shQuote(remoteStage)} || { echo "extract failed" >&2; exit 43; };`,
+  );
+  // Promote each staged file onto its target: chmod the temp first (secret
+  // lands at its mode from the instant it exists at targetPath), then bind the
+  // parent-dir re-check and the rename into a `/proc/self/fd`-pinned open so an
+  // ancestor swap after the check cannot redirect the rename.
+  mappings.forEach((mapping, i) => {
+    const staged = path.posix.join(remoteStage, indexNames[i]);
+    const parentDir = path.posix.dirname(mapping.targetPath);
+    const base = path.posix.basename(mapping.targetPath);
+    if (typeof mapping.mode === "number") {
       script.push(
-        `_pc_tgt_dir=$(_pc_resolve ${shQuote(parentDir)}) || { echo "ESCAPE" >&2; exit 42; };`,
-        `case "$_pc_tgt_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
-        `exec 8<"$_pc_tgt_dir" || { echo "open failed" >&2; exit 47; };`,
-        `_pc_fd_dir=$(_pc_resolve /proc/self/fd/8) || { echo "ESCAPE" >&2; exit 42; };`,
-        `case "$_pc_fd_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
-        `mv -f ${shQuote(staged)} /proc/self/fd/8/${shQuote(base)} || { echo "rename failed" >&2; exit 44; };`,
-        `exec 8>&-;`,
+        `chmod ${(mapping.mode & 0o7777).toString(8).padStart(3, "0")} ${shQuote(staged)} || { echo "chmod failed" >&2; exit 48; };`,
       );
-    });
-
-    await streamFileToPodStdin({
-      exec,
-      script: script.join("\n"),
-      filePath: archivePath,
-      timeoutMs,
-      label: "syncIn file transfer",
-    });
-    return { filesTransferred: mappings.length, bytesTransferred };
+    }
+    script.push(
+      `_pc_tgt_dir=$(_pc_resolve ${shQuote(parentDir)}) || { echo "ESCAPE" >&2; exit 42; };`,
+      `case "$_pc_tgt_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
+      `exec 8<"$_pc_tgt_dir" || { echo "open failed" >&2; exit 47; };`,
+      `_pc_fd_dir=$(_pc_resolve /proc/self/fd/8) || { echo "ESCAPE" >&2; exit 42; };`,
+      `case "$_pc_fd_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
+      `mv -f ${shQuote(staged)} /proc/self/fd/8/${shQuote(base)} || { echo "rename failed" >&2; exit 44; };`,
+      `exec 8>&-;`,
+    );
   });
+
+  await streamToPodStdin({
+    exec,
+    script: script.join("\n"),
+    source: archive.open(),
+    timeoutMs,
+    label: "syncIn file transfer",
+  });
+  return { filesTransferred: mappings.length, bytesTransferred: archive.payloadBytes };
 }
 
 /**
@@ -746,47 +1044,41 @@ async function syncInDirectoryMapping(input: {
 }): Promise<{ filesTransferred: number; bytesTransferred: number }> {
   const { exec, mapping, remoteDir, timeoutMs } = input;
   assertConfinedSandboxPath(remoteDir, mapping.targetPath, "target");
-  return withHostTempDir(async (tmp) => {
-    const archivePath = path.join(tmp, "sync-in.tar");
-    await createHostTarball({
-      localDir: mapping.sourcePath,
-      archivePath,
-      exclude: mapping.exclude,
-      followSymlinks: mapping.followSymlinks,
-    });
-    const archiveBytes = (await fs.stat(archivePath)).size;
-
-    const target = mapping.targetPath;
-    const script = [
-      ...canonicalizerPreamble(shQuote(remoteDir)),
-      // Confine the deepest existing ancestor before `mkdir -p` runs: it follows a
-      // sandbox-planted symlink ancestor and would otherwise create the target dir
-      // OUTSIDE the root before the post-mkdir realpath check below could reject it.
-      `_pc_confine_ancestor ${shQuote(target)} || { echo "ESCAPE" >&2; exit 42; };`,
-      `mkdir -p ${shQuote(target)} || { echo "mkdir failed" >&2; exit 46; };`,
-      // Open-then-verify the extraction dir: `open()` walks every ancestor, so a
-      // post-resolve ancestor swap is caught by re-canonicalizing the pinned fd
-      // before extracting; `tar -C /proc/self/fd/9` then chdir's through the
-      // pinned inode, immune to a later path swap.
-      `_pc_real=$(_pc_resolve ${shQuote(target)}) || { echo "ESCAPE" >&2; exit 42; };`,
-      `case "$_pc_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
-      `exec 9<"$_pc_real" || { echo "open failed" >&2; exit 46; };`,
-      `_pc_fd_real=$(_pc_resolve /proc/self/fd/9) || { echo "ESCAPE" >&2; exit 42; };`,
-      `case "$_pc_fd_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
-      `head -c ${archiveBytes} | tar -xf - -C /proc/self/fd/9 || { echo "extract failed" >&2; exit 43; };`,
-      `exec 9>&-;`,
-    ].join("\n");
-
-    await streamFileToPodStdin({
-      exec,
-      script,
-      filePath: archivePath,
-      timeoutMs,
-      label: "syncIn directory transfer",
-    });
-    const filesTransferred = await countHostFiles(mapping.sourcePath, mapping.exclude);
-    return { filesTransferred, bytesTransferred: archiveBytes };
+  const archive = await streamedDirectoryArchive({
+    localDir: mapping.sourcePath,
+    exclude: mapping.exclude,
+    followSymlinks: mapping.followSymlinks,
   });
+  const target = mapping.targetPath;
+  const script = [
+    ...canonicalizerPreamble(shQuote(remoteDir)),
+    // Confine the deepest existing ancestor before `mkdir -p` runs: it follows a
+    // sandbox-planted symlink ancestor and would otherwise create the target dir
+    // OUTSIDE the root before the post-mkdir realpath check below could reject it.
+    `_pc_confine_ancestor ${shQuote(target)} || { echo "ESCAPE" >&2; exit 42; };`,
+    `mkdir -p ${shQuote(target)} || { echo "mkdir failed" >&2; exit 46; };`,
+    // Open-then-verify the extraction dir: `open()` walks every ancestor, so a
+    // post-resolve ancestor swap is caught by re-canonicalizing the pinned fd
+    // before extracting; `tar -C /proc/self/fd/9` then chdir's through the
+    // pinned inode, immune to a later path swap.
+    `_pc_real=$(_pc_resolve ${shQuote(target)}) || { echo "ESCAPE" >&2; exit 42; };`,
+    `case "$_pc_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
+    `exec 9<"$_pc_real" || { echo "open failed" >&2; exit 46; };`,
+    `_pc_fd_real=$(_pc_resolve /proc/self/fd/9) || { echo "ESCAPE" >&2; exit 42; };`,
+    `case "$_pc_fd_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
+    `head -c ${archive.bytes} | tar -xf - -C /proc/self/fd/9 || { echo "extract failed" >&2; exit 43; };`,
+    `exec 9>&-;`,
+  ].join("\n");
+
+  await streamToPodStdin({
+    exec,
+    script,
+    source: archive.open(),
+    timeoutMs,
+    label: "syncIn directory transfer",
+  });
+  const filesTransferred = await countHostFiles(mapping.sourcePath, mapping.exclude);
+  return { filesTransferred, bytesTransferred: archive.bytes };
 }
 
 /**
@@ -853,14 +1145,39 @@ async function runPostUploadCommands(input: {
   }
 }
 
+/**
+ * One sync operation's accounting, reported through `onOperation` so the
+ * caller can log it: `bytesStaged` is what the operation reserved from the
+ * host staging budget (zero for sync-in, which streams), `stagingWaitMs` how
+ * long it queued for that reservation, `durationMs` the whole operation.
+ */
+export interface SyncOperationTelemetry {
+  direction: "in" | "out";
+  operationId: string;
+  filesTransferred: number;
+  bytesTransferred: number;
+  bytesStaged: number;
+  stagingWaitMs: number;
+  durationMs: number;
+}
+
+interface OutboundTransferResult {
+  filesTransferred: number;
+  bytesTransferred: number;
+  bytesStaged: number;
+  stagingWaitMs: number;
+}
+
 export async function performSyncIn(input: {
   exec: PodStreamExec;
   operations: PluginSyncOperation[];
   remoteDir: string;
   timeoutMs: number;
+  onOperation?: (telemetry: SyncOperationTelemetry) => void;
 }): Promise<PluginEnvironmentSyncResult> {
   const operations: PluginEnvironmentSyncResult["operations"] = [];
   for (const operation of input.operations) {
+    const startedAt = Date.now();
     let filesTransferred = 0;
     let bytesTransferred = 0;
 
@@ -898,6 +1215,15 @@ export async function performSyncIn(input: {
     });
 
     operations.push({ operationId: operation.operationId, filesTransferred, bytesTransferred });
+    input.onOperation?.({
+      direction: "in",
+      operationId: operation.operationId,
+      filesTransferred,
+      bytesTransferred,
+      bytesStaged: 0,
+      stagingWaitMs: 0,
+      durationMs: Date.now() - startedAt,
+    });
   }
   return { operations };
 }
@@ -922,20 +1248,22 @@ async function syncOutFileMappings(input: {
   remoteDir: string;
   timeoutMs: number;
   maxOutputBytes: number;
-}): Promise<{ filesTransferred: number; bytesTransferred: number }> {
-  const { exec, mappings, remoteDir, timeoutMs, maxOutputBytes } = input;
-  if (mappings.length === 0) return { filesTransferred: 0, bytesTransferred: 0 };
+  budget: StagingBudget;
+}): Promise<OutboundTransferResult> {
+  const { exec, mappings, remoteDir, timeoutMs, maxOutputBytes, budget } = input;
+  if (mappings.length === 0) return { filesTransferred: 0, bytesTransferred: 0, bytesStaged: 0, stagingWaitMs: 0 };
 
   for (const mapping of mappings) {
     assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
   }
 
-  return withHostTempDir(async (tmp) => {
+  return withBudgetedTempDir(async (tmp, hold) => {
     const remoteStage = path.posix.join(remoteDir, scratchName());
     const indexNames = mappings.map((_, i) => String(i));
+    const framing = outboundArchiveFraming();
 
-    const script: string[] = [...canonicalizerPreamble(shQuote(remoteDir))];
-    script.push(`trap 'rm -rf ${shQuote(remoteStage)}' EXIT;`);
+    const script: string[] = [...canonicalizerPreamble(shQuote(remoteDir)), ...framing.prologue];
+    script.push(`trap 'rm -rf ${shQuote(remoteStage)}; ${framing.cleanup}' EXIT;`);
     script.push(`mkdir -p -m 700 ${shQuote(remoteStage)} || { echo "stage mkdir failed" >&2; exit 46; };`);
     mappings.forEach((mapping, i) => {
       const snapshot = path.posix.join(remoteStage, indexNames[i]);
@@ -958,22 +1286,28 @@ async function syncOutFileMappings(input: {
         `exec 7>&-;`,
       );
     });
-    // Tar the immutable snapshots straight to stdout (streamed to a host file).
+    // Tar the immutable snapshots into the pod's archive snapshot, then send it
+    // framed with its size so the host can reserve staging before writing.
     script.push(
-      `tar -c --no-xattrs -f - -C ${shQuote(remoteStage)} -- ${indexNames
+      `tar -c --no-xattrs -f "$_pc_arc" -C ${shQuote(remoteStage)} -- ${indexNames
         .map(shQuote)
         .join(" ")} || { echo "tar failed" >&2; exit 43; };`,
+      ...framing.epilogue,
     );
 
+    // The archive and its extracted copy both sit in the host temp dir.
     const localTar = path.join(tmp, "sync-out.tar");
-    await streamPodStdoutToFile({
+    const received = await receiveStagedArchive({
       exec,
       script: script.join("\n"),
       filePath: localTar,
+      budget,
+      stagingFactor: 2,
       maxOutputBytes,
       timeoutMs,
       label: "syncOut file transfer",
     });
+    hold(received.reservation);
 
     // Reassemble on the host: member-confine the sandbox-authored archive,
     // extract to a temp, then atomic-rename each index file onto its host target.
@@ -991,7 +1325,12 @@ async function syncOutFileMappings(input: {
       bytesTransferred += (await fs.stat(staged)).size;
       await fs.rename(staged, mapping.targetPath);
     }
-    return { filesTransferred: mappings.length, bytesTransferred };
+    return {
+      filesTransferred: mappings.length,
+      bytesTransferred,
+      bytesStaged: received.reservation.bytes,
+      stagingWaitMs: received.reservation.waitMs,
+    };
   });
 }
 
@@ -1008,10 +1347,12 @@ async function syncOutDirectoryMapping(input: {
   remoteDir: string;
   timeoutMs: number;
   maxOutputBytes: number;
-}): Promise<{ filesTransferred: number; bytesTransferred: number }> {
-  const { exec, mapping, remoteDir, timeoutMs, maxOutputBytes } = input;
+  budget: StagingBudget;
+}): Promise<OutboundTransferResult> {
+  const { exec, mapping, remoteDir, timeoutMs, maxOutputBytes, budget } = input;
   assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
-  return withHostTempDir(async (tmp) => {
+  return withBudgetedTempDir(async (tmp, hold) => {
+    const framing = outboundArchiveFraming();
     // Preservation exclusions name literal source-relative paths. GNU tar's
     // default basename/glob matching could silently omit unrelated user files.
     const excludes = [...(mapping.preserveSourceEntries ? [] : ["._*"]), ...(mapping.exclude ?? [])];
@@ -1021,6 +1362,8 @@ async function syncOutDirectoryMapping(input: {
         : excludes).map(entry => `--exclude ${shQuote(entry)}`).join(" ");
     const script = [
       ...canonicalizerPreamble(shQuote(remoteDir)),
+      ...framing.prologue,
+      `trap '${framing.cleanup}' EXIT;`,
       // Confine the source dir through an open-then-verify pinned fd before taring.
       `_pc_real=$(_pc_resolve ${shQuote(mapping.sourcePath)}) || { echo "ESCAPE" >&2; exit 42; };`,
       `case "$_pc_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
@@ -1029,29 +1372,45 @@ async function syncOutDirectoryMapping(input: {
       `case "$_pc_fd_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
       `cd /proc/self/fd/9 || { echo "cd failed" >&2; exit 46; };`,
       // Collect top-level entries (incl. dotfiles) without a "." self-entry, then
-      // tar with the `followSymlinks` → `-h` mapping, streaming to stdout.
+      // tar with the `followSymlinks` → `-h` mapping into the archive snapshot.
       "set -- *",
       'if [ "$#" -eq 1 ] && [ "$1" = "*" ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then set --; fi',
       'for entry in .[!.]* ..?*; do [ -e "$entry" ] || [ -L "$entry" ] || continue; set -- "$@" "$entry"; done',
-      `if [ "$#" -eq 0 ]; then dd if=/dev/zero bs=1024 count=1 2>/dev/null; ` +
-        `else tar -c --no-xattrs ${mapping.followSymlinks ? "-h " : ""}${excludeFlags} -f - -- "$@" || { echo "tar failed" >&2; exit 43; }; fi`,
+      `if [ "$#" -eq 0 ]; then dd if=/dev/zero bs=1024 count=1 2>/dev/null > "$_pc_arc" || { echo "tar failed" >&2; exit 43; }; ` +
+        `else tar -c --no-xattrs ${mapping.followSymlinks ? "-h " : ""}${excludeFlags} -f "$_pc_arc" -- "$@" || { echo "tar failed" >&2; exit 43; }; fi`,
       `exec 9>&-;`,
+      ...framing.epilogue,
     ].join("\n");
 
+    // Extracting into a target under the host temp dir holds a second copy of
+    // the payload on the same disk while the archive still exists.
     const localTar = path.join(tmp, "sync-out.tar");
-    await streamPodStdoutToFile({
+    const received = await receiveStagedArchive({
       exec,
       script,
       filePath: localTar,
+      budget,
+      stagingFactor: isWithinDir(os.tmpdir(), mapping.targetPath) ? 2 : 1,
       maxOutputBytes,
       timeoutMs,
       label: "syncOut directory transfer",
     });
-    const bytesTransferred = (await fs.stat(localTar)).size;
+    hold(received.reservation);
+    const bytesTransferred = received.archiveBytes;
     await extractHostTarball({ archivePath: localTar, localDir: mapping.targetPath, preserveSourceEntries: mapping.preserveSourceEntries });
     const filesTransferred = await countHostFiles(mapping.targetPath, mapping.preserveSourceEntries ? undefined : mapping.exclude);
-    return { filesTransferred, bytesTransferred };
+    return {
+      filesTransferred,
+      bytesTransferred,
+      bytesStaged: received.reservation.bytes,
+      stagingWaitMs: received.reservation.waitMs,
+    };
   });
+}
+
+function isWithinDir(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 export async function performSyncOut(input: {
@@ -1060,12 +1419,19 @@ export async function performSyncOut(input: {
   remoteDir: string;
   timeoutMs: number;
   maxOutputBytes?: number;
+  /** Host staging budget; defaults to the one shared by the whole worker. */
+  stagingBudget?: StagingBudget;
+  onOperation?: (telemetry: SyncOperationTelemetry) => void;
 }): Promise<PluginEnvironmentSyncResult> {
   const maxOutputBytes = input.maxOutputBytes ?? MAX_SYNC_OUTPUT_BYTES;
+  const budget = input.stagingBudget ?? getSyncStagingBudget();
   const operations: PluginEnvironmentSyncResult["operations"] = [];
   for (const operation of input.operations) {
+    const startedAt = Date.now();
     let filesTransferred = 0;
     let bytesTransferred = 0;
+    let bytesStaged = 0;
+    let stagingWaitMs = 0;
 
     const fileMappings = operation.files.filter((mapping) => mapping.kind === "file");
     const directoryMappings = operation.files.filter((mapping) => mapping.kind === "directory");
@@ -1076,9 +1442,12 @@ export async function performSyncOut(input: {
       remoteDir: input.remoteDir,
       timeoutMs: input.timeoutMs,
       maxOutputBytes,
+      budget,
     });
     filesTransferred += fileResult.filesTransferred;
     bytesTransferred += fileResult.bytesTransferred;
+    bytesStaged += fileResult.bytesStaged;
+    stagingWaitMs += fileResult.stagingWaitMs;
 
     for (const mapping of directoryMappings) {
       const dirResult = await syncOutDirectoryMapping({
@@ -1087,12 +1456,24 @@ export async function performSyncOut(input: {
         remoteDir: input.remoteDir,
         timeoutMs: input.timeoutMs,
         maxOutputBytes,
+        budget,
       });
       filesTransferred += dirResult.filesTransferred;
       bytesTransferred += dirResult.bytesTransferred;
+      bytesStaged += dirResult.bytesStaged;
+      stagingWaitMs += dirResult.stagingWaitMs;
     }
 
     operations.push({ operationId: operation.operationId, filesTransferred, bytesTransferred });
+    input.onOperation?.({
+      direction: "out",
+      operationId: operation.operationId,
+      filesTransferred,
+      bytesTransferred,
+      bytesStaged,
+      stagingWaitMs,
+      durationMs: Date.now() - startedAt,
+    });
   }
   return { operations };
 }
