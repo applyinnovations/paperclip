@@ -1715,8 +1715,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // CONNECTION_CLOSED or SQLSTATE 53300). Log the bounded code only.
     const causeCode = outerErr instanceof Error ? (outerErr.cause as { code?: unknown } | undefined)?.code : undefined;
     const setupFailureCauseCode = typeof causeCode === "string" && /^[A-Z0-9_]{1,64}$/.test(causeCode) ? causeCode : null;
+    // The issue and the workspace validation reason let a log alert group
+    // repeated setup failures per issue and per cause.
+    const setupFailureIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId) ?? null;
+    const setupFailureReasonCode = readNonEmptyString(
+      parseObject(parseObject(workspaceValidationSetupFailure?.resultJson).workspaceValidation).reasonCode) ?? null;
     logger.error(
       { err: identityRedactor.redact({ message: outerErr instanceof Error ? outerErr.message : String(outerErr), stack: outerErr instanceof Error ? outerErr.stack : undefined }), runId,
+        ...(setupFailureIssueId ? { issueId: setupFailureIssueId } : {}),
+        ...(setupFailureReasonCode ? { reasonCode: setupFailureReasonCode } : {}),
         errorCode: setupFailureErrorCode, failureCause: thrownFailureCause, ...(setupFailureCauseCode ? { causeCode: setupFailureCauseCode } : {}),
         ...(workspaceProviderFailure ? { workspaceProviderFailure } : {}) },
       "heartbeat execution setup failed",
