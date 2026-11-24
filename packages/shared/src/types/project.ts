@@ -5,6 +5,16 @@ import type {
   WorkspaceRuntimeService,
 } from "./workspace-runtime.js";
 import type { AgentEnvConfig } from "./secrets.js";
+import type { IssueExecutionStage } from "./issue.js";
+
+/**
+ * Execution stages every issue created in the project starts with, unless the
+ * issue is created with stages of its own. Stage and participant ids are
+ * fresh on each issue.
+ */
+export interface ProjectDefaultExecutionPolicy {
+  stages: IssueExecutionStage[];
+}
 
 export interface ProjectGitAuthorization {
   grantId: string | null;

@@ -82,6 +82,19 @@ export interface CompanyPortabilityEmbeddedAssetManifestEntry {
   ownedBy?: string[];
 }
 
+/**
+ * `executionWorkspacePolicy.defaultIssueExecutionPolicy` of a project in a
+ * package. Participants are agents named by slug and resolved in the importing
+ * company, so one package can declare "review by the code-reviewer" for every
+ * company built from it.
+ */
+export interface CompanyPortabilityProjectDefaultExecutionPolicy {
+  stages: Array<{
+    type: "review" | "approval";
+    participants: Array<{ agentSlug: string }>;
+  }>;
+}
+
 export interface CompanyPortabilityProjectManifestEntry {
   slug: string;
   name: string;

@@ -223,6 +223,61 @@ POST /api/companies/{companyId}/issues
 
 Stage IDs and participant IDs are auto-generated if omitted. Duplicate participants within a stage are automatically deduplicated. Stages with no valid participants are removed. If no valid stages remain, the policy is set to `null`.
 
+### Project default stages
+
+A project can declare stages that every issue created in it starts with, so
+review holds by construction instead of each author remembering to add it.
+They live in the project's `executionWorkspacePolicy`, next to its other
+project-level policy:
+
+```bash
+PATCH /api/projects/{projectId}
+{
+  "executionWorkspacePolicy": {
+    "enabled": true,
+    "defaultIssueExecutionPolicy": {
+      "stages": [
+        { "type": "review", "participants": [{ "type": "agent", "agentId": "reviewer-agent-id" }] }
+      ]
+    }
+  }
+}
+```
+
+- The server adds these stages to an issue at creation, on every creation path
+  (API, sub-issues, routines, plugins), when the issue declares no stages of
+  its own. An issue created with its own `stages` keeps them; its other policy
+  fields (monitor, review limit, authorization) are kept either way.
+- They apply whether or not isolated workspaces are enabled.
+- Each issue gets fresh stage and participant ids.
+- Agent participants must belong to the project's company.
+- `executionWorkspacePolicy` is replaced as a whole on update, so send the
+  current policy with the change; omit `defaultIssueExecutionPolicy` (or set it
+  to `null`) to remove the default. Existing issues are not changed.
+- To create an issue without them (a release or verification step, say), send
+  `"executionPolicy": null` explicitly on create; omitting the field applies
+  the default. Removing them later by updating the issue's `executionPolicy`
+  works too.
+
+In a company package, declare it in the project's `executionWorkspacePolicy`
+in `.paperclip.yaml`, naming agents by slug; the import resolves each slug in
+the target company:
+
+```yaml
+projects:
+  my-project:
+    executionWorkspacePolicy:
+      enabled: true
+      defaultIssueExecutionPolicy:
+        stages:
+          - type: review
+            participants:
+              - agentSlug: code-reviewer
+```
+
+Export writes the same form. User participants are not portable and are
+omitted with a warning.
+
 ### Updating execution policy on an existing issue
 
 ```bash

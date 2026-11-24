@@ -364,6 +364,7 @@ export type {
 } from "./document-annotation.js";
 export type {
   Project,
+  ProjectDefaultExecutionPolicy,
   ProjectRepository,
   ProjectRepositoryOptions,
   ProjectGitAuthorization,
@@ -1038,6 +1039,7 @@ export type {
   CompanyPortabilityAgentManifestEntry,
   CompanyPortabilitySkillManifestEntry,
   CompanyPortabilityProjectManifestEntry,
+  CompanyPortabilityProjectDefaultExecutionPolicy,
   CompanyPortabilityProjectWorkspaceManifestEntry,
   CompanyPortabilityIssueRoutineTriggerManifestEntry,
   CompanyPortabilityIssueRoutineManifestEntry,
