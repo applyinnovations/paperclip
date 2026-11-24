@@ -45,7 +45,8 @@ export function newRunUlidDns(now: () => number = Date.now): string {
 
 export interface LabelsInput {
   runId: string;
-  agentId: string;
+  /** The agent the lease is for; absent for a lease with no agent (an environment test). */
+  agentId?: string | null;
   companyId: string;
   adapterType: string;
 }
@@ -53,7 +54,7 @@ export interface LabelsInput {
 export function paperclipLabels(input: LabelsInput): Record<string, string> {
   return {
     "paperclip.io/run-id": input.runId,
-    "paperclip.io/agent-id": input.agentId,
+    ...(input.agentId ? { "paperclip.io/agent-id": input.agentId } : {}),
     "paperclip.io/company-id": input.companyId,
     "paperclip.io/adapter": input.adapterType,
     "paperclip.io/managed-by": "paperclip-k8s-plugin",

@@ -57,4 +57,9 @@ describe("paperclipLabels", () => {
     expect(labels["paperclip.io/adapter"]).toBe("claude_local");
     expect(labels["paperclip.io/managed-by"]).toBe("paperclip-k8s-plugin");
   });
+  it("leaves out the agent label when there is no agent", () => {
+    const labels = paperclipLabels({ runId: "r1", agentId: undefined, companyId: "c1", adapterType: "claude_local" });
+    expect(labels).not.toHaveProperty("paperclip.io/agent-id");
+    expect(labels["paperclip.io/run-id"]).toBe("r1");
+  });
 });
