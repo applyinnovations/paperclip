@@ -16,7 +16,7 @@ vi.mock("../services/checkpoint-ref-cleanup.js", async importOriginal => ({
 
 const { checkpointRefNames, cleanupIssueCheckpointRefs, deleteCheckpointRefs, isIssueCheckpointRef } =
   await import("../services/checkpoint-ref-cleanup.js");
-const { issueService } = await import("../services/issues.js");
+const { executeIssuePostCommitActions, issueService } = await import("../services/issues.js");
 
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull,
   GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "t@example.com" };
@@ -223,9 +223,13 @@ describe("deleteCheckpointRefs against a local bare repository", () => {
   it("is scheduled after an issue goes done or cancelled, not on other transitions", async () => {
     const svc = issueService(db);
     const { companyId, issueId } = await seed("todo");
+    // The post-commit runner reaches the (mocked) scheduler through its dynamic import.
+    await executeIssuePostCommitActions(db, [{ type: "delete_checkpoint_refs", companyId, issueId }]);
+    expect(scheduled).toEqual([{ companyId, issueId }]);
+    scheduled.length = 0;
     await svc.update(issueId, { status: "backlog" });
     expect(scheduled).toEqual([]);
-    await svc.update(issueId, { status: "done" });
+    expect(await svc.update(issueId, { status: "done" })).toMatchObject({ status: "done" });
     expect(scheduled).toEqual([{ companyId, issueId }]);
     await svc.update(issueId, { status: "cancelled" });
     expect(scheduled).toEqual([{ companyId, issueId }, { companyId, issueId }]);
