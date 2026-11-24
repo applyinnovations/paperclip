@@ -173,9 +173,23 @@ function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
 
 const FAILED_COMMAND_OUTPUT_TAIL_CHARS = 4_000;
 
+function outputText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  // A runner handed back an object (e.g. a provider error) instead of text.
+  // Serialise it so the cause is visible rather than "[object Object]".
+  if (value instanceof Error) return value.message;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function formatFailedCommandOutput(result: RunProcessResult): string {
-  const tail = (text: string): string => {
-    const trimmed = text.trim();
+  const tail = (value: unknown): string => {
+    const trimmed = outputText(value).trim();
     if (trimmed.length <= FAILED_COMMAND_OUTPUT_TAIL_CHARS) return trimmed;
     return `...[truncated]\n${trimmed.slice(-FAILED_COMMAND_OUTPUT_TAIL_CHARS)}`;
   };
@@ -190,7 +204,10 @@ function formatFailedCommandOutput(result: RunProcessResult): string {
 function requireSuccessfulResult(result: RunProcessResult, action: string): void {
   if (result.exitCode === 0 && !result.timedOut) return;
   const detail = formatFailedCommandOutput(result);
-  throw Object.assign(new Error(`${action} failed with exit code ${result.exitCode ?? "null"}${detail}`), {
+  const outcome = result.timedOut
+    ? "timed out"
+    : result.exitCode === null ? "failed without an exit code" : `failed with exit code ${result.exitCode}`;
+  throw Object.assign(new Error(`${action} ${outcome}${detail}`), {
     exitCode: result.exitCode, timedOut: result.timedOut,
   });
 }

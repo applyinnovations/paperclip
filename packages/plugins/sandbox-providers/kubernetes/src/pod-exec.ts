@@ -22,6 +22,7 @@ import { Exec } from "@kubernetes/client-node";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
+import { toExecError } from "./exec-failure.js";
 
 // Minimal WebSocket-like shape covering what we touch. The full type comes from
 // @kubernetes/client-node's transitive ws/isomorphic-ws dep but importing it
@@ -174,6 +175,9 @@ type ExecStatus = {
  * OOM-killed), or the runtime refused the exec. The command wrote nothing, so
  * without this line the caller sees a bare "exit code 1" with empty output.
  */
+/** Start of the stderr line {@link exitFromExecStatus} adds when the exec itself failed. */
+export const EXEC_WITHOUT_EXIT_CODE_DIAGNOSTIC = "Kubernetes exec failed without a command exit code";
+
 export function exitFromExecStatus(status: ExecStatus): { exitCode: number; diagnostic: string | null } {
   if (status.status === "Success") return { exitCode: 0, diagnostic: null };
   const exitCodeCause = (status.details?.causes ?? []).find((c) => c.reason === "ExitCode");
@@ -182,7 +186,7 @@ export function exitFromExecStatus(status: ExecStatus): { exitCode: number; diag
   const detail = [status.reason, status.message].filter((part) => typeof part === "string" && part.length > 0).join(": ");
   return {
     exitCode: 1,
-    diagnostic: `Kubernetes exec failed without a command exit code (${detail || "no status message"}); the sandbox container may have been evicted or killed.\n`,
+    diagnostic: `${EXEC_WITHOUT_EXIT_CODE_DIAGNOSTIC} (${detail || "no status message"}); the sandbox container may have been evicted or killed.\n`,
   };
 }
 
@@ -319,7 +323,7 @@ export async function execInPod(
           // Belt-and-suspenders: even under an explicit cap (or with none set),
           // never let a `+=` RangeError at V8's max string length escape this
           // listener as an uncaught exception.
-          failClosed(err instanceof Error ? err : new Error(String(err)));
+          failClosed(toExecError(err));
         }
       });
 
@@ -340,7 +344,7 @@ export async function execInPod(
         try {
           stderrData += chunk.toString("utf-8");
         } catch (err) {
-          failClosed(err instanceof Error ? err : new Error(String(err)));
+          failClosed(toExecError(err));
         }
       });
 
@@ -383,7 +387,9 @@ export async function execInPod(
           if (resolved) return;
           resolved = true;
           if (watchdog) clearTimeout(watchdog);
-          reject(err);
+          // The client rejects with a WebSocket ErrorEvent or V1Status, not an
+          // Error; keep its text rather than letting callers print "[object Object]".
+          reject(toExecError(err));
         });
     },
   );
@@ -542,7 +548,7 @@ export async function execInPodStreaming(
       try {
         stderrData += chunk.toString("utf-8");
       } catch (err) {
-        failClosed(err instanceof Error ? err : new Error(String(err)));
+        failClosed(toExecError(err));
       }
     });
     stderrStream.on("end", () => { stderrEnded = true; tryFinish(); });
@@ -578,7 +584,7 @@ export async function execInPodStreaming(
           // closed.
           stdinStream.removeAllListeners("end");
           pumpExecStdin(ws, io.stdin, () => resolved).catch((err: unknown) => {
-            failClosed(err instanceof Error ? err : new Error(String(err)));
+            failClosed(toExecError(err));
           });
         } else if (stdinStream) {
           stdinStream.removeAllListeners("end");
@@ -589,7 +595,7 @@ export async function execInPodStreaming(
         if (resolved) return;
         resolved = true;
         if (watchdog) clearTimeout(watchdog);
-        reject(err);
+        reject(toExecError(err));
       });
   });
 }

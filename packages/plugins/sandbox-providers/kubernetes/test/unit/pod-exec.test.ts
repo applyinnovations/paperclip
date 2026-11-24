@@ -23,6 +23,10 @@ let scriptedExec: (
 // Frames the streaming exec sends on the fake WebSocket (channel byte first).
 let sentFrames: Buffer[] = [];
 
+// When set, the next `Exec.exec` rejects with this value, as the real client
+// does with a WebSocket ErrorEvent when the exec cannot be opened.
+let nextExecRejection: unknown;
+
 vi.mock("@kubernetes/client-node", () => {
   class Exec {
     constructor(_kc: unknown) {}
@@ -37,6 +41,11 @@ vi.mock("@kubernetes/client-node", () => {
       _tty: boolean,
       statusCb: StatusCb,
     ) {
+      if (nextExecRejection !== undefined) {
+        const rejection = nextExecRejection;
+        nextExecRejection = undefined;
+        throw rejection;
+      }
       // Defer so the caller has wired its stream listeners first.
       setImmediate(() => scriptedExec(stdout, stderr, statusCb, stdin));
       return {
@@ -274,5 +283,20 @@ describe("execInPodStreaming", () => {
         timeoutMs: 5_000,
       }),
     ).rejects.toThrow(/disk guard/i);
+  });
+});
+
+describe("execInPod setup failure", () => {
+  it("rejects with the ErrorEvent text, not [object Object]", async () => {
+    nextExecRejection = { type: "error", message: "Unexpected server response: 404" };
+    await expect(execInPod(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], undefined, 5_000))
+      .rejects.toThrow("Unexpected server response: 404");
+  });
+
+  it("rejects the streaming exec with the ErrorEvent text too", async () => {
+    nextExecRejection = { type: "error", message: "", error: new Error("socket hang up") };
+    const sink = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+    await expect(execInPodStreaming(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], { stdout: sink, timeoutMs: 5_000 }))
+      .rejects.toThrow("socket hang up");
   });
 });
