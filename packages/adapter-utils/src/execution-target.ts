@@ -1,4 +1,5 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import type { WorkspaceRestoreMetrics } from "./workspace-restore-merge.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -1510,6 +1511,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  onWorkspaceRestore?: (metrics: WorkspaceRestoreMetrics) => Promise<void>;
   workspaceSeedCacheDirectory?: string;
   workspaceSeedCacheCompanyDirectory?: string;
   workspaceSeedCacheScope?: "workspace" | "company";
@@ -1607,6 +1609,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,
     onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+    onWorkspaceRestore: input.onWorkspaceRestore,
     workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
     workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
     workspaceSeedCacheScope: input.workspaceSeedCacheScope,

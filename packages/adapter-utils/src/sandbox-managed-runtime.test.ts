@@ -527,6 +527,60 @@ describe("sandbox managed runtime", () => {
     }
   });
 
+  it.each(["archive", "checkpoint"] as const)("does not copy build output the sandbox ignores back into the host workspace (%s)", async (transfer) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ignored-restore-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local"), remote = path.join(root, "remote");
+    await mkdir(local);
+    await git(local, ["init", "-b", "main"]);
+    await git(local, ["config", "user.name", "Test"]);
+    await git(local, ["config", "user.email", "test@example.com"]);
+    await writeFile(path.join(local, "README.md"), "base\n");
+    // `provider-assets/` is not one of the fixed heavy directory names; the host
+    // has none yet, so only the sandbox's own listing can know it is ignored.
+    await writeFile(path.join(local, ".gitignore"), "/provider-assets/\n*.log\n");
+    await git(local, ["add", "."]);
+    await git(local, ["commit", "-m", "base"]);
+    await writeFile(path.join(local, "scratch.tmp"), "host notes\n");
+    const client = makeFilesystemClient();
+    if (transfer === "checkpoint") {
+      client.syncOut = async (operations) => {
+        for (const operation of operations) for (const file of operation.files) {
+          await fsPromises.cp(file.sourcePath, file.targetPath, { recursive: true, verbatimSymlinks: true });
+        }
+        return { operations: [] } as never;
+      };
+    }
+    const restores: restoreMerge.WorkspaceRestoreMetrics[] = [];
+    const prepared = await prepareSandboxManagedRuntime({
+      ...sandboxRuntimeInput(sandboxSpec("ignored-output", remote), "test", client, local),
+      workspaceCheckpoint: transfer === "checkpoint",
+      workspaceRestoreRetryDelaysMs: [],
+      onWorkspaceRestore: async (metrics) => { restores.push(metrics); },
+    });
+    await mkdir(path.join(remote, "provider-assets/linux-x64/prebuilds"), { recursive: true });
+    await writeFile(path.join(remote, "provider-assets/linux-x64/prebuilds/runtime.node"), randomBytes(64 * 1024));
+    await writeFile(path.join(remote, "build.log"), "build output\n");
+    await writeFile(path.join(remote, "notes.md"), "new untracked work\n");
+    await writeFile(path.join(remote, "README.md"), "changed\n");
+    // The sandbox now also ignores a file the host had as untracked work: the
+    // host keeps it rather than treating it as deleted.
+    await writeFile(path.join(remote, ".gitignore"), "/provider-assets/\n*.log\n*.tmp\n");
+
+    await prepared.restoreWorkspace();
+
+    await expect(stat(path.join(local, "provider-assets"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(path.join(local, "build.log"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(local, "notes.md"), "utf8")).toBe("new untracked work\n");
+    expect(await readFile(path.join(local, "README.md"), "utf8")).toBe("changed\n");
+    expect(await readFile(path.join(local, ".gitignore"), "utf8")).toContain("*.tmp");
+    expect(await readFile(path.join(local, "scratch.tmp"), "utf8")).toBe("host notes\n");
+    expect(restores).toHaveLength(1);
+    expect(restores[0]).toMatchObject({ ignoredScan: "sandbox", sandboxIgnoredPaths: 3, removedEntries: 0 });
+    expect(restores[0]!.copiedBytes).toBeLessThan(1024);
+    expect(restores[0]!.copiedFiles).toBeGreaterThanOrEqual(3);
+  }, 30_000);
+
   it("adopts a warm remote workspace without inbound overwrite and still merges outbound changes", async () => {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-sandbox-adopt-"),
