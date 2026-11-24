@@ -469,6 +469,17 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     );
   }
 
+  // Mirrors the startup adoption decision in reconcileHotRestartAdoption: a
+  // run it would report lost for `missing_process_metadata`.
+  function hasNoAdoptableProcessIdentity(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    adapterType: string;
+  }) {
+    if (input.run.runtimeMode === "native" && input.adapterType === "paperclip_runner") return false;
+    if (!isTrackedLocalChildProcessAdapter(input.adapterType)) return false;
+    return !input.run.processPid && !input.run.processGroupId;
+  }
+
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -535,12 +546,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
     if (serverStdioRuns.length > 0) {
       const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
+      // Runs startup could not adopt drain with the ACP runs; the rest stay
+      // eligible for adoption.
+      const nonAdoptableRunIds = activeRuns
+        .filter((row) => !isServerStdioBoundHotRestartRun(row) && hasNoAdoptableProcessIdentity(row))
+        .map(({ run }) => run.id);
+      const drainRunIds = [...activeServerStdioRunIds, ...nonAdoptableRunIds];
       await writeHotRestartShutdownSnapshot({
         intent: intentWithVersion,
         signal,
         activeRuns: snapshotRuns,
         drainReason: "active_acp_run",
-        drainRunIds: activeServerStdioRunIds,
+        drainRunIds,
         capturedAt: now,
       });
 
@@ -550,6 +567,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           previousServerPid: intent.previousServerPid,
           activeRunIds: snapshotRuns.map((run) => run.runId),
           activeServerStdioRunIds,
+          nonAdoptableRunIds,
           drainReason: "active_acp_run",
         },
         "server-stdio agent run prevents hot-restart adoption; using graceful drain and retry",
@@ -560,8 +578,46 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         skipDrain: false as const,
         activeRunIds: snapshotRuns.map((run) => run.runId),
         activeAcpRunIds: activeServerStdioRunIds,
-        drainRunIds: activeServerStdioRunIds,
+        drainRunIds,
         drainReason: "active_acp_run" as const,
+      };
+    }
+
+    // A legacy run of a local-child adapter with no persisted process identity
+    // (every run on a remote sandbox target, whose process lives in another
+    // pod or host) cannot be adopted: startup would report it lost
+    // (`missing_process_metadata`) and the orphan reaper would fail it as
+    // `process_lost` without a retry. Drain those to the normal
+    // interrupted-and-retried path instead; the others stay adoptable.
+    const nonAdoptableRuns = activeRuns.filter(hasNoAdoptableProcessIdentity);
+    if (nonAdoptableRuns.length > 0) {
+      const nonAdoptableRunIds = nonAdoptableRuns.map(({ run }) => run.id);
+      await writeHotRestartShutdownSnapshot({
+        intent: intentWithVersion,
+        signal,
+        activeRuns: snapshotRuns,
+        drainReason: "non_adoptable_run",
+        drainRunIds: nonAdoptableRunIds,
+        capturedAt: now,
+      });
+
+      logger.warn(
+        {
+          signal,
+          previousServerPid: intent.previousServerPid,
+          activeRunIds: snapshotRuns.map((run) => run.runId),
+          nonAdoptableRunIds,
+          drainReason: "non_adoptable_run",
+        },
+        "agent runs without a local process identity cannot be adopted; draining them to retry",
+      );
+
+      return {
+        mode: "non_adoptable_drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: snapshotRuns.map((run) => run.runId),
+        drainRunIds: nonAdoptableRunIds,
+        drainReason: "non_adoptable_run" as const,
       };
     }
 
@@ -757,7 +813,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }
 
       const hasSelectiveAcpDrain =
-        intent.drainReason === "active_acp_run" &&
+        (intent.drainReason === "active_acp_run" || intent.drainReason === "non_adoptable_run") &&
         (intent.drainRunIds?.length ?? 0) > 0;
       if (
         hasSelectiveAcpDrain &&
