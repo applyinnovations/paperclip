@@ -1,4 +1,5 @@
 import { notifyActiveRunSilence } from "../live-run-recovery-notifications.js";
+import { recordHeartbeatRunOutput } from "../heartbeat-run-start-stop-timing.js";
 import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterInvocationMeta, AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -164,6 +165,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       source?: CanonicalNativeLog,
     ) => {
       const sourceCursor = source?.sourceCursor;
+      recordHeartbeatRunOutput(runId, stream, chunk);
       const sanitizedChunk = source?.kind === "canonical_native"
         ? redactCanonicalNativeRunLogChunk(chunk, {
             redactIdentity: identityRedactor.redact,

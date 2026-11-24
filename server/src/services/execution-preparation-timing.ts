@@ -374,3 +374,12 @@ const workspaceSyncPhases: Readonly<Record<string, ExecutionPhase>> = {
 export function measureWorkspaceSyncPhase<T>(name: string, work: () => Promise<T>): Promise<T> {
   return Object.prototype.hasOwnProperty.call(workspaceSyncPhases, name) ? measureRunPhase(workspaceSyncPhases[name]!, work) : work();
 }
+
+/**
+ * The run whose execution scope the caller is in, or null outside one. Used to
+ * attribute host-side work (such as runtime transfers) to a run for its
+ * start/stop timing line.
+ */
+export function currentExecutionScopeRunId(): string | null {
+  return ownership.getStore()?.runId ?? null;
+}

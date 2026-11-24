@@ -1,4 +1,5 @@
 import { NATIVE_REMOTE_RECOVERY_LEASE_MISMATCH, remoteRecoveryLeaseMismatch } from "../native-runtime/remote-recovery-lease-mismatch.js";
+import { recordHeartbeatRunLease } from "../heartbeat-run-start-stop-timing.js";
 import { readInheritedRunnerRetainedSandbox } from "../native-runtime/native-inherited-runner-retry.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { assertEphemeralWorkspaceExecution, readRemoteWorkspaceAuthority, RemoteWorkspaceWriterActiveError, reserveRemoteWorkspace, shouldUseRemoteWorkspaces } from "../remote-workspaces.js";
@@ -1293,6 +1294,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     };
   }
   const environmentAcquireStartedAtMs = Date.now();
+  let leaseAcquired = false;
   let acquiredEnvironment: Awaited<
     ReturnType<typeof envOrchestrator.acquireForRun>
   >;
@@ -1354,6 +1356,11 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         remoteCwd: sandboxRecovery.remoteCwd,
       } } : {}),
     }));
+    leaseAcquired = true;
+    recordHeartbeatRunLease(run.id, {
+      startedAtMs: environmentAcquireStartedAtMs, endedAtMs: Date.now(), failed: false,
+      environmentDriver: acquiredEnvironment.environment.driver,
+    });
     await controllerLease.assertOwned();
     nativeRunnerPreparationSpans.push({
       name: "environment.acquire",
@@ -1363,6 +1370,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       attributes: { adapter: agent.adapterType },
     });
   } catch (error) {
+    if (!leaseAcquired) {
+      recordHeartbeatRunLease(run.id, { startedAtMs: environmentAcquireStartedAtMs, endedAtMs: Date.now(), failed: true });
+    }
     nativeRunnerPreparationSpans.push({
       name: "environment.acquire",
       parentName: "task.provider_session",

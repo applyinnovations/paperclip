@@ -2929,6 +2929,19 @@ and project row timestamps do not reset a session. This includes the first
 project-owned directory binding. Changes to effective execution configuration
 still require a fresh session.
 
+Run start/stop timing is in `server/src/services/heartbeat-run-start-stop-timing.ts`.
+While a run executes, workspace preparation marks the environment lease, run
+output marks the first non-`[paperclip]` stdout line, session preparation records
+workspace and session reuse, and an adapter-utils transfer observer attributes each
+`Syncing`/`Restoring`/`Exporting git history` transfer to the run whose execution
+scope it runs in. Every terminal status write that emits `agent.task_run` also calls
+`logHeartbeatRunStartStopTiming`, which writes one pino line,
+`msg: "heartbeat run start/stop timing"`, per settled run on that process. Field
+meanings are in the module and its tests. The line is a server log only: it is not
+Telemetry, an OpenTelemetry span, or a run-log event, and it never delays settlement.
+Find it in Loki with
+`{namespace="paperclip",container="paperclip"} |= "heartbeat run start/stop timing"`.
+
 Run-log formatting is in `server/src/services/heartbeat/run-log.ts`. It bounds
 stored event payloads, redacts and shortens log chunks, and caps stdout/stderr
 excerpts. `run-output.ts` owns per-attempt log handles, current-user redaction,

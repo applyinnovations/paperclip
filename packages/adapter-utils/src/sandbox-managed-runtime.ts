@@ -49,6 +49,7 @@ import {
 } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
+  hasRuntimeTransferObserver,
   type RuntimeProgressDirection,
   type RuntimeProgressPhase,
   type RuntimeProgressSink,
@@ -1238,7 +1239,7 @@ function makeTransferProgress(
   options: SandboxTransferProgressOptions | undefined;
   finish: (doneBytes?: number, totalBytes?: number | null) => Promise<void>;
 } {
-  if (!sink && !runtimeStatus?.sink) {
+  if (!sink && !runtimeStatus?.sink && !hasRuntimeTransferObserver()) {
     return { options: undefined, finish: async () => {} };
   }
   const reporter = createRuntimeProgressReporter({
