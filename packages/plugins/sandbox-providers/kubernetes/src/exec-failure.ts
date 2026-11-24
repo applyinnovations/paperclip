@@ -9,6 +9,14 @@
  * pod (gone, terminating, OOMKilled) so the run error says why.
  */
 
+import {
+  Observable,
+  type ConfigurationOptions,
+  type ObservableMiddleware,
+  type RequestContext,
+  type ResponseContext,
+} from "@kubernetes/client-node";
+
 import type { KubeClients } from "./kube-client.js";
 import { isKubeNotFoundError } from "./lease-lifecycle.js";
 
@@ -136,18 +144,63 @@ export function describePodState(pod: PodLike, podName: string, containerName: s
   return facts.length > 0 ? facts.join("; ") : null;
 }
 
-/** Ask the API server what happened to the pod behind a failed exec. */
+/**
+ * How long the pod lookup after a failed exec may take. The lookup only adds
+ * detail to an error the caller already has, and the exec watchdog may have
+ * spent the whole execute budget, so it must not hold the run up.
+ */
+export const POD_DIAGNOSTIC_TIMEOUT_MS = 3_000;
+
+/** Request options that attach an abort signal to a generated-client call. */
+function abortableRequestOptions(signal: AbortSignal): ConfigurationOptions<ObservableMiddleware> {
+  return {
+    middleware: [{
+      pre: (request: RequestContext) => {
+        request.setSignal(signal);
+        return new Observable(Promise.resolve(request));
+      },
+      post: (response: ResponseContext) => new Observable(Promise.resolve(response)),
+    }],
+    middlewareMergeStrategy: "append",
+  };
+}
+
+/**
+ * Ask the API server what happened to the pod behind a failed exec. Gives up
+ * after `timeoutMs`, aborting the request, and returns `null` so the caller
+ * reports the exec error alone.
+ */
 export async function diagnosePodAfterExecFailure(
   clients: Pick<KubeClients, "core">,
   namespace: string,
   podName: string,
   containerName: string,
+  timeoutMs: number = POD_DIAGNOSTIC_TIMEOUT_MS,
 ): Promise<string | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error(`pod diagnostic timed out after ${timeoutMs}ms`));
+      resolve(null);
+    }, timeoutMs);
+  });
+  const lookup = (async (): Promise<string | null> => {
+    try {
+      const pod = (await clients.core.readNamespacedPod(
+        { namespace, name: podName },
+        abortableRequestOptions(controller.signal),
+      )) as PodLike;
+      return describePodState(pod, podName, containerName);
+    } catch (err) {
+      if (controller.signal.aborted) return null;
+      if (isKubeNotFoundError(err)) return `pod ${podName} no longer exists (deleted or evicted)`;
+      return null;
+    }
+  })();
   try {
-    const pod = (await clients.core.readNamespacedPod({ namespace, name: podName })) as PodLike;
-    return describePodState(pod, podName, containerName);
-  } catch (err) {
-    if (isKubeNotFoundError(err)) return `pod ${podName} no longer exists (deleted or evicted)`;
-    return null;
+    return await Promise.race([lookup, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 }

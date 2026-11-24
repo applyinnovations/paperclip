@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpMethod, RequestContext } from "@kubernetes/client-node";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // When an exec cannot start or ends without an exit code (the pod was deleted,
 // evicted or OOM-killed), the run error must name the cause, not print the
@@ -31,6 +32,7 @@ vi.mock("../../src/pod-exec.js", async (importOriginal) => {
 });
 
 import plugin from "../../src/plugin.js";
+import { POD_DIAGNOSTIC_TIMEOUT_MS } from "../../src/exec-failure.js";
 import { exitFromExecStatus } from "../../src/pod-exec.js";
 
 function execute() {
@@ -98,5 +100,66 @@ describe("onEnvironmentExecute failure detail", () => {
     const result = await execute();
     expect(result.stderr).toBe("fatal: bad object\n");
     expect(readPod).not.toHaveBeenCalled();
+  });
+});
+
+// A pod GET that never answers until its request is aborted, the way a stalled
+// API server or network looks to the client.
+type StalledGet = { calls: number; signals: AbortSignal[] };
+function stallPodGet(): StalledGet {
+  const state: StalledGet = { calls: 0, signals: [] };
+  h.readPod = async (_param: unknown, options?: unknown) => {
+    state.calls += 1;
+    const middleware = (options as { middleware?: Array<{ pre(ctx: RequestContext): { toPromise(): Promise<RequestContext> } }> } | undefined)?.middleware ?? [];
+    const ctx = new RequestContext("https://kube.invalid/api/v1/namespaces/paperclip-acme/pods/pc-fail-pod", HttpMethod.GET);
+    for (const m of middleware) await m.pre(ctx).toPromise();
+    const signal = ctx.getSignal();
+    if (signal) state.signals.push(signal);
+    return await new Promise((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  };
+  return state;
+}
+
+describe("onEnvironmentExecute with a stalled pod diagnostic", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function settleWithin<T>(promise: Promise<T>): Promise<T> {
+    let settled = false;
+    void promise.then(() => { settled = true; }, () => { settled = true; });
+    await vi.advanceTimersByTimeAsync(POD_DIAGNOSTIC_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    return promise;
+  }
+
+  it("returns the exec setup error once the diagnostic budget runs out", async () => {
+    h.execImpl = async () => { throw { type: "error", message: "Unexpected server response: 500" }; };
+    const get = stallPodGet();
+    const result = await settleWithin(execute());
+    expect(get.calls).toBe(1);
+    expect(get.signals.map((signal) => signal.aborted)).toEqual([true]);
+    expect(result.exitCode).toBeNull();
+    expect(result.timedOut).toBe(true);
+    expect(result.stderr).toBe("Kubernetes exec in pod pc-fail-pod failed: Unexpected server response: 500");
+  });
+
+  it("returns the missing-exit-code diagnostic once the diagnostic budget runs out", async () => {
+    const { diagnostic } = exitFromExecStatus({ status: "Failure", reason: "InternalError", message: "container killed" });
+    h.execImpl = async () => ({ exitCode: 1, stdout: "", stderr: diagnostic });
+    const get = stallPodGet();
+    const result = await settleWithin(execute());
+    expect(get.calls).toBe(1);
+    expect(get.signals.map((signal) => signal.aborted)).toEqual([true]);
+    expect(result.exitCode).toBe(1);
+    expect(result.timedOut).toBe(false);
+    expect(result.stderr).toBe(diagnostic);
   });
 });

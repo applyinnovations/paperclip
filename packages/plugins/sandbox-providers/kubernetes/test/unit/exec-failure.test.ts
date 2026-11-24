@@ -1,3 +1,4 @@
+import { RequestContext, HttpMethod } from "@kubernetes/client-node";
 import { describe, expect, it, vi } from "vitest";
 import {
   describeExecError,
@@ -94,5 +95,36 @@ describe("diagnosePodAfterExecFailure", () => {
   it("returns null when the API server cannot be asked", async () => {
     const core = { readNamespacedPod: vi.fn(async () => { throw Object.assign(new Error("forbidden"), { code: 403 }); }) };
     await expect(diagnosePodAfterExecFailure({ core } as never, "ns", "pc-1", "agent")).resolves.toBeNull();
+  });
+
+  it("gives up on a stalled pod GET, aborts it and returns null", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      const core = {
+        readNamespacedPod: vi.fn(async (_param: unknown, options?: { middleware?: Array<{ pre(ctx: RequestContext): { toPromise(): Promise<RequestContext> } }> }) => {
+          // Run the request middleware the way the generated client does, then
+          // stall like a GET whose connection never answers until aborted.
+          const ctx = new RequestContext("https://kube.invalid/api/v1/namespaces/ns/pods/pc-1", HttpMethod.GET);
+          for (const middleware of options?.middleware ?? []) await middleware.pre(ctx).toPromise();
+          signal = ctx.getSignal();
+          return await new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+        }),
+      };
+      let settled: string | null | undefined;
+      const pending = diagnosePodAfterExecFailure({ core } as never, "ns", "pc-1", "agent", 1_000).then((value) => {
+        settled = value;
+        return value;
+      });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toBeNull();
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
