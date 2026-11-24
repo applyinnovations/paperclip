@@ -841,6 +841,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let effectiveExecutionCwd = targetWorkspaceRealization?.mode === "in_place"
       ? targetWorkspaceRealization.authoritativeRoot
       : adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+    // The agent's instructions bundle (AGENTS.md and the files it references,
+    // e.g. ETHOS.md or skills) lives on the host. A remote run gets the whole
+    // directory as its own asset, so relative references resolve inside the
+    // sandbox the way they do for local runs and for claude_local's prompt
+    // bundle; prepending AGENTS.md alone left its siblings unreachable.
+    const instructionsBundleDir = await (async () => {
+      const file = asString(config.instructionsFilePath, "").trim();
+      if (!file || !executionTargetIsRemote) return null;
+      const dir = path.dirname(file);
+      const stat = await fs.stat(dir).catch(() => null);
+      return stat?.isDirectory() ? dir : null;
+    })();
     const preparedExecutionTargetRuntime = executionTargetIsRemote
       ? await (async () => {
           await onLog(
@@ -909,6 +921,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // ONLY the allowlisted files (auth/config/skills), so there is
                 // nothing to filter out.
               },
+              ...(instructionsBundleDir
+                ? [{ key: "instructions", localDir: instructionsBundleDir, followSymlinks: true }]
+                : []),
             ],
           });
         })()
@@ -1143,14 +1158,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+    const remoteInstructionsDir = instructionsBundleDir
+      ? preparedExecutionTargetRuntime?.assetDirs.instructions ?? null
+      : null;
+    // Where the run sees the bundle: the synced copy for a remote run, the
+    // host directory otherwise.
+    const instructionsLocation = remoteInstructionsDir && instructionsFilePath
+      ? path.posix.join(remoteInstructionsDir, path.basename(instructionsFilePath))
+      : instructionsFilePath;
+    const instructionsDir = remoteInstructionsDir
+      ? `${remoteInstructionsDir}/`
+      : instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
     let instructionsPrefix = "";
     if (instructionsFilePath) {
       try {
         const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+          `The above agent instructions were loaded from ${instructionsLocation}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);

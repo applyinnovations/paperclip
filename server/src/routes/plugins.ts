@@ -80,6 +80,7 @@ import {
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
+  assertPluginLocalFolderRootAllowed,
   findLocalFolderDeclaration,
   getStoredLocalFolders,
   inspectPluginLocalFolder,
@@ -2989,6 +2990,7 @@ export function pluginRoutes(
 
     const existing = await registry.getCompanySettings(plugin.id, companyId);
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
+    assertPluginLocalFolderRootAllowed(body.path);
     const status = await inspectPluginLocalFolder({
       folderKey,
       declaration,

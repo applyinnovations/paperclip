@@ -22,6 +22,7 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
  */
 
 import { fork, type ChildProcess } from "node:child_process";
+import { planPluginWorkerSandbox, type PluginWorkerSandboxPlan } from "./plugin-worker-sandbox.js";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
@@ -3082,7 +3083,7 @@ export function createPluginWorkerHandle(
   // Process lifecycle
   // -----------------------------------------------------------------------
 
-  function spawnProcess(): ChildProcess {
+  function spawnProcess(sandbox: PluginWorkerSandboxPlan): ChildProcess {
     // Security: Do NOT spread process.env into the worker. Plugins should only
     // receive a minimal, controlled environment to prevent leaking host
     // secrets (like DATABASE_URL, internal API keys, etc.).
@@ -3095,9 +3096,17 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
+    // Filesystem sandbox (Node permission model): the worker reads only its own
+    // module closure and writes only its private tmp dir, so it cannot read
+    // operator secret files such as GitHub App private keys. See
+    // plugin-worker-sandbox.ts and PLUGIN_SPEC.md §12.6.
+    // Every plan carries the complete execArgv, including --disable-sigusr1.
+    const execArgv = sandbox.execArgv;
+    if (sandbox.mode === "enforced") Object.assign(workerEnv, sandbox.env);
+
     const child = fork(options.entrypointPath, [], {
       stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
+      execArgv,
       env: workerEnv,
       // Don't let the child keep the parent alive
       detached: false,
@@ -3375,12 +3384,27 @@ export function createPluginWorkerHandle(
       throw new Error(`Worker for plugin "${pluginId}" is already ${status}`);
     }
 
+    // Plan the sandbox before changing status: a worker whose allowlist would
+    // cover an operator secret file must not start at all.
+    const sandbox = planPluginWorkerSandbox({
+      pluginId,
+      entrypointPath: options.entrypointPath,
+      manifest: options.manifest,
+      execArgv: options.execArgv,
+    });
+    if (sandbox.mode === "disabled") {
+      log.warn(
+        { reason: sandbox.reason, capability: sandbox.capability },
+        "plugin worker running without the filesystem sandbox",
+      );
+    }
+
     intentionalStop = false;
     retirementPending = false;
     setStatus("starting");
     stderrExcerpt = "";
 
-    const child = spawnProcess();
+    const child = spawnProcess(sandbox);
     childProcess = child;
     attachStdioHandlers(child);
     startedAt = Date.now();
