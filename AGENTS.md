@@ -262,7 +262,7 @@ If memory is limited, use `node scripts/typecheck-low-memory.mjs` instead of `pn
 
 ### Typecheck in agent sandboxes
 
-An agent sandbox has a memory limit, 8 GiB on xlab, and its cgroup kills as a
+An agent sandbox has a memory limit (often 8 GiB), and its cgroup kills as a
 group: when a command goes over the limit, the kernel kills the agent with it
 and the run is lost. Paperclip then retries the run, which runs the same
 command into the same kill.
