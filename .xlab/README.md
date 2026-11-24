@@ -44,7 +44,10 @@ still "Not yet offered" when the change merges is a follow-up to offer it.
    branch.
 2. Open a PR into `xlab`. `.tekton/pull-request.yaml` runs `.xlab/ci.sh`
    (frozen install, typecheck, build, and the test files the PR adds or
-   changes). The full suite takes about 2 hours on one pod, so
+   changes, plus the tests that import its changes while those add at most
+   `CI_RELATED_TEST_CAP` files, default 150; above that it prints how many it
+   skipped, and the scheduled full run covers them). The full suite takes
+   about 2 hours on one pod, so
    `.tekton/full-tests.yaml` runs it weekly (Sundays, UTC) on `xlab`; check
    its latest run before shipping. Run the
    PR checks locally with
