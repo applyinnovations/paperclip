@@ -6,6 +6,14 @@ import postgres from "postgres";
 import { installDatabaseWorkSignals } from "./work-signals.js";
 import { installDatabaseResponseCapture } from "./response-capture.js";
 import { installPreparedQueries } from "./prepared-queries.js";
+import {
+  DEFAULT_DEDICATED_MAX_CONNECTIONS,
+  DEFAULT_DEDICATED_WAIT_TIMEOUT_SECONDS,
+  DedicatedConnectionLimiter,
+  MIN_DEDICATED_CONNECTIONS,
+  currentDedicatedConnectionDepth,
+  runAtDedicatedConnectionDepth,
+} from "./dedicated-connection-limiter.js";
 import * as schema from "./schema/index.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
@@ -157,6 +165,18 @@ export interface DatabaseClientOptions {
    * `postgres.js`).
    */
   applicationName?: string;
+  /**
+   * Most single-connection clients `withDedicatedDbConnection` holds open at
+   * once for this owner (default `DEFAULT_DEDICATED_MAX_CONNECTIONS`, at least
+   * `MIN_DEDICATED_CONNECTIONS`). Further callers queue.
+   */
+  dedicatedMaxConnections?: number;
+  /**
+   * How long a queued `withDedicatedDbConnection` caller waits for a slot
+   * before failing with `dedicated_connection_wait_timeout` (default
+   * `DEFAULT_DEDICATED_WAIT_TIMEOUT_SECONDS`; `0` waits indefinitely).
+   */
+  dedicatedWaitTimeoutSeconds?: number;
 }
 
 /**
@@ -225,6 +245,15 @@ export function databaseClientOptionsFromEnv(env: NodeJS.ProcessEnv = process.en
   if (maxLifetimeSeconds !== undefined) options.maxLifetimeSeconds = maxLifetimeSeconds;
   const applicationName = envNonEmptyString(env, "DATABASE_APPLICATION_NAME");
   if (applicationName !== undefined) options.applicationName = applicationName;
+  const dedicatedMaxConnections = envPositiveInteger(env, "DATABASE_DEDICATED_POOL_MAX");
+  if (dedicatedMaxConnections !== undefined) {
+    if (dedicatedMaxConnections < MIN_DEDICATED_CONNECTIONS) {
+      throw new Error(`DATABASE_DEDICATED_POOL_MAX must be at least ${MIN_DEDICATED_CONNECTIONS}, got: ${env.DATABASE_DEDICATED_POOL_MAX}`);
+    }
+    options.dedicatedMaxConnections = dedicatedMaxConnections;
+  }
+  const dedicatedWaitTimeoutSeconds = envNonNegativeInteger(env, "DATABASE_DEDICATED_WAIT_TIMEOUT_SECONDS");
+  if (dedicatedWaitTimeoutSeconds !== undefined) options.dedicatedWaitTimeoutSeconds = dedicatedWaitTimeoutSeconds;
   return options;
 }
 
@@ -260,7 +289,18 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 // work needs for progress writes. Keep connection configuration private to the
 // originating Db lifetime; callers receive neither URLs nor credentials.
 const dedicatedDbFactories = new WeakMap<object, () => Db>();
+const dedicatedLimiters = new WeakMap<object, DedicatedConnectionLimiter>();
 const ownedDatabaseListenerFactories = new WeakMap<object, () => Db>();
+const resolvedOptionsByOwner = new WeakMap<object, DatabaseClientOptions>();
+
+// Every client `createDbClient` makes for an owner (dedicated connections and
+// the private pools below) resolves back to that root owner, so a helper that
+// receives a child client still uses the owner's single bounded pool instead
+// of opening a new pool per child.
+const rootOwners = new WeakMap<object, object>();
+function rootOwner(db: object): object {
+  return rootOwners.get(db) ?? db;
+}
 
 export interface OwnedDatabaseListener {
   listen: Db["$client"]["listen"];
@@ -268,7 +308,7 @@ export interface OwnedDatabaseListener {
 }
 
 export function createOwnedDatabaseListener(db: Db): OwnedDatabaseListener {
-  const factory = ownedDatabaseListenerFactories.get(db);
+  const factory = ownedDatabaseListenerFactories.get(rootOwner(db));
   if (!factory) throw new Error("owned_listener_requires_create_db");
   const owned = factory();
   return {
@@ -277,12 +317,36 @@ export function createOwnedDatabaseListener(db: Db): OwnedDatabaseListener {
   };
 }
 
+/**
+ * Runs `action` on a private single-connection client, so session- and
+ * transaction-scoped advisory locks never borrow the shared pool. At most the
+ * owner's `dedicatedMaxConnections` are open at once; later callers queue (see
+ * `DedicatedConnectionLimiter` for how nested holders avoid deadlock). The
+ * slot is released only after the connection has ended.
+ */
 export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
-  const factory = dedicatedDbFactories.get(db);
-  if (!factory) throw new Error("dedicated_connection_requires_create_db");
-  const dedicated = factory();
-  try { return await action(dedicated); }
-  finally { await dedicated.$client.end({ timeout: 1 }); }
+  const owner = rootOwner(db);
+  const factory = dedicatedDbFactories.get(owner);
+  const limiter = dedicatedLimiters.get(owner);
+  if (!factory || !limiter) throw new Error("dedicated_connection_requires_create_db");
+  const depth = currentDedicatedConnectionDepth() + 1;
+  const release = await limiter.acquire(depth);
+  let dedicated: Db | undefined;
+  try {
+    dedicated = factory();
+    const opened = dedicated;
+    return await runAtDedicatedConnectionDepth(depth, () => action(opened));
+  } finally {
+    try { await dedicated?.$client.end({ timeout: 1 }); }
+    finally { release(); }
+  }
+}
+
+/** Current holders, queue length and high-water mark of an owner's dedicated
+ * connections; `null` for clients `createDb` did not create. */
+export function dedicatedConnectionStats(db: Db): { max: number; inUse: number; waiting: number; peak: number } | null {
+  const limiter = dedicatedLimiters.get(rootOwner(db));
+  return limiter ? { max: limiter.maxConnections, inUse: limiter.inUse, waiting: limiter.waiting, peak: limiter.peak } : null;
 }
 
 // postgres.js pipelines a query onto a busy connection when none is idle, so
@@ -296,19 +360,20 @@ const LIVENESS_POOL_MAX_CONNECTIONS = 2;
 /** The private liveness pool for a `createDb` client; other clients (test
  * doubles, transactions) are returned unchanged. */
 export function livenessDb(db: Db): Db {
-  const existing = livenessDbs.get(db);
+  const owner = rootOwner(db);
+  const existing = livenessDbs.get(owner);
   if (existing) return existing;
-  const factory = livenessDbFactories.get(db);
+  const factory = livenessDbFactories.get(owner);
   if (!factory) return db;
   const created = factory();
-  livenessDbs.set(db, created);
+  livenessDbs.set(owner, created);
   return created;
 }
 
 /** Ends the liveness pool if one was created. The ended pool stays cached, so
  * a late renewal fails like a query on the ended primary pool. */
 export async function closeLivenessDb(db: Db, timeoutSeconds: number): Promise<void> {
-  await livenessDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
+  await livenessDbs.get(rootOwner(db))?.$client.end({ timeout: timeoutSeconds });
 }
 
 // Control checkpoints must not occupy the request or lease-renewal pools
@@ -321,20 +386,22 @@ const closedCheckpointOwners = new WeakSet<object>();
 /** The bounded controller checkpoint pool; transactions and test doubles keep
  * their existing database when they have no owning client factory. */
 export function checkpointDb(db: Db): Db {
-  const existing = checkpointDbs.get(db);
+  const owner = rootOwner(db);
+  const existing = checkpointDbs.get(owner);
   if (existing) return existing;
-  const factory = checkpointDbFactories.get(db);
+  const factory = checkpointDbFactories.get(owner);
   if (!factory) return db;
-  if (closedCheckpointOwners.has(db)) throw new Error("checkpoint_pool_closed");
+  if (closedCheckpointOwners.has(owner)) throw new Error("checkpoint_pool_closed");
   const created = factory();
-  checkpointDbs.set(db, created);
+  checkpointDbs.set(owner, created);
   return created;
 }
 
 /** Fence lazy creation immediately, and keep any ended pool cached. */
 export async function closeCheckpointDb(db: Db, timeoutSeconds: number): Promise<void> {
-  closedCheckpointOwners.add(db);
-  await checkpointDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
+  const owner = rootOwner(db);
+  closedCheckpointOwners.add(owner);
+  await checkpointDbs.get(owner)?.$client.end({ timeout: timeoutSeconds });
 }
 
 // Managed file publication holds an agent lock while transferring bytes. A
@@ -342,20 +409,63 @@ export async function closeCheckpointDb(db: Db, timeoutSeconds: number): Promise
 const fileStorageDbFactories = new WeakMap<object, () => Db>();
 const fileStorageDbs = new WeakMap<object, Db>();
 const closedFileStorageOwners = new WeakSet<object>();
+const FILE_STORAGE_POOL_MAX_CONNECTIONS = 2;
 export function fileStorageDb(db: Db): Db {
-  const existing = fileStorageDbs.get(db);
+  const owner = rootOwner(db);
+  const existing = fileStorageDbs.get(owner);
   if (existing) return existing;
-  const factory = fileStorageDbFactories.get(db);
+  const factory = fileStorageDbFactories.get(owner);
   if (!factory) return db; // Preserve the caller's transaction/savepoint.
-  if (closedFileStorageOwners.has(db)) throw new Error("file_storage_pool_closed");
+  if (closedFileStorageOwners.has(owner)) throw new Error("file_storage_pool_closed");
   const created = factory();
-  fileStorageDbs.set(db, created);
-  fileStorageDbs.set(created, created);
+  fileStorageDbs.set(owner, created);
   return created;
 }
 export async function closeFileStorageDb(db: Db, timeoutSeconds: number): Promise<void> {
-  closedFileStorageOwners.add(db);
-  await fileStorageDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
+  const owner = rootOwner(db);
+  closedFileStorageOwners.add(owner);
+  await fileStorageDbs.get(owner)?.$client.end({ timeout: timeoutSeconds });
+}
+
+/** postgres.js pool size when `maxConnections` is unset. */
+export const DRIVER_DEFAULT_POOL_MAX = 10;
+const OWNED_LISTENER_CONNECTIONS = 1;
+
+export interface DatabaseConnectionBudget {
+  /** Most connections the owner's pools together can hold open at once. */
+  total: number;
+  /** The same bound per pool, named by `application_name` where it has one. */
+  pools: {
+    main: number;
+    controllerLease: number;
+    runnerCheckpoint: number;
+    fileStorage: number;
+    ownedListener: number;
+    dedicated: number;
+  };
+}
+
+/**
+ * The connection ceiling of one `createDb` owner, from its configuration:
+ * the main pool, the three private pools, one owned listener and the bounded
+ * dedicated connections. Each private pool is created at most once per owner,
+ * including when a helper receives one of the owner's child clients. An
+ * operator sizes a role's connection limit from the sum over a process's
+ * owners (plus any connections the process opens outside `createDb` owners).
+ * Returns `null` for clients `createDb` did not create (transactions, doubles).
+ */
+export function databaseConnectionBudget(db: Db): DatabaseConnectionBudget | null {
+  const resolved = resolvedOptionsByOwner.get(rootOwner(db));
+  if (!resolved) return null;
+  const pools = {
+    main: resolved.maxConnections ?? DRIVER_DEFAULT_POOL_MAX,
+    controllerLease: LIVENESS_POOL_MAX_CONNECTIONS,
+    runnerCheckpoint: CHECKPOINT_POOL_MAX_CONNECTIONS,
+    fileStorage: FILE_STORAGE_POOL_MAX_CONNECTIONS,
+    ownedListener: OWNED_LISTENER_CONNECTIONS,
+    dedicated: resolved.dedicatedMaxConnections ?? DEFAULT_DEDICATED_MAX_CONNECTIONS,
+  };
+  return { total: Object.values(pools).reduce((sum, value) => sum + value, 0), pools };
 }
 
 export function createDb(url: string, options?: DatabaseClientOptions) {
@@ -374,6 +484,15 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // that know the complete operation is idempotent.
   const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
   installDatabaseResponseCapture(db, schema);
+  if (owner) {
+    rootOwners.set(db, rootOwner(owner));
+    return db;
+  }
+  resolvedOptionsByOwner.set(db, resolved);
+  dedicatedLimiters.set(db, new DedicatedConnectionLimiter(
+    resolved.dedicatedMaxConnections ?? DEFAULT_DEDICATED_MAX_CONNECTIONS,
+    (resolved.dedicatedWaitTimeoutSeconds ?? DEFAULT_DEDICATED_WAIT_TIMEOUT_SECONDS) * 1000,
+  ));
   dedicatedDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
   }, db));
@@ -387,7 +506,7 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
     ...resolved, maxConnections: CHECKPOINT_POOL_MAX_CONNECTIONS, applicationName: "paperclip-runner-checkpoint",
   }, db));
   fileStorageDbFactories.set(db, () => createDbClient(url, {
-    ...resolved, maxConnections: 2, applicationName: "paperclip-file-storage",
+    ...resolved, maxConnections: FILE_STORAGE_POOL_MAX_CONNECTIONS, applicationName: "paperclip-file-storage",
   }, db));
   return db;
 }

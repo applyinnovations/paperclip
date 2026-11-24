@@ -665,6 +665,8 @@ DATABASE_IDLE_TIMEOUT_SECONDS=60     # close idle pooled connections; default: 6
 DATABASE_CONNECT_TIMEOUT_SECONDS=10  # default: 30
 DATABASE_MAX_LIFETIME_SECONDS=1800   # recycle a pooled connection after this long; default: 30-60 min (random)
 DATABASE_APPLICATION_NAME=paperclip  # application_name in pg_stat_activity; default: paperclip
+DATABASE_DEDICATED_POOL_MAX=16       # dedicated advisory-lock connections open at once; default: 16 (min 4)
+DATABASE_DEDICATED_WAIT_TIMEOUT_SECONDS=120  # queue wait before dedicated_connection_wait_timeout; default: 120 (0 = no limit)
 ```
 
 An explicit `DATABASE_PREPARED_STATEMENTS=true` enables named prepared statements

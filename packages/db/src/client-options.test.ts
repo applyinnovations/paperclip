@@ -37,6 +37,8 @@ describe("databaseClientOptionsFromEnv", () => {
         DATABASE_CONNECT_TIMEOUT_SECONDS: "10",
         DATABASE_MAX_LIFETIME_SECONDS: "1800",
         DATABASE_APPLICATION_NAME: " paperclip-web ",
+        DATABASE_DEDICATED_POOL_MAX: "12",
+        DATABASE_DEDICATED_WAIT_TIMEOUT_SECONDS: "0",
       }),
     ).toEqual({
       maxConnections: 25,
@@ -44,6 +46,8 @@ describe("databaseClientOptionsFromEnv", () => {
       connectTimeoutSeconds: 10,
       maxLifetimeSeconds: 1800,
       applicationName: "paperclip-web",
+      dedicatedMaxConnections: 12,
+      dedicatedWaitTimeoutSeconds: 0,
     });
   });
 
@@ -57,6 +61,10 @@ describe("databaseClientOptionsFromEnv", () => {
     );
     expect(() => databaseClientOptionsFromEnv({ DATABASE_POOL_MAX: "0" })).toThrow(/DATABASE_POOL_MAX/);
     expect(() => databaseClientOptionsFromEnv({ DATABASE_POOL_MAX: "-3" })).toThrow(/DATABASE_POOL_MAX/);
+    expect(() => databaseClientOptionsFromEnv({ DATABASE_DEDICATED_POOL_MAX: "3" })).toThrow(/DATABASE_DEDICATED_POOL_MAX must be at least 4/);
+    expect(() => databaseClientOptionsFromEnv({ DATABASE_DEDICATED_WAIT_TIMEOUT_SECONDS: "-1" })).toThrow(
+      /DATABASE_DEDICATED_WAIT_TIMEOUT_SECONDS/,
+    );
     expect(() => databaseClientOptionsFromEnv({ DATABASE_CONNECT_TIMEOUT_SECONDS: "1.5" })).toThrow(
       /DATABASE_CONNECT_TIMEOUT_SECONDS/,
     );

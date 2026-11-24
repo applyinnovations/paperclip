@@ -1,6 +1,9 @@
 export {
   createDb,
   withDedicatedDbConnection,
+  dedicatedConnectionStats,
+  databaseConnectionBudget,
+  type DatabaseConnectionBudget,
   createOwnedDatabaseListener,
   type OwnedDatabaseListener,
   livenessDb,
@@ -22,6 +25,7 @@ export {
   type MigrationBootstrapResult,
   type Db,
 } from "./client.js";
+export { DedicatedConnectionWaitTimeoutError } from "./dedicated-connection-limiter.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
