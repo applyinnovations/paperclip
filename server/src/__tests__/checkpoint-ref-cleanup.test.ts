@@ -14,9 +14,12 @@ vi.mock("../services/checkpoint-ref-cleanup.js", async importOriginal => ({
   scheduleIssueCheckpointRefCleanup: (_db: unknown, input: { companyId: string; issueId: string }) => { scheduled.push(input); },
 }));
 
+// Load issues.js before the mocked module. Importing the mock first runs its factory, and
+// importOriginal() then loads issues.js through the original module's dependency graph; that
+// copy's dynamic import of checkpoint-ref-cleanup.js resolves to the real module, not this mock.
+const { executeIssuePostCommitActions, issueService } = await import("../services/issues.js");
 const { checkpointRefNames, cleanupIssueCheckpointRefs, deleteCheckpointRefs, isIssueCheckpointRef } =
   await import("../services/checkpoint-ref-cleanup.js");
-const { executeIssuePostCommitActions, issueService } = await import("../services/issues.js");
 
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull,
   GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "t@example.com" };
