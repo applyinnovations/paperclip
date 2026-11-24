@@ -1187,6 +1187,37 @@ describe("agent live run routes", () => {
       }));
     });
 
+    it("treats a bare failedRunId as an exact retry", async () => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: { issueId: failedChatIssueId } });
+      const res = await requestApp(await createApp(fixture.db, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ failedRunId: failedChatRunId }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledExactlyOnceWith(routeAgentId, expect.objectContaining({
+        failedRunId: failedChatRunId, reason: "retry_failed_run", source: "on_demand", triggerDetail: "manual",
+      }));
+    });
+
+    it.each([
+      ["another reason", { reason: "manual_wake" }],
+      ["an empty reason", { reason: "" }],
+      ["a fresh session", { forceFreshSession: true }],
+      ["a debug trace", { debug: { providerTrace: "raw" } }],
+      ["a non-manual trigger", { triggerDetail: "system" }],
+      ["a non-on-demand source", { source: "timer" }],
+    ])("still refuses an exact retry that sets %s", async (_label, override) => {
+      const fixture = createFailedChatRetryDb(false);
+      // An instance admin passes the raw-trace permission check, so the debug
+      // case reaches the exact-retry context check rather than failing earlier.
+      const res = await requestApp(await createApp(fixture.db, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"], isInstanceAdmin: true,
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({ failedRunId: failedChatRunId, ...override }));
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ error: expect.stringContaining("cannot override its execution context") });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
     it.each([0, 3])("preserves an Agent Chat request and generation %s using only the selected run's context", async (generation) => {
       const fixture = createFailedChatRetryDb(false);
       mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: {

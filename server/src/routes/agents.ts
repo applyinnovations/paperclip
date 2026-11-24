@@ -6197,10 +6197,15 @@ export function agentRoutes(
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
     let retryNativeReviewContext: NativeReviewAssignmentContext | null = null;
+    // Selecting an exact failed run already names the intent, so a bare
+    // `{ failedRunId }` is an exact retry. Explicit conflicting fields still fail.
+    const wakeReason: string | null = req.body.failedRunId
+      ? req.body.reason ?? "retry_failed_run"
+      : req.body.reason ?? null;
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
-        req.body.reason !== "retry_failed_run" ||
+        wakeReason !== "retry_failed_run" ||
         (opts.source ?? "on_demand") !== "on_demand" ||
         (req.body.triggerDetail ?? "manual") !== "manual" ||
         req.body.forceFreshSession === true ||
@@ -6363,7 +6368,7 @@ export function agentRoutes(
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
       source: opts.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
-      reason: req.body.reason ?? null,
+      reason: wakeReason,
       payload: req.actor.type === "agent" && wakePayload
         ? { ...wakePayload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
         : wakePayload,
@@ -6380,7 +6385,7 @@ export function agentRoutes(
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
-        ...(req.body.reason === "rerun_with_provider_trace" &&
+        ...(wakeReason === "rerun_with_provider_trace" &&
         req.body.debug?.providerTrace === "raw"
           ? { resumeIntent: true }
           : {}),
