@@ -411,6 +411,27 @@ export function wasClaudeProcessKilled(proc: { exitCode: number | null; signal: 
   return proc.exitCode === 137 || proc.exitCode === 143;
 }
 
+/**
+ * True when the CLI was killed by SIGKILL (exit 137), usually the sandbox's
+ * out-of-memory killer taking down the whole pod cgroup. Its stdout ends
+ * mid-stream, so text inside it must not be classified as a provider error
+ * (APP-225).
+ */
+export function wasClaudeProcessSigkilled(proc: { exitCode: number | null; signal: string | null }): boolean {
+  return proc.signal === "SIGKILL" || proc.exitCode === 137;
+}
+
+export const CLAUDE_PROCESS_KILLED_ERROR_CODE = "process_killed";
+
+function describeClaudeProcessKilled(proc: { exitCode: number | null; signal: string | null }): string {
+  const how = proc.signal ? `signal ${proc.signal}` : `exit code ${proc.exitCode ?? -1}`;
+  return (
+    `Claude was killed by SIGKILL (${how}) before it finished, most likely by the sandbox's out-of-memory killer ` +
+    "while a command it ran used too much memory. Its output ended mid-stream. " +
+    "Do not rerun the last command unchanged: reduce its memory use first."
+  );
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
@@ -1049,9 +1070,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
+    // A SIGKILLed CLI never received a provider verdict; whatever its truncated
+    // output holds is not an upstream, quota or model error (APP-225).
+    const sigkilled = wasClaudeProcessSigkilled(proc);
+
     if (!parsed) {
-      const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const fallbackErrorMessage = sigkilled ? describeClaudeProcessKilled(proc) : parseFallbackErrorMessage(proc);
       const providerQuota =
+        !sigkilled &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
@@ -1061,6 +1087,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
+        !sigkilled &&
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1086,6 +1113,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? proc.errorCode
         : loginMeta.requiresLogin
         ? "claude_auth_required"
+        : sigkilled
+        ? CLAUDE_PROCESS_KILLED_ERROR_CODE
         : isClaudeModelNotFoundError({
           parsed: null,
           stdout: proc.stdout,
@@ -1192,11 +1221,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
+    const processKilled = failed && sigkilled;
+    const errorMessage = processKilled
+      ? describeClaudeProcessKilled(proc)
+      : failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
     const providerQuota =
       failed &&
+      !processKilled &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1208,6 +1241,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     const transientUpstream =
       failed &&
+      !processKilled &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1233,6 +1267,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? proc.errorCode
       : loginMeta.requiresLogin
       ? "claude_auth_required"
+      : processKilled
+      ? CLAUDE_PROCESS_KILLED_ERROR_CODE
       // Structured CLI signals outrank the model-not-found detector, which
       // scans the run's full stdout for a literal "model not found" phrase.
       // An agent's own tool output (grepping runtime source, tailing logs,
