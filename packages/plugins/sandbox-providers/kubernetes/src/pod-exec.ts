@@ -23,10 +23,80 @@ import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
 
-// Minimal WebSocket-like shape covering what we touch (close()). The full type
-// comes from @kubernetes/client-node's transitive ws/isomorphic-ws dep but
-// importing it directly couples this file to that internal choice.
-type WebSocketLike = { close(): void };
+// Minimal WebSocket-like shape covering what we touch. The full type comes from
+// @kubernetes/client-node's transitive ws/isomorphic-ws dep but importing it
+// directly couples this file to that internal choice. `send`, `pause` and
+// `resume` are the `ws` package's own API; the streaming exec uses them for
+// flow control (see `execInPodStreaming`).
+type WebSocketLike = {
+  close(): void;
+  send?(data: Buffer, cb?: (err?: Error) => void): void;
+  pause?(): void;
+  resume?(): void;
+};
+
+// The Kubernetes exec channel byte that prefixes every stdin frame.
+const EXEC_STDIN_CHANNEL = 0;
+
+// Most bytes of stdin a streaming exec hands the WebSocket before it waits for
+// the socket to take them. Small enough that a transfer's memory does not grow
+// with the payload; large enough to keep the connection busy.
+const STREAM_STDIN_HIGH_WATER_BYTES = 1024 * 1024;
+
+/**
+ * The exec stdout channel. The Kubernetes client writes each stdout frame here
+ * and ignores the return value of `write()`, so on its own a slow sink makes
+ * every received byte pile up in memory. This PassThrough reports when its
+ * buffer is full, and the streaming exec pauses the WebSocket until it drains.
+ */
+class ExecStdoutChannel extends PassThrough {
+  onBackpressure: (() => void) | null = null;
+
+  override write(chunk: unknown, encoding?: unknown, cb?: unknown): boolean {
+    const ok = super.write(chunk, encoding as BufferEncoding, cb as (error: Error | null | undefined) => void);
+    if (!ok) this.onBackpressure?.();
+    return ok;
+  }
+}
+
+/**
+ * Send `source` to the exec's stdin channel, waiting for the WebSocket to
+ * flush once more than {@link STREAM_STDIN_HIGH_WATER_BYTES} are queued. The
+ * Kubernetes client's own stdin handling sends every chunk the moment it is
+ * read, so a file read from local disk faster than the API server accepts it
+ * ends up queued, whole, in the WebSocket's send buffer.
+ */
+async function pumpExecStdin(
+  ws: WebSocketLike,
+  source: Readable,
+  stopped: () => boolean,
+): Promise<void> {
+  const send = ws.send;
+  if (typeof send !== "function") throw new Error("exec WebSocket cannot send stdin");
+  let queuedBytes = 0;
+  let sendError: Error | null = null;
+  let wake: (() => void) | null = null;
+  for await (const chunk of source) {
+    if (stopped()) break;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    if (bytes.length === 0) continue;
+    const frame = Buffer.allocUnsafe(bytes.length + 1);
+    frame[0] = EXEC_STDIN_CHANNEL;
+    bytes.copy(frame, 1);
+    queuedBytes += frame.length;
+    send.call(ws, frame, (err?: Error) => {
+      queuedBytes -= frame.length;
+      if (err && !sendError) sendError = err;
+      const resume = wake;
+      wake = null;
+      resume?.();
+    });
+    while (queuedBytes > STREAM_STDIN_HIGH_WATER_BYTES && !sendError && !stopped()) {
+      await new Promise<void>((resolve) => { wake = resolve; });
+    }
+    if (sendError) throw sendError;
+  }
+}
 
 // Single-quote a string for safe interpolation into a sh -c script. Wraps in
 // '...' and escapes any embedded single quotes via '\'' (close, escape, reopen).
@@ -325,7 +395,7 @@ export async function execInPod(
  *
  * Where `execInPod` buffers the command's whole stdout into an in-memory string
  * (fine for small command output, fatal for a multi-gigabyte tar), this variant
- * PIPES the exec's stdin from a caller `Readable` and its stdout into a caller
+ * streams the exec's stdin from a caller `Readable` and its stdout into a caller
  * `Writable` — so a native file-sync `syncIn`/`syncOut` streams raw tar bytes
  * straight to/from a host file on disk and neither the host nor the pod ever
  * holds the whole payload in memory. Both are intentionally kept side by side:
@@ -343,6 +413,15 @@ export async function execInPod(
  * self-terminate on the byte count instead of relying on EOF (the caller's
  * `syncIn` script bounds its read with `head -c <N>`). We close the WebSocket
  * ourselves from the status callback.
+ *
+ * Flow control: the Kubernetes client sends each stdin chunk the moment it is
+ * read and writes each stdout frame without checking `write()`, so by itself a
+ * transfer queues as fast as the faster side allows: a whole tarball in the
+ * WebSocket send buffer on the way in, or in the stdout stream when the sink is
+ * slower than the network on the way out. Here stdin goes through
+ * `pumpExecStdin`, which waits for the socket once about 1 MiB is queued, and a
+ * full stdout sink pauses the WebSocket until it drains. A transfer's memory
+ * therefore stays bounded whatever the archive size.
  *
  * Resolves once the command's exit status is known AND both the stdout sink has
  * finished draining and stderr has ended, so a caller that reads the sink file
@@ -362,8 +441,11 @@ export async function execInPodStreaming(
   },
 ): Promise<{ exitCode: number; stderr: string }> {
   const exec = new Exec(kc);
-  const stdoutStream = new PassThrough();
+  const stdoutStream = new ExecStdoutChannel();
   const stderrStream = new PassThrough();
+  // Handed to the Kubernetes client only so it asks the API server for a stdin
+  // channel. Nothing is ever written to it: `pumpExecStdin` sends the caller's
+  // bytes itself, with flow control.
   const stdinStream: PassThrough | null = io.stdin ? new PassThrough() : null;
 
   let stderrData = "";
@@ -407,8 +489,24 @@ export async function execInPodStreaming(
       if (watchdog) clearTimeout(watchdog);
       try { ws?.close(); } catch { /* ignore */ }
       try { stdinStream?.destroy(); } catch { /* ignore */ }
+      try { io.stdin?.destroy(); } catch { /* ignore */ }
       reject(err);
     };
+
+    // Stop reading from the API server while the stdout sink is full, and
+    // carry on once it drains, so a sink slower than the network (a busy disk)
+    // holds the bytes in the socket instead of in this process.
+    let stdoutPaused = false;
+    stdoutStream.onBackpressure = () => {
+      if (stdoutPaused || !ws?.pause) return;
+      stdoutPaused = true;
+      ws.pause();
+    };
+    stdoutStream.on("drain", () => {
+      if (!stdoutPaused) return;
+      stdoutPaused = false;
+      ws?.resume?.();
+    });
 
     // Pipe stdout to the caller sink (streamed to disk), or drain it if the
     // caller wants none. Piping with the default `end: true` ends the sink when
@@ -469,13 +567,19 @@ export async function execInPodStreaming(
     execPromise
       .then((webSocket) => {
         ws = webSocket as unknown as WebSocketLike;
+        if (resolved) {
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
         if (stdinStream && io.stdin) {
-          // Strip the default `end -> ws.close()` listener (see execInPod) so
-          // EOF on our stdin only signals the pod, then stream the caller's
-          // source into the exec stdin channel. A source error fails closed.
+          // Strip the default `end -> ws.close()` listener (see execInPod); the
+          // pod command ends on its byte count, not on stdin EOF. Then send the
+          // caller's source with flow control. A source or send error fails
+          // closed.
           stdinStream.removeAllListeners("end");
-          io.stdin.on("error", failClosed);
-          io.stdin.pipe(stdinStream);
+          pumpExecStdin(ws, io.stdin, () => resolved).catch((err: unknown) => {
+            failClosed(err instanceof Error ? err : new Error(String(err)));
+          });
         } else if (stdinStream) {
           stdinStream.removeAllListeners("end");
           stdinStream.end();
