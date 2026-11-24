@@ -26,6 +26,10 @@ const manifest: PaperclipPluginManifestV1 = {
       // Subscription sign-in (`claude setup-token`, `codex login --device-auth`)
       // runs on a terminal exec in the lease's Sandbox pod. sandbox-cr backend only.
       supportsLoginPty: true,
+      // Acquires label their workload with the host's creation intent and
+      // onEnvironmentInspectLease finds it by that id, so the host can delete a
+      // workload whose acquire failed (creation-recovery.ts).
+      creationOperationVersion: 1,
       configSchema: {
         type: "object",
         properties: {
