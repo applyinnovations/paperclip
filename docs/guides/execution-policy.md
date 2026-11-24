@@ -104,7 +104,24 @@ interface IssueExecutionDecision {
 5. **Approver approves** and transitions to `done` with a comment:
    - A decision record is created: `{ outcome: "approved" }`
    - `executionState.status` becomes `completed`
-   - Issue reaches actual `done` status
+   - Issue reaches actual `done` status, because the executor marked the work complete in step 3
+
+### Review Before Delivery Is Done
+
+An executor that still has delivery left after review (merge, release, rollout,
+verification) hands off with `in_review` instead of `done`. The runtime routes
+the issue through the same stages, but approving the **final** stage does not
+close it:
+
+- `executionState.status` becomes `completed` and the decision is recorded as usual
+- Status changes to `in_progress` and the issue is reassigned to the executor (`returnAssignee`), who is woken (`issue_assigned` with an `executionStage` of `wakeRole: "executor"`, `lastDecisionOutcome: "approved"`)
+- The executor finishes delivery and transitions to `done`; the completed review is not run again
+
+`executionState.completionRequested` records which hand-off started the current
+review cycle (`true` for `done`, `false` for `in_review`). It is recomputed on
+every resubmission after changes requested. A state written before the field
+existed counts as `false`, so the issue goes back to its executor rather than
+closing early.
 
 ### Changes Requested Flow
 
@@ -291,7 +308,7 @@ If the policy is removed (`null`) while a review is in progress, the execution s
 
 ### Advancing a stage (reviewer/approver approves)
 
-The active reviewer or approver transitions the issue to `done` with a comment:
+The active reviewer or approver transitions the issue to `done` with a comment. On the final stage this closes the issue only when the executor marked the work `done`; otherwise the issue returns to the executor in `in_progress` (see [Review Before Delivery Is Done](#review-before-delivery-is-done)):
 
 ```bash
 PATCH /api/issues/{issueId}

@@ -466,6 +466,7 @@ export interface PluginLocalFolderProblem {
     | "missing_file"
     | "path_traversal"
     | "symlink_escape"
+    | "protected_path"
     | "atomic_write_failed";
   message: string;
   path?: string;

@@ -395,6 +395,8 @@ function createReviewIssue(policy: NonNullable<Awaited<ReturnType<typeof normali
       completedStageIds: [],
       lastDecisionId: null,
       lastDecisionOutcome: null,
+      // The executor marked the work complete, so the final approval closes it.
+      completionRequested: true as boolean,
     },
   };
 }
@@ -3065,6 +3067,7 @@ describe("issue comment reopen routes", () => {
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
+        completionRequested: true,
       },
     };
     mockIssueService.getById.mockResolvedValue(issue);
@@ -4014,5 +4017,154 @@ describe("issue comment reopen routes", () => {
         }),
       ),
     );
+  });
+
+  describe("review approval with delivery outstanding (APP-306)", () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const executorAgentId = "22222222-2222-4222-8222-222222222222";
+
+    async function reviewHandoffIssue(completionRequested?: boolean) {
+      const policy = (await createAgentReviewPolicy(reviewerAgentId))!;
+      const issue = createReviewIssue(policy, reviewerAgentId);
+      return {
+        ...issue,
+        executionState: {
+          ...issue.executionState,
+          ...(completionRequested === undefined ? {} : { completionRequested }),
+        },
+      };
+    }
+
+    function reviewerActor(runId: string) {
+      return {
+        type: "agent" as const,
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      };
+    }
+
+    it("returns an approved issue to its executor, keeps it open and wakes the executor", async () => {
+      const issue = await reviewHandoffIssue(false);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        }),
+      );
+
+      const res = await request(
+        await installActor(createApp(), reviewerActor("run-app-306-approve")),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "done", comment: "Approved" });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+      expect(updatePatch).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: executorAgentId,
+        assigneeUserId: null,
+        executionState: expect.objectContaining({
+          status: "completed",
+          lastDecisionOutcome: "approved",
+          lastDecisionId: expect.any(String),
+        }),
+      });
+      expect(mockTxInsertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: "approved", body: "Approved" }),
+      );
+      await waitForWakeup(() =>
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          executorAgentId,
+          expect.objectContaining({
+            reason: "issue_assigned",
+            payload: expect.objectContaining({
+              issueId: "11111111-1111-4111-8111-111111111111",
+              executionStage: expect.objectContaining({
+                wakeRole: "executor",
+                stageType: "review",
+                lastDecisionOutcome: "approved",
+                allowedActions: ["continue_delivery", "mark_done"],
+              }),
+            }),
+          }),
+        ),
+      );
+    });
+
+    it("closes the issue when the executor had marked the work complete", async () => {
+      const issue = await reviewHandoffIssue(true);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        }),
+      );
+
+      const res = await request(
+        await installActor(createApp(), reviewerActor("run-app-306-final")),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "done", comment: "Approved" });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+      expect(updatePatch.status).toBe("done");
+      expect(updatePatch.assigneeAgentId).toBeUndefined();
+      expect(updatePatch.executionState).toMatchObject({ status: "completed", completionRequested: true });
+    });
+
+    it("an APPROVED review comment also hands the issue back instead of closing it", async () => {
+      const issue = await reviewHandoffIssue(false);
+      const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-app-306",
+        issueId: issue.id,
+        companyId: issue.companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: reviewerAgentId,
+        authorUserId: null,
+      });
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>, tx?: unknown) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+          _tx: tx,
+        }),
+      );
+
+      const res = await request(
+        await installActor(createApp(), reviewerActor("run-app-306-comment")),
+      )
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: reviewBody });
+
+      expect(res.status).toBe(201);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+      expect(updatePatch).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: executorAgentId,
+        executionState: expect.objectContaining({ status: "completed", lastDecisionOutcome: "approved" }),
+      });
+      await waitForWakeup(() =>
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          executorAgentId,
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              executionStage: expect.objectContaining({ wakeRole: "executor", lastDecisionOutcome: "approved" }),
+            }),
+          }),
+        ),
+      );
+    });
   });
 });

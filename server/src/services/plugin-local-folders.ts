@@ -10,6 +10,7 @@ import type {
   PluginLocalFolderStatus,
 } from "@paperclipai/plugin-sdk";
 import { badRequest, forbidden, notFound } from "../errors.js";
+import { findLocalFolderRootConflict } from "./plugin-protected-paths.js";
 
 export interface StoredPluginLocalFolderConfig {
   path: string;
@@ -131,6 +132,20 @@ export function setStoredLocalFolder(
   };
 }
 
+/**
+ * The host reads and writes local folders for the plugin, so a root over an
+ * operator secret (GitHub App keys, the secrets master key, the server config,
+ * orchestrator secret mounts) would hand the plugin that file through RPC even
+ * though its worker sandbox denies it. Throws 403 for such a root.
+ */
+export function assertPluginLocalFolderRootAllowed(rootPath: string) {
+  if (!path.isAbsolute(rootPath)) return;
+  const conflict = findLocalFolderRootConflict(rootPath);
+  if (conflict) {
+    throw forbidden(`Local folder path overlaps a protected host path (${conflict}) and cannot be used.`);
+  }
+}
+
 export async function inspectPluginLocalFolder(input: {
   folderKey: string;
   declaration?: PluginLocalFolderDeclaration | null;
@@ -185,6 +200,33 @@ export async function inspectPluginLocalFolder(input: {
 
   if (!path.isAbsolute(config.path)) {
     problems.push(problem("not_absolute", "Local folder path must be absolute.", config.path));
+  }
+
+  const protectedConflict = path.isAbsolute(config.path) ? findLocalFolderRootConflict(configuredPath) : null;
+  if (protectedConflict) {
+    // Never stat, probe or hand out the realPath of a protected root.
+    return {
+      folderKey: input.folderKey,
+      configured: true,
+      path: configuredPath,
+      realPath: null,
+      access,
+      readable: false,
+      writable: false,
+      requiredDirectories,
+      requiredFiles,
+      missingDirectories: requiredDirectories,
+      missingFiles: requiredFiles,
+      healthy: false,
+      problems: [
+        problem(
+          "protected_path",
+          "Local folder path overlaps a protected host path and cannot be used.",
+          configuredPath,
+        ),
+      ],
+      checkedAt,
+    };
   }
 
   try {
@@ -323,6 +365,7 @@ export async function preparePluginLocalFolder(input: {
   if (!config?.path || access !== "readWrite" || !path.isAbsolute(config.path)) return;
 
   const configuredPath = path.resolve(config.path);
+  assertPluginLocalFolderRootAllowed(configuredPath);
   try {
     const stat = await fs.stat(configuredPath);
     if (!stat.isDirectory()) return;

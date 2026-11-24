@@ -525,6 +525,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
+    ...(previous?.completionRequested !== undefined ? { completionRequested: previous.completionRequested } : {}),
   };
 }
 
@@ -576,7 +577,9 @@ function buildPendingState(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  completionRequested?: boolean;
 }): IssueExecutionState {
+  const completionRequested = input.completionRequested ?? input.previous?.completionRequested;
   return {
     status: PENDING_STATUS,
     currentStageId: input.stage.id,
@@ -590,6 +593,7 @@ function buildPendingState(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
+    ...(completionRequested !== undefined ? { completionRequested } : {}),
   };
 }
 
@@ -618,6 +622,7 @@ function buildPendingStagePatch(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  completionRequested?: boolean;
 }) {
   input.patch.status = "in_review";
   Object.assign(input.patch, patchForPrincipal(input.participant));
@@ -629,6 +634,7 @@ function buildPendingStagePatch(input: {
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest,
     changesRequestedCount: input.changesRequestedCount,
+    completionRequested: input.completionRequested,
   });
 }
 
@@ -812,17 +818,28 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         // approval into an endless re-review loop (#7893).
         const nextStage = nextPendingStageAfter(input.policy, activeStage, approvedState);
 
+        const decision = {
+          stageId: activeStage.id,
+          stageType: activeStage.type,
+          outcome: "approved" as const,
+          body: input.commentBody.trim(),
+        };
+
         if (!nextStage) {
           patch.executionState = approvedState;
-          return {
-            patch,
-            decision: {
-              stageId: activeStage.id,
-              stageType: activeStage.type,
-              outcome: "approved",
-              body: input.commentBody.trim(),
-            },
-          };
+          if (existingState?.completionRequested === true) {
+            // The executor explicitly marked the work complete and this was the
+            // last gate: the reviewer's `done` closes the issue.
+            return { patch, decision };
+          }
+          // The executor only asked for review; delivery (merge, release,
+          // verification, ...) is still theirs. Approval clears the gate and
+          // hands the issue back instead of closing it. The executor closes
+          // it later with `done`, which a completed state lets through.
+          const returnAssignee = existingState?.returnAssignee ?? null;
+          patch.status = returnAssignee ? "in_progress" : "todo";
+          Object.assign(patch, patchForPrincipal(returnAssignee));
+          return { patch, decision, workflowControlledAssignment: true };
         }
 
         const participant = selectStageParticipant(nextStage, {
@@ -844,12 +861,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         });
         return {
           patch,
-          decision: {
-            stageId: activeStage.id,
-            stageType: activeStage.type,
-            outcome: "approved",
-            body: input.commentBody.trim(),
-          },
+          decision,
           workflowControlledAssignment: true,
         };
       }
@@ -1053,6 +1065,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     participant,
     returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
+    // Recomputed on every executor hand-off (including resubmission after
+    // changes requested): only an explicit `done` counts as completion.
+    completionRequested: requestedStatus === "done",
   });
   return {
     patch,

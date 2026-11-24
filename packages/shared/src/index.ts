@@ -1628,6 +1628,7 @@ export type {
   PluginMigrationRecord,
   PluginStateRecord,
   PluginConfig,
+  PluginConfigManagedWithoutRow,
   PluginCompanySettings,
   PluginEntityRecord,
   PluginEntityQuery,
