@@ -1419,7 +1419,9 @@ It peaks at about 3.8 GiB, against about 5.5 GiB for `pnpm -r typecheck` on 16
 cores. It also takes about twice as long.
 
 It checks one package at a time and uses one thread for the server layers and the
-UI. Do not add `GOMEMLIMIT` to this path. It saves at most 300 MiB here, and it
+UI. `scripts/run-tsc.mjs` also uses one thread on its own when the process's
+cgroup memory limit is below 8 GiB, such as in an agent sandbox; set
+`PAPERCLIP_TYPECHECK_LOW_MEMORY=0` to keep the default checkers there. Do not add `GOMEMLIMIT` to this path. It saves at most 300 MiB here, and it
 slows `tsc` by up to 20 times when the live heap goes above the limit.
 `pnpm build` still checks the whole server program and needs more than 8 GiB. The
 Docker image sets `PAPERCLIP_TSC_EMIT_ONLY=1` for that build, which emits
