@@ -16,7 +16,7 @@ import {
 } from "./git-credentials.js";
 
 /**
- * Deletes the refs `paperclip-checkpoint` (xlab-containers) pushes for an issue once the issue
+ * Deletes the refs `paperclip-checkpoint` (the sandbox runtime image) pushes for an issue once the issue
  * is done or cancelled:
  *
  * - `refs/paperclip/wip/<ID>` — left behind when a run is killed after its last checkpoint and
