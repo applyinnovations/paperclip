@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { adapterRegistrySchema } from "./adapter-registry.js";
 import { KNOWN_ADAPTER_TYPES } from "./adapter-defaults.js";
+import { DEFAULT_POD_START_TIMEOUT_SEC } from "./manifest.js";
 
 const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
 
@@ -37,7 +38,7 @@ export const kubernetesProviderConfigSchema = z
      * (scheduling, image pull, container start). Kept apart from command
      * timeouts so a cold start never fails the first command.
      */
-    podStartTimeoutSec: z.number().int().positive().default(300),
+    podStartTimeoutSec: z.number().int().positive().default(DEFAULT_POD_START_TIMEOUT_SEC),
 
     /**
      * The adapter type that Jobs in this environment will run.

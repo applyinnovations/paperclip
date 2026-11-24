@@ -1,12 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { definePlugin, type PluginContext } from "@paperclipai/plugin-sdk";
+import { definePlugin, readEnvironmentCreationCleanupError, type PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentTerminationReceipt,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginEnvironmentInspectLeaseParams,
   PluginEnvironmentLease,
+  PluginEnvironmentLeaseObservation,
   PluginEnvironmentProbeParams,
   PluginEnvironmentProbeResult,
   PluginEnvironmentRealizeWorkspaceParams,
@@ -32,8 +34,9 @@ import { buildSandboxCrManifest, resolveSandboxShutdownMs } from "./sandbox-cr-b
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
-import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
+import { getJobStatus, jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
 import {
+  getSandboxCrStatus,
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
@@ -41,7 +44,21 @@ import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from ".
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
+import {
+  checkLeaseResumable,
+  confirmLeaseResourcesGone,
+  destroyLeaseResources,
+  isKubeNotFoundError,
+} from "./lease-lifecycle.js";
+import {
+  creationCleanup,
+  creationOwnershipLabels,
+  creationWorkloadName,
+  getCreationWorkload,
+  isCreationIdentity,
+  kubernetesAccountFingerprint,
+  workloadMatchesOwner,
+} from "./creation-operations.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -405,6 +422,9 @@ const plugin = definePlugin({
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
     const namespace = deriveTenantNamespace(config, params.companyId);
+    if (params.creationOperationId !== undefined && !isCreationIdentity(params.creationOperationId)) {
+      throw new Error("Invalid creation operation identity");
+    }
     // Validate the caller's deadline before anything is created in the cluster.
     const shutdown = resolveSandboxShutdownMs({
       nowMs: Date.now(),
@@ -457,17 +477,35 @@ const plugin = definePlugin({
       resourceQuota: DEFAULT_RESOURCE_QUOTA,
     });
 
-    const jobName = `pc-${newRunUlidDns()}`;
+    // A host with creation operations (creationOperationVersion: 1) names the
+    // attempt. The workload then gets a name derived from it and ownership
+    // labels, so if this caller gives up before the lease is recorded, the
+    // host's recovery can find the workload (onEnvironmentInspectLease) and
+    // destroy it instead of leaving it to hold tenant quota.
+    const creationOwner = params.creationOperationId !== undefined
+      ? {
+          creationOperationId: params.creationOperationId,
+          companyId: params.companyId,
+          environmentId: params.environmentId,
+          runId: params.runId,
+        }
+      : null;
+    const jobName = creationOwner
+      ? creationWorkloadName(creationOwner.creationOperationId)
+      : `pc-${newRunUlidDns()}`;
     const secretName = `${jobName}-env`;
 
     // TODO: use params.runId as stand-in for agentId in labels; future
     // versions will have a dedicated agentId on AcquireLeaseParams.
-    const labels = paperclipLabels({
-      runId: params.runId,
-      agentId: params.runId,
-      companyId: params.companyId,
-      adapterType: effectiveAdapterType,
-    });
+    const labels = {
+      ...paperclipLabels({
+        runId: params.runId,
+        agentId: params.runId,
+        companyId: params.companyId,
+        adapterType: effectiveAdapterType,
+      }),
+      ...(creationOwner ? creationOwnershipLabels(creationOwner) : {}),
+    };
 
     const image = resolveImage(
       { imageOverride: null },
@@ -801,6 +839,68 @@ const plugin = definePlugin({
     });
   },
 
+  async onEnvironmentInspectLease(
+    params: PluginEnvironmentInspectLeaseParams,
+  ): Promise<PluginEnvironmentLeaseObservation> {
+    const config = kubernetesProviderConfigSchema.parse(params.config);
+    const namespace =
+      typeof params.leaseMetadata?.namespace === "string"
+        ? params.leaseMetadata.namespace
+        : deriveTenantNamespace(config, params.companyId);
+    const backend =
+      typeof params.leaseMetadata?.backend === "string"
+        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
+        : config.backend;
+    const clients = makeKubeClients(createKubeConfig({
+      inCluster: config.inCluster,
+      kubeconfig: config.kubeconfig,
+    }));
+
+    // Creation recovery: the host asks about an acquire whose caller gave up
+    // before the lease was recorded. Report the workload with an ownership
+    // envelope so the host books its destruction. The workload name is
+    // deterministic, so absence is reported with the same envelope: the
+    // host's destroy is idempotent (404 is success) and also removes a
+    // leftover per-run Secret, and the operation resolves instead of waiting
+    // for operator reconciliation.
+    if (params.creationOperation !== undefined) {
+      const { id, runId } = params.creationOperation;
+      if (!isCreationIdentity(id) || !isCreationIdentity(runId)) {
+        throw new Error("Invalid creation operation identity");
+      }
+      const owner = {
+        creationOperationId: id,
+        companyId: params.companyId,
+        environmentId: params.environmentId,
+        runId,
+      };
+      const cleanup = creationCleanup(owner, kubernetesAccountFingerprint(config, namespace));
+      const workload = await getCreationWorkload(clients, namespace, backend, id);
+      if (workload && !workloadMatchesOwner(workload, owner)) {
+        throw new Error("Creation operation ownership does not match");
+      }
+      return {
+        providerLeaseId: cleanup.providerLeaseId,
+        state: workload ? "active" : "destroyed",
+        creationCleanup: cleanup,
+      };
+    }
+
+    // An ordinary lease: report whether its workload still exists. Only a 404
+    // is "destroyed"; any other error propagates so absence is never guessed.
+    try {
+      if (backend === "sandbox-cr") {
+        await getSandboxCrStatus(clients, namespace, params.providerLeaseId);
+      } else {
+        await getJobStatus(clients, namespace, params.providerLeaseId);
+      }
+      return { providerLeaseId: params.providerLeaseId, state: "active" };
+    } catch (err) {
+      if (isKubeNotFoundError(err)) return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+      throw err;
+    }
+  },
+
   async onEnvironmentDestroyLease(
     params: PluginEnvironmentDestroyLeaseParams,
   ): Promise<PluginEnvironmentTerminationReceipt | void> {
@@ -810,6 +910,20 @@ const plugin = definePlugin({
       typeof params.leaseMetadata?.namespace === "string"
         ? params.leaseMetadata.namespace
         : deriveTenantNamespace(config, params.companyId);
+    // A cleanup the host booked from creation recovery (see
+    // onEnvironmentInspectLease). Only honour it for the same operation,
+    // scope and cluster account that reported it.
+    if (params.leaseMetadata?.failedCreateCleanup !== undefined) {
+      const cleanup = readEnvironmentCreationCleanupError({ data: {
+        schema: "paperclip/environment-creation-cleanup/v1", cleanup: params.leaseMetadata.failedCreateCleanup,
+      } });
+      if (!cleanup || cleanup.companyId !== params.companyId || cleanup.environmentId !== params.environmentId ||
+          cleanup.providerLeaseId !== params.providerLeaseId || !isCreationIdentity(cleanup.attemptId) ||
+          cleanup.providerLeaseId !== creationWorkloadName(cleanup.attemptId) ||
+          cleanup.accountFingerprint !== kubernetesAccountFingerprint(config, namespace)) {
+        throw new Error("Failed-create Sandbox cleanup scope does not match");
+      }
+    }
     const leaseBackend =
       typeof params.leaseMetadata?.backend === "string"
         ? (params.leaseMetadata.backend as "sandbox-cr" | "job")

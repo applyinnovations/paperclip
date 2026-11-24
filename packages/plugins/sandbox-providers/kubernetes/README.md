@@ -77,6 +77,38 @@ Common optional fields:
 
 Full JSON Schema in `src/manifest.ts`.
 
+### Acquire budget
+
+An acquire waits up to `podStartTimeoutSec` (default 300 s) for its Sandbox pod
+to become Ready. The driver declares `defaultAcquireTimeoutMs` of 360 s (that
+wait plus 60 s for the tenant, workload, Secret and network policy calls), so the
+host waits as long as the provider does. Without it the host gave up after its
+30 s RPC default while the provider went on to create the Sandbox. An environment
+`timeoutMs` overrides the default; if you raise `podStartTimeoutSec`, raise
+`timeoutMs` to match.
+
+### Interrupted lease creation
+
+The host commits a creation operation before each fresh acquire and passes its
+UUID as `creationOperationId`. The workload is then named `pc-<uuid>` and
+labelled `paperclip.io/creation-operation-id`, `paperclip.io/company-id`,
+`paperclip.io/environment-id` and `paperclip.io/run-id`. If the caller gives up
+before the lease is recorded (RPC timeout, server restart), the host's recovery
+calls `onEnvironmentInspectLease` with that operation. The provider reads the
+workload by its name, checks those labels (a mismatch is an error, never a
+cleanup) and returns a cleanup envelope. The host then destroys the workload and
+its Secret, so an orphan no longer holds tenant quota until its `shutdownTime`.
+
+Absence is reported with the same envelope (`state: "destroyed"`). Kubernetes
+creates the workload synchronously in the acquire, the host asks only after its
+settle window, and destroy treats 404 as success, so the operation resolves
+rather than waiting for an operator. The envelope carries a fingerprint of the
+cluster account and namespace; destroy refuses an envelope from another one.
+The lookup is a plain GET, so recovery needs no RBAC beyond what leases use.
+
+Declared as `creationOperationVersion: 1`. Acquires from hosts that send no
+operation keep the random `pc-{ulid}` name.
+
 ### Task-scoped egress grants
 
 Keep provider-level egress defaults narrow, then grant only the destinations a task needs through its execution workspace settings:
@@ -141,6 +173,7 @@ For each agent run (sandbox-cr backend):
 
 ```
 Sandbox CR         pc-{ulid}                       (agents.x-k8s.io/v1beta1; release or absolute shutdown deadline)
+                                                   (pc-{creationOperationId} when the host sends one)
 Pod                pc-{ulid}                       (managed by Sandbox controller; torn down on CR delete)
 Secret             pc-{ulid}-env                   (owned by Sandbox CR; cascade-deleted)
 ```
