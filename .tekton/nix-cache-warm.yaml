@@ -1,0 +1,107 @@
+# On every push to xlab, put the PR checks' toolchain (the .xlab devshell and
+# paperclip-runner's prebuilt Cargo dependencies) in the shared Nix cache, so
+# test-affected substitutes it instead of compiling the Rust dependencies.
+# Runs no tests: the weekly test-full run exports nothing when its tests fail
+# (nix-v1 skips the export after a failed step). .xlab/warm-cache.sh builds
+# nothing when the cache already holds the toolchain.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: nix-cache-warm-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[xlab]"
+    pipelinesascode.tekton.dev/target-namespace: tekton-buildkit
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  params:
+    - name: revision
+      value: "{{ revision }}"
+  taskRunTemplate:
+    serviceAccountName: default
+    podTemplate:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      nodeSelector:
+        storage.xlab.now/fast-local: "true"
+  timeouts:
+    pipeline: 60m
+  taskRunSpecs:
+    - pipelineTaskName: build
+      podTemplate:
+        hostUsers: false
+    - pipelineTaskName: publish-cache
+      serviceAccountName: nix-cache-publisher
+  pipelineSpec:
+    params:
+      - name: revision
+        type: string
+    workspaces:
+      - name: source
+      - name: git-auth
+      - name: nix-cache-export
+    tasks:
+      - name: clone
+        timeout: 10m
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: git-clone-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        params:
+          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: revision, value: $(params.revision) }
+          - { name: expectedCommitSha, value: $(params.revision) }
+        workspaces:
+          - { name: output, workspace: source }
+          - { name: basic-auth, workspace: git-auth }
+      - name: build
+        timeout: 45m
+        runAfter: [clone]
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-v1 }
+            - { name: namespace, value: tekton-buildkit }
+        params:
+          - { name: SCRIPT, value: .xlab/warm-cache.sh }
+        workspaces:
+          - { name: source, workspace: source }
+          - { name: nix-cache-export, workspace: nix-cache-export }
+    finally:
+      - name: publish-cache
+        taskRef:
+          resolver: cluster
+          params:
+            - { name: kind, value: task }
+            - { name: name, value: nix-cache-publish-v1 }
+            - { name: namespace, value: tekton-pipelines }
+        workspaces:
+          - { name: nix-cache-export, workspace: nix-cache-export }
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: scratch-local
+          resources:
+            requests:
+              storage: 5Gi
+    - name: git-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
+    # The build's cache export (store paths the Nix cache lacks) for
+    # publish-cache. The build keeps its own Nix store.
+    - name: nix-cache-export
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: scratch-local
+          resources:
+            requests:
+              storage: 10Gi

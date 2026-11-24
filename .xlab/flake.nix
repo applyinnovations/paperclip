@@ -8,9 +8,10 @@
   outputs = { nixpkgs, ... }:
     let
       pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in
-    {
-      devShells.x86_64-linux.default = pkgs.mkShell {
+      runnerCargoDeps = pkgs.callPackage ./runner-cargo-deps.nix {
+        workspace = ../packages/paperclip-runner/runner;
+      };
+      devShell = pkgs.mkShell {
         packages = [
           pkgs.nodejs_24
           pkgs.corepack_24
@@ -57,6 +58,19 @@
         # expects the distribution's.
         XLAB_GLIBC = "${pkgs.glibc}";
         XLAB_LIBSTDCXX = "${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6";
+        # ci.sh seeds paperclip-runner's Cargo target directory with its
+        # prebuilt dependencies (runner-cargo-deps.nix), substituted from the
+        # Nix cache while Cargo.lock is unchanged.
+        XLAB_RUNNER_CARGO_DEPS = "${runnerCargoDeps}";
+      };
+    in
+    {
+      devShells.x86_64-linux.default = devShell;
+      packages.x86_64-linux = {
+        runner-cargo-deps = runnerCargoDeps;
+        # Everything `nix develop ./.xlab` needs, as one store path:
+        # .xlab/warm-cache.sh puts its closure in the shared Nix cache.
+        ci-toolchain = devShell.inputDerivation;
       };
     };
 }
