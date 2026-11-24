@@ -260,6 +260,23 @@ pnpm build
 
 If memory is limited, use `node scripts/typecheck-low-memory.mjs` instead of `pnpm -r typecheck`. See `doc/DEVELOPING.md`.
 
+### Typecheck in agent sandboxes
+
+An agent sandbox has a memory limit, often 4-6 GiB, and its cgroup kills as a
+group: when a command goes over the limit, the kernel kills the agent with it
+and the run is lost. Paperclip then retries the run, which runs the same
+command into the same kill.
+
+- Never run `tsc` on `server/tsconfig.json` (`npx tsc --noEmit` in `server/`,
+  `tsc -p server`). That is the whole server as one program, and it needs more
+  than 8 GiB.
+- To check the server, run `pnpm --filter @paperclipai/server typecheck`. It
+  checks the server in layers, and `scripts/run-tsc.mjs` uses one thread when
+  the cgroup limit is below 8 GiB. It peaks at about 3.8 GiB.
+- To check the whole workspace, run `node scripts/typecheck-low-memory.mjs`,
+  not `pnpm -r typecheck`, which runs several packages at once. Usually the
+  packages you changed and CI's typecheck are enough.
+
 If anything cannot be run, explicitly report what was not run and why.
 
 ## 8. API and Auth Expectations
