@@ -226,6 +226,81 @@ describe("codex remote execution", () => {
     }));
   });
 
+  it("syncs the whole instructions bundle to a remote target and points the prompt at the synced copy", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-bundle-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    const bundleDir = path.join(rootDir, "agent-instructions");
+    const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-bundle/workspace";
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await mkdir(bundleDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    await writeFile(path.join(bundleDir, "AGENTS.md"), "Read ETHOS.md before you start.\n", "utf8");
+    await writeFile(path.join(bundleDir, "ETHOS.md"), "Fix it, then make it impossible.\n", "utf8");
+
+    await execute({
+      runId: "run-bundle",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexReviewer", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli",
+        command: "codex",
+        instructionsFilePath: path.join(bundleDir, "AGENTS.md"),
+        env: { CODEX_HOME: codexHomeDir },
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary", workspaceId: "workspace-1" },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    const syncs = (syncDirectoryToSsh.mock.calls as unknown as Array<[{ localDir: string; remoteDir: string; followSymlinks?: boolean }]>)
+      .map(([args]) => args);
+    const bundleSync = syncs.find((args) => args.localDir === bundleDir);
+    expect(bundleSync).toBeDefined();
+    expect(bundleSync?.followSymlinks).toBe(true);
+    expect(bundleSync?.remoteDir).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/instructions`);
+
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[], { stdin?: string }] | undefined;
+    const prompt = call?.[3].stdin ?? "";
+    expect(prompt).toContain("Read ETHOS.md before you start.");
+    expect(prompt).toContain(`Resolve any relative file references from ${managedRemoteWorkspace}/.paperclip-runtime/codex/instructions/.`);
+    expect(prompt).not.toContain(`from ${bundleDir}/`);
+  });
+
+  it("does not sync an instructions bundle for a local run", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-local-bundle-"));
+    cleanupDirs.push(rootDir);
+    const bundleDir = path.join(rootDir, "agent-instructions");
+    await mkdir(bundleDir, { recursive: true });
+    await writeFile(path.join(bundleDir, "AGENTS.md"), "Local.\n", "utf8");
+    await execute({
+      runId: "run-local",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexReviewer", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "codex", instructionsFilePath: path.join(bundleDir, "AGENTS.md"), env: { CODEX_HOME: path.join(rootDir, "home") } },
+      context: { paperclipWorkspace: { cwd: rootDir, source: "project_primary", workspaceId: "workspace-1" } },
+      onLog: async () => {},
+    });
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[], { stdin?: string }] | undefined;
+    expect(call?.[3].stdin ?? "").toContain(`Resolve any relative file references from ${bundleDir}/.`);
+  });
+
   it("stages only the allowlist into the home asset: keeps config.toml/skills/auth, drops session+sqlite state, no exclude", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-allowlist-"));
     cleanupDirs.push(rootDir);
