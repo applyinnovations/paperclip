@@ -7,6 +7,7 @@ import { emitStartupReuse, type StartupReuseReason } from "@paperclipai/adapter-
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
+import { logger } from "../../middleware/logger.js";
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
@@ -839,6 +840,11 @@ async function prepareRuntime(input: {
     workspaceRepositories: input.repositories ?? (input.baseline ? [] : undefined),
     workspaceCheckpoint: true,
     onWorkspaceCheckpoint: input.onCheckpoint,
+    // One line per merge, so the files volume's growth can be attributed to runs.
+    onWorkspaceRestore: async (metrics) => {
+      logger.info({ event: "native_workspace_sync.restore", runId: input.runId, ...metrics },
+        "Sandbox workspace restored to host");
+    },
     workspaceSeedCacheDirectory: input.seedCacheDirectory,
     workspaceSeedCacheCompanyDirectory: input.seedCacheCompanyDirectory,
     workspaceSeedCacheScope: "company",

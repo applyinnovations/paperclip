@@ -685,13 +685,18 @@ export async function captureDirectorySnapshotOffThread(
 /** A disk-backed subset for independent nested-repository merges. */
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
   prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
+  /** Drop entries at or below these paths (relative to the selected root). */
+  drop?: WorkspacePaths;
 }): Promise<DirectorySnapshot> {
   const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
+  const dropped = workspacePathMatcher(options.drop);
   try {
     for (const [relative, entry] of snapshot.entries) {
       if (options.prefix && !relative.startsWith(options.prefix)) continue;
       if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
-      writer.add("baseline", options.prefix ? relative.slice(options.prefix.length) : relative, JSON.stringify(entry));
+      const selected = options.prefix ? relative.slice(options.prefix.length) : relative;
+      if (options.drop && dropped.matches(selected)) continue;
+      writer.add("baseline", selected, JSON.stringify(entry));
     }
     const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,
       entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry) };
@@ -702,7 +707,7 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
     writer.close(false);
     await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
     throw error;
-  }
+  } finally { dropped.close(); }
 }
 
 function orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
@@ -753,6 +758,28 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
+/** What one sandbox workspace restore wrote into the host workspace. */
+export interface WorkspaceRestoreMetrics extends DirectoryMergeStats {
+  /**
+   * Where the ignored paths the merge skipped came from: the sandbox's own Git
+   * listing plus the host's, the host's only (the sandbox listing failed), or
+   * neither applies (not a Git workspace, or every file is synced).
+   */
+  ignoredScan: "sandbox" | "host_only" | "not_applicable";
+  /** Ignored paths that only the sandbox reported, so the merge skipped them. */
+  sandboxIgnoredPaths: number;
+}
+
+/** What one merge wrote into its target directory. */
+export interface DirectoryMergeStats {
+  /** Files and symlinks copied from the source into the target. */
+  copiedFiles: number;
+  /** Bytes of the copied regular files. */
+  copiedBytes: number;
+  /** Baseline entries the merge removed from the target. */
+  removedEntries: number;
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
@@ -764,7 +791,8 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
-}): Promise<void> {
+}): Promise<DirectoryMergeStats> {
+  const stats: DirectoryMergeStats = { copiedFiles: 0, copiedBytes: 0, removedEntries: 0 };
   const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await capture(input.sourceDir, options);
@@ -788,6 +816,7 @@ export async function mergeDirectoryWithBaseline(input: {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+          stats.removedEntries += 1;
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
@@ -797,12 +826,18 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         for (const [relative, entry] of orderedEntries(source)) {
           if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) {
+            await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+            if (entry.kind === "dir") continue;
+            stats.copiedFiles += 1;
+            if (entry.kind === "file") stats.copiedBytes += (await fs.lstat(path.join(input.sourceDir, relative))).size;
+          }
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
     });
   } finally { await disposeDirectorySnapshot(source); }
+  return stats;
 }
 
 export async function directoryEntryMatchesBaseline(

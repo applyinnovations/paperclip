@@ -1,4 +1,5 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import type { WorkspaceRestoreMetrics } from "./workspace-restore-merge.js";
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
@@ -559,6 +560,7 @@ export async function prepareCommandManagedRuntime(input: {
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  onWorkspaceRestore?: (metrics: WorkspaceRestoreMetrics) => Promise<void>;
   workspaceSeedCacheDirectory?: string;
   workspaceSeedCacheCompanyDirectory?: string;
   workspaceSeedCacheScope?: "workspace" | "company";
@@ -636,6 +638,7 @@ export async function prepareCommandManagedRuntime(input: {
           workspaceDurableSeed: input.workspaceDurableSeed,
           workspaceCheckpoint: input.workspaceCheckpoint,
           onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+          onWorkspaceRestore: input.onWorkspaceRestore,
           workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
           workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
           workspaceSeedCacheScope: input.workspaceSeedCacheScope,
@@ -690,6 +693,7 @@ export async function prepareCommandManagedRuntime(input: {
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,
     onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+    onWorkspaceRestore: input.onWorkspaceRestore,
     workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
     workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
     workspaceSeedCacheScope: input.workspaceSeedCacheScope,

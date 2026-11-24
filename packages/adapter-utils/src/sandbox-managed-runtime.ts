@@ -1,4 +1,5 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import type { WorkspaceRestoreMetrics } from "./workspace-restore-merge.js";
 import { workspaceSeedGeneration, workspaceSeedCloneSnapshot, readWorkspaceSeedGeneration, publishWorkspaceSeedGeneration } from "./workspace-seed-cache.js";
 import { writeCheckpointBaseline, workspaceCheckpointScript, readCheckpointSnapshot, validateCheckpointPayload } from "./workspace-checkpoint.js";
 import { execFile as execFileCallback } from "node:child_process";
@@ -9,7 +10,7 @@ import {
   promises as fs,
 } from "node:fs";
 import os from "node:os";
-import { assertWorkspaceManifestDiskSpace, createWorkspaceManifest, WorkspaceManifestMap, workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
+import { assertWorkspaceManifestDiskSpace, createWorkspaceManifest, WorkspaceManifestMap, WorkspaceNulParser, workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -333,6 +334,70 @@ async function delay(ms: number): Promise<void> {
  * so a dropped transfer or a busy merge lock must not end the run's restore.
  */
 const WORKSPACE_RESTORE_RETRY_DELAYS_MS = [2_000, 5_000] as const;
+
+/** Upper bound for the sandbox's ignored-path listing; larger listings are not used. */
+const SANDBOX_IGNORED_SCAN_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * List the paths the sandbox's own Git work tree reports as untracked and
+ * ignored, merged with the host's ignored paths from preparation. The restore
+ * must not bring these back: they are build output, dependency trees and
+ * caches (`node_modules`, `dist`, prebuilt binaries) that a run created, and
+ * the host's preparation-time list cannot know about them. Tracked files never
+ * appear in this listing. Any failure returns `null`, and the restore keeps the
+ * host's list, so the scan can only make a restore bring back less output.
+ */
+async function readSandboxIgnoredPaths(input: {
+  client: SandboxManagedRuntimeClient;
+  remoteDir: string;
+  runtimeRootDir: string;
+  timeoutMs: number;
+  hostIgnoredPaths: WorkspacePaths | undefined;
+  /** Paths restored separately (nested repositories) or never restored. */
+  skip: string[];
+}): Promise<{ paths: WorkspacePaths; sandboxOnly: number; dispose: () => Promise<void> } | null> {
+  const remoteOutput = path.posix.join(input.runtimeRootDir, `ignored-${randomUUID()}.bin`);
+  let writer: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
+  const hostIgnored = workspacePathMatcher(input.hostIgnoredPaths);
+  try {
+    await input.client.run(`sh -c ${shellQuote([
+      `mkdir -p ${shellQuote(input.runtimeRootDir)}`,
+      `git -C ${shellQuote(input.remoteDir)} -c core.fsmonitor=false ls-files --others --ignored --exclude-standard --directory -z > ${shellQuote(remoteOutput)}`,
+    ].join(" && "))}`, { timeoutMs: input.timeoutMs });
+    const bytes = toBuffer(await input.client.readFile(remoteOutput, {
+      onProgress: (transferred, total) => {
+        if (transferred > SANDBOX_IGNORED_SCAN_MAX_BYTES || (total !== null && total > SANDBOX_IGNORED_SCAN_MAX_BYTES)) {
+          throw new Error("Sandbox ignored-path listing exceeds its byte limit");
+        }
+      },
+    }));
+    if (bytes.byteLength > SANDBOX_IGNORED_SCAN_MAX_BYTES) throw new Error("Sandbox ignored-path listing exceeds its byte limit");
+    writer = await createWorkspaceManifest("paperclip-restore-ignored-");
+    const output = writer;
+    if (input.hostIgnoredPaths) for (const relative of workspacePaths(input.hostIgnoredPaths)) output.add("ignored", relative);
+    let sandboxOnly = 0;
+    const parser = new WorkspaceNulParser((record) => {
+      const relative = record.replace(/\/+$/, "");
+      if (input.skip.some((skip) => relative === skip || relative.startsWith(`${skip}/`) || skip.startsWith(`${relative}/`))) return;
+      if (!hostIgnored.matches(relative)) sandboxOnly += 1;
+      output.add("ignored", relative);
+    });
+    output.batch(() => { parser.write(bytes); parser.finish(); });
+    const paths = output.paths("ignored");
+    output.close();
+    const directory = path.dirname(output.filePath);
+    return { paths, sandboxOnly, dispose: () => fs.rm(directory, { recursive: true, force: true }) };
+  } catch {
+    if (writer) {
+      writer.close(false);
+      await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true }).catch(() => undefined);
+    }
+    return null;
+  } finally {
+    hostIgnored.close();
+    await input.client.remove(remoteOutput).catch(() => undefined);
+  }
+}
 
 /**
  * Retry a copy-back attempt only while it has written nothing into the host
@@ -1287,6 +1352,8 @@ export async function prepareSandboxManagedRuntime(input: {
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  /** Called after each successful workspace merge with what it wrote to the host. */
+  onWorkspaceRestore?: (metrics: WorkspaceRestoreMetrics) => Promise<void>;
   workspaceSeedCacheDirectory?: string;
   workspaceSeedCacheCompanyDirectory?: string;
   workspaceSeedCacheScope?: "workspace" | "company";
@@ -2053,6 +2120,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
                 workspaceCheckpoint: input.workspaceCheckpoint,
                 onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+                onWorkspaceRestore: input.onWorkspaceRestore,
                 workspaceGitSnapshot: repository.snapshot,
                 workspaceFileMode: input.workspaceFileMode,
                 workspaceExclude: nestedExclude,
@@ -2073,6 +2141,7 @@ export async function prepareSandboxManagedRuntime(input: {
               let importedHead: string | null = null;
               let remoteWorkspaceStatus = "dirty";
               let checkpointSnapshot: DirectorySnapshot | undefined;
+              let sandboxIgnored: Awaited<ReturnType<typeof readSandboxIgnoredPaths>> = null;
               try {
                 if (gitSnapshot) {
                   await emitRuntimeStatus(input.onRuntimeProgress, "export", "Exporting git changes from environment");
@@ -2189,6 +2258,13 @@ export async function prepareSandboxManagedRuntime(input: {
                   }
                 }
 
+                if (gitSnapshot && input.workspaceFileMode !== "all") {
+                  sandboxIgnored = await readSandboxIgnoredPaths({
+                    client: input.client, remoteDir: workspaceRemoteDir, runtimeRootDir, timeoutMs: input.spec.timeoutMs,
+                    hostIgnoredPaths: ignoredPaths, skip: [".paperclip-runtime", ...repositories.map((repo) => repo.path)],
+                  });
+                }
+                const restoreIgnoredPaths = sandboxIgnored?.paths ?? ignoredPaths;
                 await emitRuntimeStatus(input.onRuntimeProgress, "restore", "Restoring workspace from environment");
                 const extractedDir = path.join(tempDir, "workspace");
                 let sparseSupported = false;
@@ -2311,15 +2387,21 @@ export async function prepareSandboxManagedRuntime(input: {
                 if (!checkpointSnapshot) await confineFullWorkspaceExport(extractedDir);
                 const gitHeadToIntegrate = importedHead;
                 await withWorkspaceRestoreStep("directory_merge", async () => {
-                  const mergeBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
-                    omit: repositories.map((repo) => repo.path), exclude: workspaceRestoreExclude, ignoredPaths,
+                  // Output the sandbox ignores is neither copied to the host nor
+                  // treated as deleted there: drop it from both merge sides.
+                  const drop = sandboxIgnored?.paths;
+                  const mergeBaseline = repositories.length === 0 && !drop ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
+                    omit: repositories.map((repo) => repo.path), exclude: workspaceRestoreExclude, ignoredPaths: restoreIgnoredPaths, drop,
                   });
+                  const mergeSource = checkpointSnapshot && drop
+                    ? await selectDirectorySnapshot(checkpointSnapshot, { exclude: checkpointSnapshot.exclude, ignoredPaths: restoreIgnoredPaths, drop })
+                    : checkpointSnapshot;
                   try {
-                    await mergeDirectoryWithBaseline({
+                    const merged = await mergeDirectoryWithBaseline({
                       workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
                       baseline: mergeBaseline,
                       sourceDir: extractedDir,
-                      ...(checkpointSnapshot ? { snapshots: { source: checkpointSnapshot } } : {}),
+                      ...(mergeSource ? { snapshots: { source: mergeSource } } : {}),
                       targetDir: input.workspaceLocalDir,
                       // Runs under the merge lock, before the first host write.
                       beforeApply: async () => {
@@ -2340,9 +2422,18 @@ export async function prepareSandboxManagedRuntime(input: {
                           }
                         : undefined,
                     });
-                  } finally { if (mergeBaseline !== baselineSnapshot) await disposeDirectorySnapshot(mergeBaseline); }
+                    await input.onWorkspaceRestore?.({
+                      ...merged,
+                      ignoredScan: sandboxIgnored ? "sandbox" : gitSnapshot && input.workspaceFileMode !== "all" ? "host_only" : "not_applicable",
+                      sandboxIgnoredPaths: sandboxIgnored?.sandboxOnly ?? 0,
+                    }).catch(() => undefined);
+                  } finally {
+                    if (mergeBaseline !== baselineSnapshot) await disposeDirectorySnapshot(mergeBaseline);
+                    if (mergeSource !== checkpointSnapshot) await disposeDirectorySnapshot(mergeSource ?? null);
+                  }
                 });
               } finally {
+                await sandboxIgnored?.dispose().catch(() => undefined);
                 await disposeDirectorySnapshot(checkpointSnapshot ?? null);
                 await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing workspace");
                 if (importedRef) {
