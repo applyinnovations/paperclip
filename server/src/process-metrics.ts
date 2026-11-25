@@ -16,14 +16,20 @@
  *   their memory counts against the container but not this process's RSS.
  * - `paperclip_sandbox_transfers_*`, the transfer limiter's active and queued
  *   counts and its cap.
+ * - `paperclip_board_items_resolved_stale{company,company_id}`, open
+ *   user-assigned issues idle for more than N days whose links (PRs, blockers)
+ *   have all resolved: board items that should have closed or gone back to an
+ *   agent (APP-527). See `services/board-item-metrics.ts`. Only exported when
+ *   the server passes a source for it, and cached between scrapes.
  *
- * Metrics are process-level only. No label carries company, user, or issue
- * data; plugin workers are labelled by their plugin id.
+ * No label carries user or issue data. Plugin workers are labelled by their
+ * plugin id; the board item gauge by company issue prefix and id.
  */
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { Gauge, Registry, collectDefaultMetrics } from "@prometheus-io/client";
 import { getSandboxTransferLimiter, type SandboxTransferLimiterSnapshot } from "./services/sandbox-transfer-limiter.js";
+import type { ResolvedStaleBoardItemCount } from "./services/board-item-metrics.js";
 
 export interface PluginWorkerProcessInfo {
   pluginId: string;
@@ -35,6 +41,10 @@ export interface ProcessMetricsSources {
   sandboxTransfers?: () => SandboxTransferLimiterSnapshot;
   /** Reads a process's resident set size in bytes, or null when it is gone. */
   readProcessRssBytes?: (pid: number) => Promise<number | null>;
+  /** Per-company counts of resolved stale board items; expected to be cached by the caller. */
+  resolvedStaleBoardItems?: () => Promise<readonly ResolvedStaleBoardItemCount[]>;
+  /** Called when a database-backed source fails; the scrape still succeeds without that metric. */
+  onSourceError?: (metric: string, error: unknown) => void;
 }
 
 export interface ProcessMetricsServerConfig {
@@ -109,6 +119,29 @@ export function createProcessMetricsRegistry(sources: ProcessMetricsSources = {}
     gauge("paperclip_sandbox_transfers_active", "Native sandbox file transfers running now.", (s) => s.active);
     gauge("paperclip_sandbox_transfers_queued", "Native sandbox file transfers waiting for a slot.", (s) => s.queued);
     gauge("paperclip_sandbox_transfers_limit", "Maximum native sandbox file transfers that run at once.", (s) => s.concurrency);
+  }
+
+  const resolvedStaleBoardItems = sources.resolvedStaleBoardItems;
+  if (resolvedStaleBoardItems) {
+    const name = "paperclip_board_items_resolved_stale";
+    new Gauge({
+      name,
+      help: "Open user-assigned issues not updated for more than the stale threshold whose linked PRs and blockers have all resolved.",
+      labelNames: ["company", "company_id"],
+      registers: [registry],
+      async collect() {
+        this.reset();
+        try {
+          for (const row of await resolvedStaleBoardItems()) {
+            this.set({ company: row.issuePrefix, company_id: row.companyId }, row.count);
+          }
+        } catch (error) {
+          // A database hiccup drops this series for one scrape; it must not
+          // fail the whole endpoint and hide the process metrics with it.
+          sources.onSourceError?.(name, error);
+        }
+      },
+    });
   }
 
   return registry;
