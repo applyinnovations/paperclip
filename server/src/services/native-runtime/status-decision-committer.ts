@@ -68,7 +68,7 @@ import {
   isExternalChatWaitAuthorizationContention,
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
-import { issueService } from "../issues.js";
+import { executeIssuePostCommitActions, issueService } from "../issues.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -1655,6 +1655,10 @@ export async function commitNativeStatusDecision(input: {
   }
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+  // Set when this decision moves the issue into done/cancelled, so the board
+  // items it blocked are re-evaluated after commit (issueService.update does
+  // the same for every other caller).
+  let becameTerminal = false;
   const committed = await input.db.transaction(async (tx) => {
     const retiredReview = input.requireReassessmentSource?.retiredAutomaticReview;
     if (retiredReview && !await lockCurrentNativeCompletionContract(tx as unknown as Db, {
@@ -2335,6 +2339,13 @@ export async function commitNativeStatusDecision(input: {
       });
     }
 
+    if (
+      (input.decision.statusAction === "done" || input.decision.statusAction === "cancelled") &&
+      issue.status !== "done" && issue.status !== "cancelled"
+    ) {
+      becameTerminal = true;
+    }
+
     if (input.decision.statusAction === "done" && issue.status !== "done") {
       const issueSvc = issueService(tx as unknown as Db);
       const dependents = await issueSvc.listWakeableBlockedDependents(
@@ -2541,5 +2552,12 @@ export async function commitNativeStatusDecision(input: {
   for (const publication of publications) publishActivity(publication);
   for (const terminalRun of terminalRunsToEmit)
     await emitAgentTaskRun(input.db, terminalRun);
+  if (becameTerminal && !committed.replayed) {
+    await executeIssuePostCommitActions(input.db, [{
+      type: "resolve_blocked_board_items",
+      companyId: input.companyId,
+      issueId: input.issueId,
+    }]);
+  }
   return committed;
 }

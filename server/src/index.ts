@@ -13,6 +13,7 @@ import { routineExecutionStatusService } from "./services/routine-run-status.js"
 import { registerMergeConfirmationWork } from "./services/merged-pr-confirmation-work.js";
 import { registerNativeHarnessBackupExpirationWork } from "./services/native-runtime/native-harness-backup-expiration-work.js";
 import { registerGitHubConnectionEventWork, registerGitHubConnectionContinuityWork } from "./services/github-connection-work.js";
+import { runBoardItemAutoResolutionBackfillFromEnv } from "./services/board-item-auto-resolution.js";
 import { registerProviderTraceRetentionWork } from "./services/provider-trace-retention-work.js";
 import { registerRunEvidenceMigrationWork } from "./services/run-evidence-migration-work.js";
 import { registerSkillVersionRetentionWork } from "./services/skill-version-retention-work.js";
@@ -1551,6 +1552,13 @@ async function startServerWithDatabaseTeardown(
   const githubEventWorker = registerGitHubConnectionEventWork(db, deliveryWork, githubConnectionEvents, githubCanRun);
   const githubContinuityWorker = registerGitHubConnectionContinuityWork(db, deliveryWork, tools, githubCanRun);
   server.on("close", () => { void githubEventWorker.stop(); void githubContinuityWorker.stop(); });
+  // One-shot, opt-in per deploy (see board-item-auto-resolution.ts). Ongoing
+  // resolution is event-driven; this only catches items already waiting.
+  if (!isWarmStandby()) {
+    void runBoardItemAutoResolutionBackfillFromEnv(db as any).catch((err) => {
+      logger.warn({ err }, "board item auto-resolution backfill failed");
+    });
+  }
   server.on("close", registerGitHubBotCloudSetupPoller(db, async () => {
     if (githubCanRun()) await githubConnectionEvents.pollOnce({ forSetup: true });
   }));

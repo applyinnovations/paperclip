@@ -319,12 +319,19 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
 
-export type IssuePostCommitAction = {
-  type: "cancel_native_question_run";
-  runId: string;
-  issueId: string;
-  issueStatus: string;
-};
+export type IssuePostCommitAction =
+  | {
+      type: "cancel_native_question_run";
+      runId: string;
+      issueId: string;
+      issueStatus: string;
+    }
+  | {
+      /** The issue became done/cancelled; re-evaluate the board items it blocked. */
+      type: "resolve_blocked_board_items";
+      companyId: string;
+      issueId: string;
+    };
 
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
@@ -332,6 +339,35 @@ export async function executeIssuePostCommitActions(
   actions: readonly IssuePostCommitAction[],
 ): Promise<void> {
   if (actions.length === 0) return;
+  const cancellations = actions.filter(
+    (action): action is Extract<IssuePostCommitAction, { type: "cancel_native_question_run" }> =>
+      action.type === "cancel_native_question_run",
+  );
+  if (cancellations.length > 0) await cancelNativeQuestionRuns(db, cancellations);
+  const resolvedBlockers = new Set<string>();
+  for (const action of actions) {
+    if (action.type !== "resolve_blocked_board_items") continue;
+    const key = `${action.companyId}:${action.issueId}`;
+    if (resolvedBlockers.has(key)) continue;
+    resolvedBlockers.add(key);
+    try {
+      const { boardItemAutoResolutionService } = await import("./board-item-auto-resolution.js");
+      await boardItemAutoResolutionService(db).onBlockerResolved(action.companyId, action.issueId);
+    } catch (err) {
+      // The issue transition has committed; a failure here leaves the board
+      // item as it was, and the next event on it re-evaluates it.
+      logger.warn(
+        { err, issueId: action.issueId },
+        "board item auto-resolution after blocker resolution failed",
+      );
+    }
+  }
+}
+
+async function cancelNativeQuestionRuns(
+  db: Db,
+  actions: readonly Extract<IssuePostCommitAction, { type: "cancel_native_question_run" }>[],
+): Promise<void> {
   const { heartbeatService } = await import("./heartbeat.js");
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
@@ -11940,6 +11976,13 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            if (receiptExisting.status !== "done" && receiptExisting.status !== "cancelled") {
+              queuedPostCommitActions.push({
+                type: "resolve_blocked_board_items",
+                companyId: updated.companyId,
+                issueId: updated.id,
+              });
+            }
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, status cards)
             // that never touch the HTTP routes. Governed cards expire; ordinary
