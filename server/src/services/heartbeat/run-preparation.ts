@@ -98,6 +98,7 @@ import {
   buildPlanReviewContext,
 } from "../plan-review-context.js";
 import {
+  ENVIRONMENT_CAPACITY_WAIT_KEY,
   WAKE_COMMENT_IDS_KEY,
   extractWakeCommentIds,
   deriveCommentId,
@@ -1857,6 +1858,13 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // A queued run's place in the environment capacity queue is recorded by the
+  // server at deferral; a wake merged into it never moves or forges it.
+  if (existing[ENVIRONMENT_CAPACITY_WAIT_KEY] !== undefined) {
+    merged[ENVIRONMENT_CAPACITY_WAIT_KEY] = existing[ENVIRONMENT_CAPACITY_WAIT_KEY];
+  } else {
+    delete merged[ENVIRONMENT_CAPACITY_WAIT_KEY];
+  }
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];

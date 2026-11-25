@@ -17,14 +17,14 @@ import { logger } from "../middleware/logger.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { isQueuedDependencyWait } from "./run-cancellation.js";
-import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
-  WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
+import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON,
+  RUNNER_REVISION_WAIT_RETRY_REASON, WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
 
 // These scheduled runs wait for a shared resource; none records a failed
 // attempt. Their dispatcher re-checks the resource, so the run can stay
 // scheduled past its retry time. Retry cannot free the resource either.
 const resourceWaitRetryReasons = new Set<string>([WORKSPACE_BUSY_RETRY_REASON, AI_CONNECTION_BUSY_RETRY_REASON,
-  AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON]);
+  AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON, ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON]);
 
 // A due same-run resume dispatches within seconds; past this, offer Retry.
 const NATIVE_RESUME_DISPATCH_GRACE_MS = 2 * 60_000;

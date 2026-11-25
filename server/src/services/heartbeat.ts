@@ -11,6 +11,8 @@ import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
 import { describeFailedAttachment } from "./native-runtime/remote-warm-session-recovery.js";
 import { createProviderLimitWait } from "./heartbeat/provider-limit-wait.js";
+import { createEnvironmentCapacityWait } from "./heartbeat/environment-capacity-wait.js";
+import { findEnvironmentCapacityUnavailableError } from "./environment-capacity-unavailable-error.js";
 import { externalConversationSettlementWork } from "./external-conversation-settlement-work.js";
 import { nativeRecoveryNoticeWork } from "./native-runtime/native-recovery-notice-work.js";
 import { nativeRunProjectionWork } from "./native-runtime/native-run-projection-work.js";
@@ -1880,6 +1882,15 @@ export function heartbeatService(
     setWakeupStatus,
     appendRunEvent,
     scheduleBoundedRetryForRun,
+    releaseIssueExecutionAndPromote,
+    finalizeAgentStatus,
+  });
+  const { deferRunForEnvironmentCapacity } = createEnvironmentCapacityWait({
+    setRunStatusIfRunning,
+    setWakeupStatus,
+    appendRunEvent,
+    scheduleBoundedRetryForRun,
+    getAgent,
     releaseIssueExecutionAndPromote,
     finalizeAgentStatus,
   });
@@ -3833,6 +3844,14 @@ export function heartbeatService(
             );
           },
         );
+      } else if (!legacyAdapterEntered && !nativeDispatchStarted && run.runtimeMode === "legacy"
+          && run.nativeSessionId === null && run.runnerInstanceId === null && findEnvironmentCapacityUnavailableError(outerErr)) {
+        // No room for a new sandbox yet (APP-114). Not a failure: queue the
+        // run for capacity. The finally block below still releases this
+        // run's leases, runtime services, and scratch.
+        await deferRunForEnvironmentCapacity(run, findEnvironmentCapacityUnavailableError(outerErr)!).catch((deferralErr) => {
+          logger.error({ err: deferralErr, runId }, "failed to queue the run for environment capacity");
+        });
       } else {
         await preserveNativeWorkspaceOnFailure();
         if (!nativeOwnershipHeld && !nativeStartupCleanupScheduled && !nativeStartupCleanupError) {

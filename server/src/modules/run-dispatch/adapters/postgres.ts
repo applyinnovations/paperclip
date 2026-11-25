@@ -74,6 +74,7 @@ import type {
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
+  ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON,
   allowsIssueInteractionWake,
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
@@ -97,6 +98,7 @@ import type {
 } from "../application/types.js";
 import { RunDispatchApplicationError } from "../application/types.js";
 import { parkWorkspaceBusyRetryInTx } from "./workspace-busy-wait.js";
+import { parkEnvironmentCapacityRetryInTx } from "./environment-capacity-wait.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type LoadGateFactsInput = {
@@ -954,6 +956,9 @@ export function createPostgresRunDispatchAdapter(
       if (await parkWorkspaceBusyRetryInTx(tx, run, now)) {
         return { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
       }
+      if (await parkEnvironmentCapacityRetryInTx(tx, run, now)) {
+        return { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
+      }
 
       const promoted = await promoteDueRetryInTx(tx as unknown as Db, {
         runId: input.runId,
@@ -1008,6 +1013,8 @@ export function createPostgresRunDispatchAdapter(
       const recovery = parseObject(parent.resultJson?.executionRecovery);
       const unstarted = parent.errorCode === WORKSPACE_BUSY_RETRY_REASON
         ? recovery.kind === "workspace_wait" && recovery.providerWorkStarted === false
+        : parent.errorCode === ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON
+        ? recovery.kind === "environment_capacity_wait" && recovery.providerWorkStarted === false
         : parent.errorCode === "execution_reconciliation_required" && await isPreDispatchExecutionWaitVerified(tx, parent);
       if (!unstarted) return null;
       const [wake] = await tx.select().from(agentWakeupRequests).where(and(

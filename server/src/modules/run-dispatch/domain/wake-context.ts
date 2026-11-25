@@ -20,6 +20,7 @@ export const WORKSPACE_BUSY_RETRY_REASON = "workspace_busy";
 export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const RUNNER_REVISION_WAIT_RETRY_REASON = "runner_revision_wait";
+export const ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON = "environment_capacity_wait";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
@@ -86,6 +87,41 @@ export function readWorkspaceBusyWait(
     issueExecutionWorkspaceId: readNonEmptyString(wait.issueExecutionWorkspaceId),
     issueProjectWorkspaceId: readNonEmptyString(wait.issueProjectWorkspaceId),
   };
+}
+
+// Fallback re-check for a run waiting for room in its environment. A lease
+// released on the environment, or the run ahead of it starting, wakes the
+// next waiter directly; this bounds a missed wake and covers capacity freed by
+// pods Paperclip does not own (CI on the same node, for example).
+export const ENVIRONMENT_CAPACITY_RECHECK_MS = 60 * 1000;
+export const ENVIRONMENT_CAPACITY_WAIT_KEY = "environmentCapacityWait";
+
+/** What an environment-capacity retry is waiting for, recorded at deferral. */
+export type EnvironmentCapacityWait = {
+  /** `environment:<id>`; waiters on one key in one company are admitted in arrival order. */
+  key: string;
+  environmentId: string;
+  /** `quota`, `scheduling`, or `queued` (behind older waiters). */
+  reason: string;
+  /** ISO time of the first deferral for this key; carried across re-deferrals. */
+  waitingSince: string;
+};
+
+export function environmentCapacityWaitKey(environmentId: string): string {
+  return `environment:${environmentId}`;
+}
+
+export function readEnvironmentCapacityWait(
+  retryReason: string | null | undefined,
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): EnvironmentCapacityWait | null {
+  if (retryReason !== ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON) return null;
+  const wait = parseObject(parseObject(contextSnapshot)[ENVIRONMENT_CAPACITY_WAIT_KEY]);
+  const environmentId = readNonEmptyString(wait.environmentId);
+  const waitingSince = readNonEmptyString(wait.waitingSince);
+  if (!environmentId || !waitingSince || Number.isNaN(Date.parse(waitingSince))) return null;
+  if (wait.key !== environmentCapacityWaitKey(environmentId)) return null;
+  return { key: wait.key, environmentId, reason: readNonEmptyString(wait.reason) ?? "quota", waitingSince };
 }
 
 /**

@@ -5817,6 +5817,195 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }, 90_000);
   });
 
+  describe("environment capacity wait (APP-114)", () => {
+    // The provider refuses a sandbox while its tenant quota is full, exactly as
+    // the Kubernetes provider reports `exceeded quota` in the acquire envelope.
+    const quotaFull = () => new JsonRpcCallError({ code: -32000,
+      message: "Sandbox pod refused: exceeded quota: paperclip-quota, requested: requests.cpu=500m",
+      data: { schema: "paperclip/environment-acquire-error/v1", capacityUnavailable: "quota" } });
+
+    /** A provider with a fixed number of sandbox slots, shared by every run. */
+    function capacityLimitedProvider(slots: number) {
+      const state = { inUse: 0, peak: 0, refused: 0, admittedRunIds: [] as string[] };
+      const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
+      const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((database, options = {}) => {
+        const runtime = originalFactory(database, options).runtime;
+        return originalFactory(database, { ...options, environmentRuntime: { ...runtime,
+          acquireRunLease: async (input) => {
+            if (state.inUse >= slots) {
+              state.refused += 1;
+              throw quotaFull();
+            }
+            state.inUse += 1;
+            state.peak = Math.max(state.peak, state.inUse);
+            try {
+              const lease = await runtime.acquireRunLease(input);
+              state.admittedRunIds.push(input.heartbeatRunId ?? "");
+              return lease;
+            } catch (error) {
+              state.inUse -= 1;
+              throw error;
+            }
+          },
+          releaseRunLeases: async (...args: Parameters<typeof runtime.releaseRunLeases>) => {
+            const released = await runtime.releaseRunLeases(...args);
+            state.inUse -= released.length;
+            return released;
+          },
+        } });
+      });
+      return { state, restore: () => factory.mockRestore() };
+    }
+
+    async function seedCompanyWithQueuedIssueRuns(count: number) {
+      const companyId = randomUUID();
+      const issuePrefix = `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      const now = new Date();
+      await seedRecoveryCompany(companyId, issuePrefix);
+      const seeded: Array<{ agentId: string; runId: string; issueId: string }> = [];
+      for (let index = 0; index < count; index += 1) {
+        const agentId = randomUUID();
+        const runId = randomUUID();
+        const wakeupRequestId = randomUUID();
+        const issueId = randomUUID();
+        // Stagger arrival so the queue order is deterministic.
+        const createdAt = new Date(now.getTime() - (count - index) * 1_000);
+        await db.insert(agents).values({ id: agentId, companyId, name: `Coder${index}`, role: "engineer", status: "idle",
+          adapterType: "codex_local", adapterConfig: {},
+          runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+        await db.insert(agentWakeupRequests).values({ id: wakeupRequestId, companyId, agentId, source: "assignment",
+          triggerDetail: "system", reason: "issue_assigned", payload: { issueId }, status: "queued", runId,
+          requestedAt: createdAt, updatedAt: createdAt });
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "assignment",
+          triggerDetail: "system", status: "queued", wakeupRequestId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" }, updatedAt: createdAt, createdAt });
+        await db.insert(issues).values({ id: issueId, companyId, title: `Capacity wait ${index}`, status: "in_progress",
+          priority: "medium", assigneeAgentId: agentId, checkoutRunId: runId, executionRunId: runId,
+          responsibleUserId: "responsible-user", issueNumber: index + 1, identifier: `${issuePrefix}-${index + 1}`,
+          startedAt: createdAt });
+        await db.update(heartbeatRuns).set({ scopeKind: "issue", issueId }).where(eq(heartbeatRuns.id, runId));
+        seeded.push({ agentId, runId, issueId });
+      }
+      return { companyId, seeded };
+    }
+
+    async function companyRuns(companyId: string) {
+      return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    }
+
+    it("queues 12 runs against 8 slots in arrival order; all complete and no task is blocked", async () => {
+      const SLOTS = 8;
+      const RUNS = 12;
+      const { companyId, seeded } = await seedCompanyWithQueuedIssueRuns(RUNS);
+      const provider = capacityLimitedProvider(SLOTS);
+      // Each admitted run holds its sandbox until the test lets it finish.
+      const finish = new Map<string, () => void>();
+      let finishAll = false;
+      const entered: Array<{ runId: string; issueId: string }> = [];
+      for (let index = 0; index < RUNS; index += 1) {
+        mockAdapterExecute.mockImplementationOnce(async (input) => {
+          const issueId = String((input.context as Record<string, unknown>).issueId ?? "");
+          entered.push({ runId: input.runId, issueId });
+          if (!finishAll) await new Promise<void>((resolve) => finish.set(issueId, resolve));
+          return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+            summary: "Done after waiting for capacity.", provider: "test", model: "test-model" };
+        });
+      }
+      const releaseAll = () => { finishAll = true; for (const resolve of finish.values()) resolve(); };
+      try {
+        const heartbeat = heartbeatService(db);
+        await heartbeat.resumeQueuedRuns();
+
+        // Eight runs hold every slot; the other four wait, not fail.
+        const waiting = await waitForValue(async () => {
+          const rows = await companyRuns(companyId);
+          const queued = rows.filter(run => run.status === "scheduled_retry");
+          return entered.length >= SLOTS && queued.length === RUNS - SLOTS ? queued : null;
+        }, 30_000);
+        expect(waiting).not.toBeNull();
+        expect(entered).toHaveLength(SLOTS);
+        expect(waiting!.every(run => run.scheduledRetryReason === "environment_capacity_wait")).toBe(true);
+        const deferred = (await companyRuns(companyId)).filter(run => run.status === "cancelled");
+        expect(deferred).toHaveLength(RUNS - SLOTS);
+        expect(deferred.every(run => run.errorCode === "environment_capacity_wait")).toBe(true);
+        for (const run of waiting!) {
+          const [issue] = await db.select().from(issues).where(eq(issues.id, run.issueId!));
+          // The task stays in progress, held by its queued retry; nothing is blocked.
+          expect(issue).toMatchObject({ status: "in_progress", executionRunId: run.id });
+          expect(await getExecutionBlocker(db, companyId, run.issueId!)).toBeNull();
+          // A resource wait reads as ongoing work with no Retry: retrying cannot free capacity.
+          expect(await taskInterruptionPresentation(db, issue!)).toMatchObject({ state: "working" });
+        }
+
+        // Re-waking a queued task merges into its queued run: no new runs.
+        const runCountBefore = (await companyRuns(companyId)).length;
+        for (const run of waiting!) {
+          for (let wake = 0; wake < 3; wake += 1) {
+            const merged = await heartbeat.wakeup(run.agentId, { source: "automation", triggerDetail: "system",
+              reason: "issue_status_changed", payload: { issueId: run.issueId }, requestedByActorType: "system",
+              requestedByActorId: "capacity-test", contextSnapshot: { issueId: run.issueId, wakeReason: "issue_status_changed" } });
+            expect(merged?.id).toBe(run.id);
+          }
+        }
+        const afterWakes = await companyRuns(companyId);
+        expect(afterWakes).toHaveLength(runCountBefore);
+        // The merged wakes keep each run's place in the queue.
+        for (const run of waiting!) {
+          expect(afterWakes.find(row => row.id === run.id)!.contextSnapshot).toMatchObject({
+            environmentCapacityWait: (run.contextSnapshot as Record<string, unknown>).environmentCapacityWait });
+        }
+
+        // Waiters in arrival order: first deferral time, then run id.
+        const waiterIssues = [...waiting!]
+          .sort((left, right) => {
+            const a = (left.contextSnapshot as { environmentCapacityWait: { waitingSince: string } }).environmentCapacityWait;
+            const b = (right.contextSnapshot as { environmentCapacityWait: { waitingSince: string } }).environmentCapacityWait;
+            return a.waitingSince.localeCompare(b.waitingSince) || left.id.localeCompare(right.id);
+          })
+          .map(run => run.issueId!);
+
+        // Free one slot at a time. Each released lease wakes the oldest waiter
+        // directly, well before the fallback re-check timer, and only it starts.
+        const drive = async () => {
+          await heartbeat.promoteDueScheduledRetries(new Date());
+          await heartbeat.resumeQueuedRuns();
+        };
+        for (let freed = 0; freed < RUNS - SLOTS; freed += 1) {
+          finish.get(entered[freed]!.issueId)!();
+          const admitted = await waitForValue(async () => {
+            await drive();
+            return entered.length > SLOTS + freed ? entered[SLOTS + freed] : null;
+          }, 20_000);
+          expect(admitted?.issueId).toBe(waiterIssues[freed]);
+        }
+
+        releaseAll();
+        const done = await waitForValue(async () => {
+          await drive();
+          await heartbeat.drainActiveRunExecutions();
+          const rows = await companyRuns(companyId);
+          return seeded.every(({ issueId }) => rows.some(run => run.issueId === issueId && run.status === "succeeded")) || null;
+        }, 60_000);
+        expect(done).toBe(true);
+
+        const settled = await companyRuns(companyId);
+        expect(settled.filter(run => run.status === "failed")).toEqual([]);
+        expect(settled.some(run => run.errorCode === "setup_failed")).toBe(false);
+        expect(provider.state.peak).toBeLessThanOrEqual(SLOTS);
+        for (const { issueId } of seeded) {
+          const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(issue!.status).not.toBe("blocked");
+        }
+      } finally {
+        releaseAll();
+        provider.restore();
+        mockAdapterExecute.mockReset();
+        mockAdapterExecute.mockImplementation(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+          summary: "Recovered stranded heartbeat work.", provider: "test", model: "test-model" }));
+      }
+    }, 120_000);
+  });
+
   it("classifies only the installed-but-not-ready sandbox provider plugin message as a configuration gap", () => {
     expect(
       parseSandboxProviderPluginNotReadyFailureMessage(

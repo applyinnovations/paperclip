@@ -367,6 +367,10 @@ export function projectExecution(
     projection.nextAction = `Waiting for the agent's provider usage limit to reset; the work starts at ${resetAt}. To continue sooner, restore the provider allowance or change the agent's AI connection, then start a manual run.`;
     return set("retry_scheduled", "Waiting for usage limit reset");
   }
+  if (run.status === "scheduled_retry" && run.scheduledRetryReason === "environment_capacity_wait") {
+    projection.nextAction = "Waiting for room in the execution environment (its quota or nodes are full); the run starts automatically, in arrival order, when a sandbox is released.";
+    return set("retry_scheduled", "Waiting for environment capacity");
+  }
   if (run.status === "scheduled_retry" && run.scheduledRetryReason === "workspace_busy") {
     projection.nextAction = "Waiting for the live workspace holder to finish; the scheduled check will revalidate ownership.";
     return set("retry_scheduled", "Waiting for workspace");
