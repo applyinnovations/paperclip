@@ -45,6 +45,19 @@ const SANDBOX_TOOL_CACHE_DIRECTORIES = {
 type SandboxToolCacheDirectoryKey = keyof typeof SANDBOX_TOOL_CACHE_DIRECTORIES;
 
 /**
+ * Whether `value` is a path this module placed under `remoteCwd`'s cache root.
+ * Such a path is owned by the sandbox target, not by the controller, so code
+ * that strips controller paths from a remote env (e.g. a preconfigured home)
+ * must keep it.
+ */
+export function isSandboxToolCachePath(remoteCwd: string, value: unknown): value is string {
+  if (typeof value !== "string" || !path.posix.isAbsolute(value)) return false;
+  const root = path.posix.join(remoteCwd, SANDBOX_TOOL_CACHE_RELATIVE_ROOT);
+  const normalized = path.posix.normalize(value);
+  return normalized === root || normalized.startsWith(`${root}/`);
+}
+
+/**
  * pnpm's default import method (`auto`) clones files on a reflink-capable
  * filesystem such as the sandbox's XFS volumes. A clone is a separate inode,
  * so `du` and the XFS project quota kubelet uses for emptyDir limits charge it

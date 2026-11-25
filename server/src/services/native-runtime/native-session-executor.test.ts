@@ -19402,6 +19402,32 @@ describe("runnerd provider runtime wiring", () => {
     expect(runnerEnvironment).toMatchObject(paths);
   });
 
+  it("keeps the sandbox tool cache in the remote preconfigured environment while dropping controller paths (APP-20)", async () => {
+    const cache = "/workspace/.paperclip-runtime/cache";
+    const toolCaches = { npm_config_cache: `${cache}/npm`, npm_config_store_dir: `${cache}/pnpm-store`,
+      XDG_CACHE_HOME: `${cache}/xdg`, GOMODCACHE: `${cache}/go-mod`, npm_config_package_import_method: "hardlink" };
+    const runnerEnvironment = { ...configuredEnvironmentProjection({ XDG_CONFIG_HOME: "/controller/config", TASK_FLAG: "kept" }),
+      ...toolCaches, HOME: "/controller/home", CODEX_HOME: "/controller/codex" };
+    const remoteExecution = { ...execution, schema: "paperclip.native-execution-input.v7" as const,
+      homeMode: "preconfigured" as const, executionMode: "default" as const, planningContext: null,
+      provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const }, runtimeContext: nativeRuntimeContextFixture() };
+    const remoteExecute = vi.fn(async (command: { args?: string[] }) => ({
+      exitCode: 0, timedOut: false, stderr: "", stdout: command.args?.[1]?.includes("getent passwd") ? "/home/executor\n" : "",
+    }));
+    await createRunnerdBackend({ db: leaseDb(remoteExecution), execution: remoteExecution, runnerInstanceId: "remote-home-tool-cache",
+      runnerEnvironment, runnerIngressAuthorized: true, runnerExecutionTarget: {
+        kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment",
+        leaseId: "remote-home-tool-cache", providerKey: "daytona", effectiveCapabilities: { runnerWebSocketIngress: true },
+        runner: { execute: remoteExecute, syncIn: vi.fn(async () => undefined) },
+      } as never });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const environment = (state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { environment: NodeJS.ProcessEnv }).environment;
+    expect(environment).toMatchObject({ ...toolCaches, HOME: "/home/executor", PAPERCLIP_WORKSPACE_CWD: "/workspace" });
+    expect(environment.XDG_CONFIG_HOME).toBeUndefined();
+    expect(environment.CODEX_HOME).toBeUndefined();
+    expect(configuredEnvironment(environment)).toEqual({ TASK_FLAG: "kept", PAPERCLIP_CONFIGURED_ENV_KEYS: '["TASK_FLAG"]' });
+  });
+
   it("keeps the provider backup fence while its accepted result is saving the workspace", async () => {
     const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(),
       executionWorkspaceId: randomUUID() }, session: { ...execution.session, normalizedSessionId: randomUUID() } };

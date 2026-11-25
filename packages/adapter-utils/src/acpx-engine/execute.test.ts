@@ -2210,8 +2210,15 @@ describe("shared ACPX engine runtime behavior", () => {
       XDG_CACHE_HOME: `${cache}/xdg`, GOMODCACHE: `${cache}/go-mod`, npm_config_package_import_method: "hardlink" };
     // Saved by the previous release: no cache env, no context marker.
     const before = await runExecutor({ ...config, env: { FOO: "bar" } }, { context: { taskId: "issue-1" } });
-    const after = await runExecutor({ ...config, env: { FOO: "bar", ...cacheEnv } },
-      { context: { taskId: "issue-1", paperclipSandboxToolCaches: { type: "workspace_volume", env: cacheEnv } } });
+    expect(before.result.sessionId).toBeTruthy();
+    // The next wake runs the new release: it carries the cache env and resumes the saved session.
+    const after = await runExecutor({ ...config, env: { FOO: "bar", ...cacheEnv } }, {
+      context: { taskId: "issue-1", paperclipSandboxToolCaches: { type: "workspace_volume", env: cacheEnv } },
+      runtime: { sessionParams: before.result.sessionParams },
+    });
+    expect(after.sessionInputs[0]?.resumeSessionId).toBe(before.result.sessionId);
+    expect((after.sessionInputs[0]?.sessionOptions as { env: Record<string, string> }).env).toMatchObject(cacheEnv);
+    expect(after.result.sessionId).toBe(before.result.sessionId);
     expect(after.result.sessionParams?.configFingerprint).toBe(before.result.sessionParams?.configFingerprint);
     // An operator value for the same key is still an adapter setting.
     const operator = await runExecutor({ ...config, env: { FOO: "bar", ...cacheEnv, npm_config_cache: "/scratch" } },

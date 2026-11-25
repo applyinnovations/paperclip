@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { sanitizeRemoteExecutionEnv } from "@paperclipai/adapter-utils/remote-execution-env";
-import { buildSandboxToolCacheEnv, prepareSandboxToolCaches } from "./sandbox-tool-caches.js";
+import { buildSandboxToolCacheEnv, isSandboxToolCachePath, prepareSandboxToolCaches } from "./sandbox-tool-caches.js";
 
 const remoteCwd = "/workspace/paperclip-workspace";
 const cacheRoot = `${remoteCwd}/.paperclip-runtime/cache`;
@@ -158,5 +158,15 @@ describe("prepareSandboxToolCaches", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("recognizes only paths inside the workspace cache root as target-owned", () => {
+    expect(isSandboxToolCachePath(remoteCwd, expectedEnv.XDG_CACHE_HOME)).toBe(true);
+    expect(isSandboxToolCachePath(remoteCwd, cacheRoot)).toBe(true);
+    expect(isSandboxToolCachePath(remoteCwd, "/home/paperclip/.cache")).toBe(false);
+    expect(isSandboxToolCachePath(remoteCwd, `${cacheRoot}-other/xdg`)).toBe(false);
+    expect(isSandboxToolCachePath(remoteCwd, `${cacheRoot}/../../../etc`)).toBe(false);
+    expect(isSandboxToolCachePath(remoteCwd, ".paperclip-runtime/cache/xdg")).toBe(false);
+    expect(isSandboxToolCachePath(remoteCwd, undefined)).toBe(false);
   });
 });
