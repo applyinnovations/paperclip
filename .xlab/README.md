@@ -52,6 +52,9 @@ still "Not yet offered" when the change merges is a follow-up to offer it.
    In Tekton, `ci.sh` first makes the nixos/nix image look like upstream's
    Ubuntu runner (FHS loader, the toolchain in `/usr/bin`, an unprivileged
    test user under a child reaper) rather than editing upstream's tests.
+   The tests also run without the Nix shell's build variables, and the
+   `test-env` step fails if one comes back that the run-failure redactor
+   would mask in a test stack (`test-env-guard.mjs`).
    When a test fails only in our CI, fix that environment first.
 3. Add or update the change's row in [PATCHES.md](PATCHES.md).
    `tekton-xlab / fork-guard-` (below) fails a PR that changes anything
