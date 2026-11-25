@@ -680,6 +680,15 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
    * lifetime.
    */
   requestedExpiresAt?: string | null;
+  /**
+   * True when the host queues the run and tries again once capacity frees.
+   * A provider that sees its sandbox refused for capacity (a full quota, or no
+   * node with room) should then release what it created and throw
+   * `PluginEnvironmentCapacityUnavailableError` at once, rather than holding the
+   * call open until capacity returns. When omitted, the provider may wait for
+   * capacity within its own start-up budget.
+   */
+  hostQueuesOnCapacity?: boolean;
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {

@@ -36,6 +36,11 @@ export const kubernetesProviderConfigSchema = z
      * How long acquiring a Sandbox lease waits for its pod to become Ready
      * (scheduling, image pull, container start). Kept apart from command
      * timeouts so a cold start never fails the first command.
+     *
+     * The host waits 600 s for acquireLease by default (the manifest's
+     * defaultAcquireTimeoutMs); above ~540 s, also raise the environment's
+     * `timeoutMs`. A pod refused for a reason that cannot clear (LimitRange,
+     * image pull, container config) fails the wait at once with that cause.
      */
     podStartTimeoutSec: z.number().int().positive().default(300),
 
