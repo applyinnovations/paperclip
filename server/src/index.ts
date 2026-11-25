@@ -132,6 +132,7 @@ import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { processMetricsConfigFromEnv, startProcessMetricsServer } from "./process-metrics.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -288,6 +289,29 @@ function initializeRuntimeConfigConsumers(config: ReturnType<typeof loadConfig>)
   }
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = config.secretsMasterKeyFilePath;
+  }
+}
+
+/**
+ * Starts the opt-in `/metrics` listener when `PAPERCLIP_METRICS_PORT` is set.
+ * A bad port or a bind failure is logged and the server keeps starting:
+ * metrics are for diagnosis and must not take the server down.
+ */
+async function startConfiguredProcessMetrics(
+  pluginWorkerManager: ReturnType<typeof createPluginWorkerManager>,
+): Promise<void> {
+  try {
+    const config = processMetricsConfigFromEnv();
+    if (!config) return;
+    await startProcessMetricsServer({
+      config,
+      sources: {
+        pluginWorkers: () => pluginWorkerManager.diagnostics().map(({ pluginId, pid }) => ({ pluginId, pid })),
+      },
+    });
+    logger.info({ host: config.host, port: config.port }, "process metrics listening on /metrics");
+  } catch (error) {
+    logger.error({ err: error }, "process metrics listener failed to start; continuing without it");
   }
 }
 
@@ -965,6 +989,7 @@ async function startServerWithDatabaseTeardown(
     logger,
   });
   const pluginWorkerManager = createPluginWorkerManager();
+  await startConfiguredProcessMetrics(pluginWorkerManager);
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;

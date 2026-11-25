@@ -2549,6 +2549,19 @@ Environment overrides:
 
 Structured `workspace_git_scan` logs expose the operation name, a non-reversible workspace-path hash, queue and execution durations, active/queued counts, cache and single-flight use, and terminal outcome. Saturation and timeout warnings are rate-limited so an overload does not create a second logging storm.
 
+### Sandbox transfers and process metrics
+
+Native sandbox file transfers (`syncIn`/`syncOut`, used by workspace restore and sync) run through a process-wide FIFO limiter. A transfer over the cap waits for a slot instead of failing.
+
+- `PAPERCLIP_SANDBOX_TRANSFER_CONCURRENCY` (default `4`, range `1`–`64`)
+
+Set `PAPERCLIP_METRICS_PORT` to serve Prometheus metrics at `GET /metrics` on a separate listener. `PAPERCLIP_METRICS_HOST` sets the bind address (default `0.0.0.0`). With the port unset, nothing listens. The endpoint has no auth, so expose it only on the pod network, never through the app's ingress. It exports:
+
+- Node default metrics: `process_resident_memory_bytes`, `nodejs_heap_size_used_bytes`, `nodejs_heap_size_total_bytes`, `nodejs_external_memory_bytes`, `nodejs_eventloop_lag_seconds`, GC and handle counts
+- `nodejs_array_buffers_bytes`: memory held by `ArrayBuffer`s and `Buffer`s
+- `paperclip_plugin_worker_resident_memory_bytes{plugin_id}`: RSS of each plugin worker child process, read from `/proc` on Linux. Sandbox providers run transfers in these workers, so this memory counts toward the container but not toward the server's own RSS.
+- `paperclip_sandbox_transfers_active`, `paperclip_sandbox_transfers_queued`, `paperclip_sandbox_transfers_limit`
+
 ## Worktree-local Instances
 
 When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.
