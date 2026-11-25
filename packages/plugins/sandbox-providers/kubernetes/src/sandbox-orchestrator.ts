@@ -1,4 +1,5 @@
 import type { KubeClients } from "./kube-client.js";
+import type { SandboxStartDiagnosis } from "./sandbox-start-diagnosis.js";
 
 export interface SandboxStatus {
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
@@ -50,12 +51,22 @@ export interface SandboxOrchestrator {
   /** Tear down the sandbox. Implementations MUST cascade-delete child resources. */
   release(clients: KubeClients, namespace: string, name: string): Promise<void>;
 
-  /** Block until phase is Succeeded or Failed, or throw on timeout. */
+  /**
+   * Block until phase is Succeeded or Failed, or throw on timeout. The
+   * diagnosis options are honoured by the sandbox-cr backend only; see
+   * waitForSandboxReady.
+   */
   waitForCompletion(
     clients: KubeClients,
     namespace: string,
     name: string,
-    opts: { timeoutMs: number; pollMs?: number },
+    opts: {
+      timeoutMs: number;
+      pollMs?: number;
+      diagnose?: () => Promise<SandboxStartDiagnosis>;
+      diagnoseEveryMs?: number;
+      failFastOnCapacity?: boolean;
+    },
   ): Promise<SandboxStatus>;
 
   // Optional warm-pool / Kata-FC extension slots. Job-backed implementation

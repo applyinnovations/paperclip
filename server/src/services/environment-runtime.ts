@@ -1932,6 +1932,10 @@ function createSandboxEnvironmentDriver(
                 // opencode image and the harness binary is missing at exec time).
                 adapterType: input.adapterType ?? undefined,
                 ...(input.resolveSnapshotIdentity ? { resolveSnapshotIdentity: true } : {}),
+                // A heartbeat run that is refused for capacity is queued by the
+                // host (APP-114), so the provider should say so at once rather
+                // than hold the call open. Ad-hoc test leases have no queue.
+                ...(input.heartbeatRunId !== null ? { hostQueuesOnCapacity: true } : {}),
                 // Forward a caller deadline so the provider configures a provider-side
                 // expiry at or before it and returns the real provider expiry.
                 ...(requestedExpiresAtParam(input.requestedExpiresAt) !== undefined

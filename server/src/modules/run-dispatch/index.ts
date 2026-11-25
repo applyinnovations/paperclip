@@ -15,6 +15,11 @@ export {
   AI_CONNECTION_BUSY_RETRY_REASON,
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   RUNNER_REVISION_WAIT_RETRY_REASON,
+  ENVIRONMENT_CAPACITY_WAIT_RETRY_REASON,
+  ENVIRONMENT_CAPACITY_RECHECK_MS,
+  ENVIRONMENT_CAPACITY_WAIT_KEY,
+  environmentCapacityWaitKey,
+  readEnvironmentCapacityWait,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
@@ -56,6 +61,8 @@ export { RunDispatchApplicationError } from "./application/types.js";
 
 export type { WorkspaceBusyWait } from "./domain/wake-context.js";
 export { wakeWorkspaceBusyWaitersInTx } from "./adapters/workspace-busy-wait.js";
+export type { EnvironmentCapacityWait } from "./domain/wake-context.js";
+export { hasEarlierEnvironmentCapacityWaiter, wakeNextEnvironmentCapacityWaiter } from "./adapters/environment-capacity-wait.js";
 
 export type RunDispatchDeps = {
   /** Overrides the Postgres adapter; a test builds its module against a fake instead. */

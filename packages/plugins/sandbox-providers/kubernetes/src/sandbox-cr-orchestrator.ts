@@ -21,7 +21,9 @@
  * should use execInPod() and capture its stdout/stderr directly.
  */
 
+import { PluginEnvironmentCapacityUnavailableError } from "@paperclipai/plugin-sdk";
 import type { KubeClients } from "./kube-client.js";
+import type { SandboxStartDiagnosis } from "./sandbox-start-diagnosis.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
@@ -35,6 +37,35 @@ export class SandboxCrTimeoutError extends Error {
     );
     this.name = "SandboxCrTimeoutError";
   }
+}
+
+/**
+ * The Sandbox cannot start for a reason waiting will not fix (a LimitRange
+ * rejection, an image that cannot be pulled). The message names that cause.
+ */
+export class SandboxStartRefusedError extends Error {
+  constructor(namespace: string, name: string, cause: string) {
+    super(`Sandbox ${namespace}/${name} cannot start: ${cause}`);
+    this.name = "SandboxStartRefusedError";
+  }
+}
+
+export interface WaitForSandboxReadyOptions {
+  timeoutMs: number;
+  pollMs?: number;
+  /**
+   * Reports why a still-pending Sandbox is not Ready. When given, a permanent
+   * cause fails the wait at once, and a wait that ends at the deadline while
+   * capacity is short fails with a capacity error instead of a bare timeout.
+   */
+  diagnose?: () => Promise<SandboxStartDiagnosis>;
+  /** How often to diagnose a pending Sandbox (default 5 s). */
+  diagnoseEveryMs?: number;
+  /**
+   * Fail with a capacity error as soon as capacity is seen to be short, for a
+   * host that queues the run and tries again itself.
+   */
+  failFastOnCapacity?: boolean;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -255,18 +286,32 @@ export async function deleteSandboxCr(
  *
  * Throws SandboxCrTimeoutError if Ready is not reached within timeoutMs.
  * Throws if the Sandbox transitions to Failed.
+ * With `diagnose`: throws SandboxStartRefusedError as soon as a permanent cause
+ * is seen, and PluginEnvironmentCapacityUnavailableError when capacity is short
+ * at the deadline (or at once with `failFastOnCapacity`).
  */
 export async function waitForSandboxReady(
   clients: KubeClients,
   namespace: string,
   name: string,
-  opts: { timeoutMs: number; pollMs?: number } = {
+  opts: WaitForSandboxReadyOptions = {
     timeoutMs: 120_000,
     pollMs: 2000,
   },
 ): Promise<SandboxStatus> {
-  const deadline = Date.now() + opts.timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + opts.timeoutMs;
   const pollMs = opts.pollMs ?? 2000;
+  const diagnoseEveryMs = opts.diagnoseEveryMs ?? 5000;
+  let nextDiagnosisAt = startedAt + diagnoseEveryMs;
+  let lastDiagnosis: SandboxStartDiagnosis = { kind: "pending" };
+
+  const capacityError = (diagnosis: Extract<SandboxStartDiagnosis, { kind: "capacity" }>, cause?: unknown) =>
+    new PluginEnvironmentCapacityUnavailableError(
+      diagnosis.reason,
+      `Sandbox ${namespace}/${name} has no capacity to start after ${Date.now() - startedAt}ms: ${diagnosis.message}`,
+      cause ? { cause } : undefined,
+    );
 
   while (Date.now() < deadline) {
     const cr = await clients.custom.getNamespacedCustomObject({
@@ -296,11 +341,23 @@ export async function waitForSandboxReady(
         `Sandbox ${namespace}/${name} is Terminating — cannot wait for Ready`,
       );
     }
-    // Pending — keep polling
+    // Pending — say why, now and then, and stop early when waiting cannot help.
+    if (opts.diagnose && Date.now() >= nextDiagnosisAt) {
+      nextDiagnosisAt = Date.now() + diagnoseEveryMs;
+      lastDiagnosis = await opts.diagnose();
+      if (lastDiagnosis.kind === "permanent") {
+        throw new SandboxStartRefusedError(namespace, name, lastDiagnosis.message);
+      }
+      if (lastDiagnosis.kind === "capacity" && opts.failFastOnCapacity) {
+        throw capacityError(lastDiagnosis);
+      }
+    }
     await sleep(pollMs);
   }
 
-  throw new SandboxCrTimeoutError(namespace, name, opts.timeoutMs);
+  const timeout = new SandboxCrTimeoutError(namespace, name, opts.timeoutMs);
+  if (lastDiagnosis.kind === "capacity") throw capacityError(lastDiagnosis, timeout);
+  throw timeout;
 }
 
 /**

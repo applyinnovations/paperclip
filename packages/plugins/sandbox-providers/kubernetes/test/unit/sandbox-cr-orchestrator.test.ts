@@ -5,8 +5,10 @@ import {
   getSandboxCrStatus,
   findPodForSandbox,
   SandboxCrTimeoutError,
+  SandboxStartRefusedError,
   waitForSandboxReady,
 } from "../../src/sandbox-cr-orchestrator.js";
+import { PluginEnvironmentCapacityUnavailableError } from "@paperclipai/plugin-sdk";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
 const SANDBOX_VERSION = "v1beta1";
@@ -266,5 +268,66 @@ describe("waitForSandboxReady", () => {
         pollMs: 10,
       }),
     ).rejects.toThrow(/failed.*OOMKilled/i);
+  });
+});
+
+describe("waitForSandboxReady with a start diagnosis", () => {
+  const pending = () => ({ custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(makeCr("Pending")) } });
+
+  it("fails at once with the cause when the pod can never start", async () => {
+    const diagnose = vi.fn().mockResolvedValue({
+      kind: "permanent",
+      message: "the pod was refused at admission: maximum cpu usage per Container is 2, but limit is 4",
+    });
+    const error = await waitForSandboxReady(pending() as never, "ns", "pc-abc", {
+      timeoutMs: 60_000, pollMs: 1, diagnose, diagnoseEveryMs: 0,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SandboxStartRefusedError);
+    expect((error as Error).message).toBe(
+      "Sandbox ns/pc-abc cannot start: the pod was refused at admission: maximum cpu usage per Container is 2, but limit is 4",
+    );
+    expect(diagnose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps waiting through a capacity shortage and starts once it clears", async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce(makeCr("Pending"))
+      .mockResolvedValueOnce(makeCr("Pending"))
+      .mockResolvedValueOnce(makeCr("Ready"));
+    const diagnose = vi.fn().mockResolvedValue({ kind: "capacity", reason: "quota", message: "tenant quota is full" });
+    const status = await waitForSandboxReady({ custom: { getNamespacedCustomObject: get } } as never, "ns", "pc-abc", {
+      timeoutMs: 60_000, pollMs: 1, diagnose, diagnoseEveryMs: 0,
+    });
+    expect(status.phase).toBe("Running");
+    expect(diagnose).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports capacity, not a bare timeout, when the deadline passes while capacity is short", async () => {
+    const diagnose = vi.fn().mockResolvedValue({ kind: "capacity", reason: "quota", message: "tenant quota is full" });
+    const error = await waitForSandboxReady(pending() as never, "ns", "pc-abc", {
+      timeoutMs: 30, pollMs: 1, diagnose, diagnoseEveryMs: 0,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PluginEnvironmentCapacityUnavailableError);
+    expect((error as PluginEnvironmentCapacityUnavailableError).capacityUnavailable).toBe("quota");
+    expect((error as Error).message).toMatch(/^Sandbox ns\/pc-abc has no capacity to start after \d+ms: tenant quota is full$/);
+    expect((error as Error).cause).toBeInstanceOf(SandboxCrTimeoutError);
+  });
+
+  it("fails at once on capacity for a host that queues the run itself", async () => {
+    const diagnose = vi.fn().mockResolvedValue({ kind: "capacity", reason: "scheduling", message: "no node can take the pod" });
+    const error = await waitForSandboxReady(pending() as never, "ns", "pc-abc", {
+      timeoutMs: 60_000, pollMs: 1, diagnose, diagnoseEveryMs: 0, failFastOnCapacity: true,
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PluginEnvironmentCapacityUnavailableError);
+    expect((error as PluginEnvironmentCapacityUnavailableError).capacityUnavailable).toBe("scheduling");
+    expect(diagnose).toHaveBeenCalledTimes(1);
+  });
+
+  it("still times out plainly when nothing is wrong, and diagnoses on its interval only", async () => {
+    const diagnose = vi.fn().mockResolvedValue({ kind: "pending" });
+    await expect(waitForSandboxReady(pending() as never, "ns", "pc-abc", {
+      timeoutMs: 40, pollMs: 5, diagnose, diagnoseEveryMs: 60_000,
+    })).rejects.toBeInstanceOf(SandboxCrTimeoutError);
+    expect(diagnose).not.toHaveBeenCalled();
   });
 });

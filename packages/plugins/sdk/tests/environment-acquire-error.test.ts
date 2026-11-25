@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { definePlugin } from "../src/define-plugin.js";
-import { readEnvironmentAcquireErrorDiagnostic } from "../src/environment-acquire-error.js";
+import { PluginEnvironmentCapacityUnavailableError, readEnvironmentAcquireErrorDiagnostic } from "../src/environment-acquire-error.js";
 import { PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "../src/environment-creation-cleanup.js";
 import { createRequest, isJsonRpcResponse, JsonRpcCallError, parseMessage, serializeMessage, type JsonRpcResponse } from "../src/protocol.js";
 import { startWorkerRpcHost } from "../src/worker-rpc-host.js";
@@ -67,5 +67,31 @@ describe("environment acquisition refusal diagnostics", () => {
     expect(readEnvironmentAcquireErrorDiagnostic(forged({ schema: "other", providerDiagnostic: { httpStatus: 502 } }))).toBeNull();
     expect(readEnvironmentAcquireErrorDiagnostic(forged({ schema: "paperclip/environment-acquire-error/v1",
       providerDiagnostic: { httpStatus: 9000, errorCode: "EVIL" } }))).toBeNull();
+  });
+});
+
+describe("environment acquisition capacity refusals", () => {
+  it("carries the capacity reason across the real acquire RPC, with no transient status", async () => {
+    const refusal = new PluginEnvironmentCapacityUnavailableError("quota",
+      "Sandbox pc-1 could not start: tenant quota is full (exceeded quota: paperclip-quota)",
+      { cause: Object.assign(new Error("forbidden"), { statusCode: 403 }) });
+    const callError = await acquire(refusal);
+    expect(readEnvironmentAcquireErrorDiagnostic(callError)).toEqual({ capacityUnavailable: "quota" });
+    expect(callError.message).toContain("tenant quota is full");
+  });
+
+  it("finds the reason on a cause and keeps the cleanup envelope", async () => {
+    const createError = new Error("wrapped", { cause: new PluginEnvironmentCapacityUnavailableError("scheduling", "no node") });
+    const callError = await acquire(new PluginEnvironmentCreationCleanupError([createError, new Error("lookup")],
+      "creation failed; cleanup could not be confirmed", cleanup));
+    expect(readEnvironmentAcquireErrorDiagnostic(callError)).toEqual({ capacityUnavailable: "scheduling" });
+    expect(readEnvironmentCreationCleanupError(callError)).toMatchObject({ providerLeaseId: cleanup.providerLeaseId });
+  });
+
+  it("drops an unknown capacity reason", () => {
+    const forged = Object.assign(new Error("x"), {
+      data: { schema: "paperclip/environment-acquire-error/v1", capacityUnavailable: "disk" },
+    });
+    expect(readEnvironmentAcquireErrorDiagnostic(forged)).toBeNull();
   });
 });

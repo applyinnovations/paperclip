@@ -23,6 +23,8 @@ import { and, eq } from "drizzle-orm";
 import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import { remoteRecoveryLeaseMismatch, type RemoteRecoveryLeaseMismatchField } from "./native-runtime/remote-recovery-lease-mismatch.js";
 import { EnvironmentProviderUnavailableError, readTransientEnvironmentProviderFailure } from "./environment-provider-unavailable-error.js";
+import { EnvironmentCapacityUnavailableError, readEnvironmentCapacityReason } from "./environment-capacity-unavailable-error.js";
+import { hasEarlierEnvironmentCapacityWaiter, wakeNextEnvironmentCapacityWaiter } from "../modules/run-dispatch/index.js";
 import { findReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { findPluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import type {
@@ -232,6 +234,21 @@ export function environmentRunOrchestrator(
     try {
       return await environmentRuntime.acquireRunLease(input);
     } catch (err) {
+      // A full quota or node is not a failure: the run waits for capacity
+      // without spending the transient-retry budget (APP-114).
+      const capacity = findReusableSandboxResumeError(err) ? null : readEnvironmentCapacityReason(err);
+      if (capacity) {
+        throw new EnvironmentRunError(
+          "lease_acquire_failed",
+          `Failed to acquire lease for environment "${input.environment.name}" (${input.environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+          {
+            environmentId: input.environment.id,
+            driver: input.environment.driver,
+            cause: new EnvironmentCapacityUnavailableError({ environmentId: input.environment.id,
+              environmentName: input.environment.name, reason: capacity, cause: err }),
+          },
+        );
+      }
       // A transient provider refusal (HTTP 5xx/429/timeout) is retried by the
       // setup path with its bounded bootstrap budget. Saved-sandbox resume and
       // stopped-worker refusals keep their own, more specific classifications.
@@ -402,7 +419,25 @@ export function environmentRunOrchestrator(
       }
       leaseRecord = { environment, lease, leaseContext: buildEnvironmentLeaseContext(input) };
     } else {
+      // Older runs of this company waiting for room in this environment go
+      // first; this run joins the back of the queue without asking the provider.
+      if (await hasEarlierEnvironmentCapacityWaiter(db, {
+        companyId: input.companyId, environmentId: environment.id, runId: input.heartbeatRunId,
+      })) {
+        throw new EnvironmentRunError(
+          "lease_acquire_failed",
+          `Environment "${environment.name}" (${environment.driver}) has older runs waiting for capacity`,
+          {
+            environmentId: environment.id,
+            driver: environment.driver,
+            cause: new EnvironmentCapacityUnavailableError({ environmentId: environment.id,
+              environmentName: environment.name, reason: "queued" }),
+          },
+        );
+      }
       leaseRecord = await acquireLease(acquisitionInput);
+      // There was room for this run; the next waiter may fit too.
+      wakeEnvironmentCapacityWaiter(input.companyId, environment.id);
     }
 
     // Step 3: Log lease acquisition activity
@@ -846,9 +881,22 @@ export function environmentRunOrchestrator(
         // Activity logging failure should not block lease release
       }
       result.released.push(released);
+      // Each released lease frees one slot in its environment.
+      if (released.lease.status === "released" || released.lease.status === "expired" || released.lease.status === "failed") {
+        wakeEnvironmentCapacityWaiter(input.companyId, released.environment.id);
+      }
     }
 
     return result;
+  }
+
+  /**
+   * Wake the next run waiting for room in this environment. Best effort: a
+   * missed wake is covered by the waiter's own re-check timer.
+   */
+  function wakeEnvironmentCapacityWaiter(companyId: string, environmentId: string) {
+    void wakeNextEnvironmentCapacityWaiter(db, { companyId, environmentId }).catch((error: unknown) =>
+      logger.warn({ err: error, companyId, environmentId }, "failed to wake the next environment capacity waiter"));
   }
 
   return {

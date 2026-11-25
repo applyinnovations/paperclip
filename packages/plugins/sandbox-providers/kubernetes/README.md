@@ -74,8 +74,18 @@ Common optional fields:
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
 | `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. On `sandbox-cr` this sets the Sandbox `shutdownTime`; a caller's earlier deadline (a sign-in lease) shortens it. |
+| `podStartTimeoutSec` | `300` | How long acquiring a `sandbox-cr` lease waits for the Sandbox pod to be Ready. The server waits 600 s for the acquire by default; above ~540 s, also raise the environment's `timeoutMs`. |
 
 Full JSON Schema in `src/manifest.ts`.
+
+### Waiting for a Sandbox to start
+
+While a `sandbox-cr` lease waits for Ready, the plugin checks every 5 s why the Sandbox is still pending, and releases it when the wait ends without a pod:
+
+- **Cannot start** (fails at once, with the cause as the error): the pod create was refused at admission for a reason other than quota, for example a LimitRange (`maximum cpu usage per Container is 2, but limit is 4`), or a container waits on `ImagePullBackOff`, `ErrImageNeverPull`, `InvalidImageName` or `CreateContainerConfigError`.
+- **No capacity**: the tenant ResourceQuota refused the pod (`exceeded quota`), or the pod is `Unschedulable`. The plugin keeps waiting within `podStartTimeoutSec`. If the deadline passes, it fails with `PluginEnvironmentCapacityUnavailableError` (`capacityUnavailable: "quota" | "scheduling"`), not a bare timeout. A server that sends `hostQueuesOnCapacity: true` queues the run itself, and the plugin then fails with that error as soon as it sees the shortage.
+
+A refused pod create appears only as a Warning Event on the Sandbox, so the identity the plugin runs as needs `list` on `events` in the tenant namespaces. Without it, the plugin cannot tell why a Sandbox has no pod and waits until the deadline as before.
 
 ### Task-scoped egress grants
 
