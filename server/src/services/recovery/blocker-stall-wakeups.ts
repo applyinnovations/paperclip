@@ -19,13 +19,29 @@
  * one `blocks`) is woken once per stall. The idempotency key names the
  * recovery action, so a repeated sweep never wakes twice, and a later stall
  * (a new action after a Retry or another failure) wakes again.
+ *
+ * A wake that did not reach the agent is retried, boundedly. A refusal
+ * (wake-on-demand off, agent paused) is retried after ten minutes, doubling per
+ * refusal up to MAX_WAKE_RETRY_MS. A stall whose runs failed (the keyed wake's
+ * run or a resource-wait retry carrying it) is retried with a doubling wait and
+ * given up after MAX_FAILED_STALL_DELIVERIES failed runs; the stall stays listed
+ * on the waiter's page. A run that failed setup on a broken workspace
+ * (isNonTransientSetupFailure) ends the retries at once. Both counts apply to
+ * the waiter state the wakes were made in: a change of the waiter's status,
+ * assignee or execution workspace starts them again (fork, APP-145). A waiter whose last
+ * run failed setup on its bound remote workspace's hold is not woken again while
+ * reservation would still refuse that hold (remoteWorkspaceHoldRefusesStart):
+ * its run could only fail the same way. It is woken once the hold settles.
  */
-import { and, eq, gt, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
-import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
-import { ISSUE_BLOCKER_STALLED_WAKE_REASON, type IssueBlockerStalledWakeContext, type IssueBlockerStallRelation } from "@paperclipai/shared";
+import { and, desc, eq, gt, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { agents, agentWakeupRequests, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { ISSUE_BLOCKER_STALLED_WAKE_REASON, readRemoteWorkspaceAuthority, type IssueBlockerStalledWakeContext,
+  type IssueBlockerStallRelation } from "@paperclipai/shared";
 import { logActivity } from "../activity-log.js";
 import { parseHeartbeatPolicy } from "../heartbeat/timer-policy.js";
 import { authorizationService } from "../authorization.js";
+import { readRemoteWorkspaceWriterHold, REMOTE_WORKSPACE_WRITER_PENDING_MESSAGE,
+  remoteWorkspaceHoldRefusesStart } from "../remote-workspace-writer-hold.js";
 
 const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
 /** Waiters that may be woken: not finished, and not parked in the backlog by the board. */
@@ -41,6 +57,42 @@ const waiterCursors = new Map<string, string>();
 const DELIVERING_RUN_STATUSES = ["queued", "scheduled_retry", "running", "succeeded"];
 /** A refused wake (skipped, failed, cancelled) is retried, but not more often than this. */
 const REFUSED_WAKE_RETRY_MS = 10 * 60_000;
+/** Failed runs of one stall's wake before it is no longer retried; each retry waits twice as long. */
+const MAX_FAILED_STALL_DELIVERIES = 3;
+/** Longest wait between retries of one stall's wake, however often it was refused or failed. */
+const MAX_WAKE_RETRY_MS = 4 * 60 * 60_000;
+/** The wait before the next attempt after `attempts` refused or failed ones: 10 min, doubling, capped. */
+function wakeRetryDelayMs(attempts: number) {
+  return Math.min(REFUSED_WAKE_RETRY_MS * 2 ** Math.max(0, attempts - 1), MAX_WAKE_RETRY_MS);
+}
+/**
+ * Setup failures that a retry cannot fix: the waiter's workspace fails
+ * validation, or its worktree path is broken. A retry of the same stall in the
+ * same waiter state could only fail the same way (APP-138: 59 failed runs in
+ * ten hours), so such a stall is not retried until the waiter's state changes.
+ */
+const NON_TRANSIENT_SETUP_ERROR_CODES = ["workspace_validation_failed"];
+const NON_TRANSIENT_SETUP_FAILED_MESSAGES = ["not a reusable git worktree", "is not reusable"];
+export function isNonTransientSetupFailure(run: { errorCode: string | null; error: string | null }) {
+  if (run.errorCode && NON_TRANSIENT_SETUP_ERROR_CODES.includes(run.errorCode)) return true;
+  return run.errorCode === "setup_failed" && NON_TRANSIENT_SETUP_FAILED_MESSAGES.some(text => run.error?.includes(text));
+}
+/**
+ * The waiter state a stall wake was made in, stored in its run context. Failed
+ * runs count against a stall only while the waiter is still in that state: a
+ * new status, assignee or workspace binding starts the count again.
+ */
+type WaiterState = { status: string; assigneeAgentId: string | null; executionWorkspaceId: string | null };
+const WAITER_STATE_CONTEXT_KEY = "blockerStallWaiterState";
+/**
+ * Wakes skipped before any row was written (the agent takes no wakes), keyed by
+ * idempotency key: they back off like refusals, in memory, since there is no row
+ * to count. Entries end when the wake is sent or the stall is gone.
+ */
+const skippedWakes = new Map<string, { attempts: number; dueAt: number }>();
+const SKIPPED_WAKE_FORGET_MS = 2 * MAX_WAKE_RETRY_MS;
+/** Re-check for a waiter whose workspace hold refuses a run; settling the hold is what lets it run. */
+const HELD_WORKSPACE_RECHECK_MS = 60 * 60_000;
 const NON_INVOKABLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
 /** Company-wide passes resume after the last stall a capped pass reached, so every stall is visited. */
 const companyCursors = new Map<string, string>();
@@ -115,6 +167,30 @@ async function readStalls(db: Db, filter: StallFilter, limit = MAX_STALLS_PER_PA
 
 type StallRow = Awaited<ReturnType<typeof readStalls>>[number];
 
+/**
+ * Whether a run of the waiter's assignee could only fail setup on its bound
+ * remote workspace's hold. The evidence is the assignee's own latest run on the
+ * task: it failed setup on that hold, so this agent uses the workspace and
+ * reservation already tried, and refused, to release the writer. The hold must
+ * still be one reservation refuses outright (an ended writer past the holder
+ * cutoff with its save unsettled, or a writer that cannot be named). Another
+ * assignee, a later run, or a settled hold lets the wake through.
+ */
+async function waiterWorkspaceRefusesStart(db: Db, companyId: string,
+  waiter: { id: string; assigneeAgentId: string | null; executionWorkspaceId: string | null }) {
+  if (!waiter.executionWorkspaceId || !waiter.assigneeAgentId) return false;
+  const [latest] = await db.select({ status: heartbeatRuns.status, error: heartbeatRuns.error }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, waiter.assigneeAgentId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${waiter.id}`))
+    .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+  if (latest?.status !== "failed" || latest.error !== REMOTE_WORKSPACE_WRITER_PENDING_MESSAGE) return false;
+  const [workspace] = await db.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces)
+    .where(and(eq(executionWorkspaces.companyId, companyId), eq(executionWorkspaces.id, waiter.executionWorkspaceId)));
+  const authority = readRemoteWorkspaceAuthority(workspace?.metadata);
+  if (!authority?.writerRunId) return false;
+  return remoteWorkspaceHoldRefusesStart(await readRemoteWorkspaceWriterHold(db, { companyId, authority }));
+}
+
 /** What a waiter's agent may see of a stalled issue it cannot read: that it is stalled, nothing more. */
 function redactedStallContext(stall: StallRow, relation: IssueBlockerStallRelation): IssueBlockerStalledWakeContext {
   return {
@@ -157,6 +233,7 @@ export async function wakeWaitersOfStalledIssues(db: Db, enqueueWakeup: BlockerS
   const result = { stalls: 0, woken: 0, alreadyWoken: 0, deferred: 0, failed: 0, retryAt: null as number | null };
   const retryAt = (at: number) => { result.retryAt = result.retryAt === null ? at : Math.min(result.retryAt, at); };
   const maxStalls = opts.maxStalls ?? MAX_STALLS_PER_PASS;
+  for (const [key, entry] of skippedWakes) if (entry.dueAt + SKIPPED_WAKE_FORGET_MS < Date.now()) skippedWakes.delete(key);
   let stalled: StallRow[];
   if (opts.issueId) {
     // The per-issue sweep checks the issue itself and its own children and
@@ -200,7 +277,7 @@ export async function wakeWaitersOfStalledIssues(db: Db, enqueueWakeup: BlockerS
     let scanned = 0;
     for (;;) {
       const waiters = await db.select({ id: issues.id, identifier: issues.identifier, assigneeAgentId: issues.assigneeAgentId,
-        status: issues.status, responsibleUserId: issues.responsibleUserId,
+        status: issues.status, responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
         relation: sql<"child" | "blocker">`case when ${issues.id} = ${stall.parentId ?? null} then 'child' else 'blocker' end` })
         .from(issues)
         .where(and(
@@ -227,20 +304,56 @@ export async function wakeWaitersOfStalledIssues(db: Db, enqueueWakeup: BlockerS
         // (company_id, payload->>'issueId') is indexed; the key narrows to this stall.
         // A delivered or pending wake ends it. A refused one (wake-on-demand off,
         // agent paused) is retried once the refusal is old, so re-enabling wakes
-        // still delivers the stall.
-        const [existing] = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status,
-          requestedAt: agentWakeupRequests.requestedAt }).from(agentWakeupRequests)
+        // still delivers the stall. Failed runs carrying this stall (the keyed
+        // wake's run, or a resource-wait retry that keeps its context) are
+        // retried after a doubling wait, and not after MAX_FAILED_STALL_DELIVERIES.
+        // Refusals and failed runs count against a stall only in the waiter state
+        // they were made in: a new status, assignee or workspace starts again.
+        const waiterState: WaiterState = { status: waiter.status, assigneeAgentId: waiter.assigneeAgentId,
+          executionWorkspaceId: waiter.executionWorkspaceId };
+        const sameWaiterState = (column: typeof heartbeatRuns.contextSnapshot | typeof agentWakeupRequests.payload) =>
+          and(...(["status", "assigneeAgentId", "executionWorkspaceId"] as const).map(field =>
+            sql`(${column}->${sql.raw(`'${WAITER_STATE_CONTEXT_KEY}'`)} is null
+              or ${column}#>>${sql.raw(`'{${WAITER_STATE_CONTEXT_KEY},${field}}'`)} is not distinct from ${waiterState[field]}::text)`));
+        const [prior] = await db.select({
+          delivered: sql<boolean>`coalesce(bool_or(${inArray(agentWakeupRequests.status, DELIVERED_OR_PENDING_WAKE_STATUSES)}), false)`,
+          refused: sql<number>`count(*) filter (where ${sameWaiterState(agentWakeupRequests.payload)})::int`,
+          lastRequestedAt: sql<string | null>`max(${agentWakeupRequests.requestedAt})`,
+        }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.companyId, stall.companyId),
             sql`${agentWakeupRequests.payload}->>'issueId' = ${waiter.id}`,
-            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-            or(inArray(agentWakeupRequests.status, DELIVERED_OR_PENDING_WAKE_STATUSES),
-              gt(agentWakeupRequests.requestedAt, new Date(Date.now() - REFUSED_WAKE_RETRY_MS))))).limit(1);
-        if (existing) {
-          result.alreadyWoken += 1;
-          // A recent refusal is retried once it is old; the worker comes back then.
-          if (!(DELIVERED_OR_PENDING_WAKE_STATUSES as readonly string[]).includes(existing.status))
-            retryAt(existing.requestedAt.getTime() + REFUSED_WAKE_RETRY_MS);
-          continue;
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey)));
+        if (prior?.delivered) { result.alreadyWoken += 1; skippedWakes.delete(idempotencyKey); continue; }
+        // Failed runs of this stall made in the waiter's current state (runs
+        // from before the state was recorded count as the current state).
+        const failedRunsOfStall = and(eq(heartbeatRuns.companyId, stall.companyId), eq(heartbeatRuns.status, "failed"),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${waiter.id}`,
+          sql`${heartbeatRuns.contextSnapshot}#>>'{blockerStall,stalledIssueId}' = ${stall.issueId}`,
+          sql`${heartbeatRuns.contextSnapshot}#>>'{blockerStall,recoveryAction,id}' = ${stall.actionId}`, sameWaiterState(heartbeatRuns.contextSnapshot));
+        const [failed] = await db.select({
+          runs: sql<number>`count(*)::int`,
+          lastAt: sql<string | null>`max(coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}))`,
+        }).from(heartbeatRuns).where(failedRunsOfStall);
+        const failedRuns = Number(failed?.runs ?? 0);
+        if (failedRuns >= MAX_FAILED_STALL_DELIVERIES) { result.alreadyWoken += 1; continue; }
+        if (failedRuns > 0) {
+          const [lastFailed] = await db.select({ errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
+            .from(heartbeatRuns).where(failedRunsOfStall)
+            .orderBy(desc(sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt})`)).limit(1);
+          // A broken workspace is not retried for this stall until the waiter's state changes.
+          if (lastFailed && isNonTransientSetupFailure(lastFailed)) { result.alreadyWoken += 1; continue; }
+        }
+        const lastAttemptAt = Math.max(prior?.lastRequestedAt ? new Date(prior.lastRequestedAt).getTime() : 0,
+          failed?.lastAt ? new Date(failed.lastAt).getTime() : 0);
+        if (lastAttemptAt > 0) {
+          // Failed runs double the wait (upstream); refusals that started no run
+          // (rows of this key that were not delivered) double it the same way.
+          const dueAt = lastAttemptAt + wakeRetryDelayMs(failedRuns > 0 ? failedRuns : Number(prior?.refused ?? 0));
+          if (dueAt > Date.now()) {
+            result.alreadyWoken += 1;
+            retryAt(dueAt);
+            continue;
+          }
         }
         // A resource wait cancels the stall wake's run and schedules a retry
         // with no idempotency key; the retry keeps the stall in its context.
@@ -251,21 +364,33 @@ export async function wakeWaitersOfStalledIssues(db: Db, enqueueWakeup: BlockerS
             sql`${heartbeatRuns.contextSnapshot}#>>'{blockerStall,stalledIssueId}' = ${stall.issueId}`,
             sql`${heartbeatRuns.contextSnapshot}#>>'{blockerStall,recoveryAction,id}' = ${stall.actionId}`)).limit(1);
         if (carried) { result.alreadyWoken += 1; continue; }
-        if (!(await acceptsWakes(waiter.assigneeAgentId!))) {
+        if (await waiterWorkspaceRefusesStart(db, stall.companyId, waiter)) {
           result.deferred += 1;
-          retryAt(Date.now() + REFUSED_WAKE_RETRY_MS);
+          retryAt(Date.now() + HELD_WORKSPACE_RECHECK_MS);
           continue;
         }
+        if (!(await acceptsWakes(waiter.assigneeAgentId!))) {
+          // No row is written for this refusal, so its back-off is kept in memory.
+          const skipped = skippedWakes.get(idempotencyKey);
+          if (!skipped || skipped.dueAt <= Date.now()) {
+            const attempts = (skipped?.attempts ?? 0) + 1;
+            skippedWakes.set(idempotencyKey, { attempts, dueAt: Date.now() + wakeRetryDelayMs(attempts) });
+          }
+          result.deferred += 1;
+          retryAt(skippedWakes.get(idempotencyKey)!.dueAt);
+          continue;
+        }
+        skippedWakes.delete(idempotencyKey);
         // A private stalled issue's details never reach an agent that cannot read it.
         const readable = await agentCanRead(waiter.assigneeAgentId!, waiter.responsibleUserId, stall);
         const context = readable ? stallContext(stall, waiter.relation) : redactedStallContext(stall, waiter.relation);
         try {
           const wake = await enqueueWakeup(waiter.assigneeAgentId!, {
             source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKER_STALLED_WAKE_REASON,
-            payload: { issueId: waiter.id, ...context }, idempotencyKey,
+            payload: { issueId: waiter.id, ...context, [WAITER_STATE_CONTEXT_KEY]: waiterState }, idempotencyKey,
             requestedByActorType: "system", requestedByActorId: "issue-blocker-stall",
             contextSnapshot: { issueId: waiter.id, taskId: waiter.id, wakeReason: ISSUE_BLOCKER_STALLED_WAKE_REASON,
-              source: "issue.blocker_stalled", blockerStall: context },
+              source: "issue.blocker_stalled", blockerStall: context, [WAITER_STATE_CONTEXT_KEY]: waiterState },
             // One stall per run: coalescing would keep only the last blockerStall
             // context while marking every merged stall as delivered.
             allowRunCoalescing: false,
