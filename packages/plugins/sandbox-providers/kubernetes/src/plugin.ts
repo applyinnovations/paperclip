@@ -45,6 +45,7 @@ import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessi
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
 import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources, isKubeNotFoundError } from "./lease-lifecycle.js";
 import { ACQUIRE_RELEASE_RESERVE_MS, parseAcquireDeadline, SandboxAcquireDeadlineError } from "./acquire-deadline.js";
+import { createQuotaGate, sandboxQuotaDemand } from "./quota.js";
 import { assertCreationCleanupOwnership, createAttemptLabels, inspectCreation } from "./creation-recovery.js";
 import {
   appendNetworkEgressDenyHint,
@@ -612,6 +613,15 @@ const plugin = definePlugin({
           await sandboxCrOrchestrator.waitForCompletion(clients, namespace, jobName, {
             timeoutMs: readyTimeoutMs,
             pollMs: 1000,
+            // A pod the tenant quota refuses never comes; fail now, naming the
+            // quota, instead of at the deadline (APP-233).
+            onPending: createQuotaGate({
+              clients,
+              namespace,
+              sandboxName: jobName,
+              demand: sandboxQuotaDemand(manifest),
+              logger: { warn: (message, meta) => console.warn(`[plugin-kubernetes] ${message}`, meta) },
+            }),
           });
         } catch (readyError) {
           throw readyError instanceof SandboxCrTimeoutError && readyTimeoutMs < startBudgetMs

@@ -1,5 +1,12 @@
 import type { KubeClients } from "./kube-client.js";
 
+/**
+ * A check a readiness wait runs on each poll that finds the workload not yet
+ * Ready; throw to stop waiting. `signal` aborts at the wait's deadline, and the
+ * wait does not wait for the check past it.
+ */
+export type PendingCheck = (ctx: { signal: AbortSignal }) => Promise<void>;
+
 export interface SandboxStatus {
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
   complete: boolean;
@@ -55,7 +62,12 @@ export interface SandboxOrchestrator {
     clients: KubeClients,
     namespace: string,
     name: string,
-    opts: { timeoutMs: number; pollMs?: number },
+    opts: {
+      timeoutMs: number;
+      pollMs?: number;
+      /** Runs on each poll that finds the workload not yet Ready; throw to stop waiting. */
+      onPending?: PendingCheck;
+    },
   ): Promise<SandboxStatus>;
 
   // Optional warm-pool / Kata-FC extension slots. Job-backed implementation
