@@ -680,6 +680,14 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
    * lifetime.
    */
   requestedExpiresAt?: string | null;
+  /**
+   * When the host stops waiting for this call, as an ISO 8601 timestamp. The
+   * host sets it from the RPC timeout it applies to this request. A response
+   * after this time is discarded, so a provider must not leave an allocation
+   * behind after it: stop waiting, delete what this call created, and fail
+   * before the deadline. Absent on older hosts.
+   */
+  acquireDeadlineAt?: string;
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {

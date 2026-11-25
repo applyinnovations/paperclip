@@ -16,9 +16,21 @@ export type SandboxCreationOperation = typeof sandboxCreationOperations.$inferSe
 // materialize an aborted request. Absence is conclusive only after this delay.
 const CREATION_SETTLE_FLOOR_MS = 30 * 60_000;
 
-function creationAbsenceInconclusive(operation: SandboxCreationOperation): boolean {
+// A provider-plugin acquire that failed (its RPC timed out or the provider threw)
+// hands no lease to anyone, so nothing would release a workload it created. The
+// intent is inspected this soon after the failure instead of at its settle
+// deadline: the workload is deleted within minutes rather than holding capacity
+// (a pod-quota slot, for Kubernetes) for the whole settle window.
+export const FAILED_CREATION_RECHECK_MS = 60_000;
+
+function creationAbsenceInconclusive(operation: SandboxCreationOperation, providerLooked: boolean): boolean {
   const settleAt = Date.parse(typeof operation.metadata.creationSettleAt === "string" ? operation.metadata.creationSettleAt : "");
-  return operation.metadata.creationControllerLost === true && Number.isFinite(settleAt) && Date.now() < settleAt;
+  // A failed creation is inspected early. A provider that looked and found
+  // nothing may not have materialized it yet, so keep looking until settle. A
+  // provider that cannot look (no creation support, no credential) never will.
+  const earlyFailedLookup = operation.metadata.creationFailed === true && providerLooked;
+  return (operation.metadata.creationControllerLost === true || earlyFailedLookup) &&
+    Number.isFinite(settleAt) && Date.now() < settleAt;
 }
 
 export function recoverableTaskCreation(operation: Pick<SandboxCreationOperation, "metadata">): boolean {
@@ -106,8 +118,28 @@ export async function createOwnedSandbox(
         logger.warn({ errorKind: "task_creation_recovery_wakeup_failed", operationId: id, companyId: operation.companyId },
           "Task creation recovery retains its saved deadline");
       }
+    } else if (operation.metadata.sandboxProviderPlugin === true) {
+      await expediteFailedCreation(db, operation);
     }
     throw error;
+  }
+}
+
+/** Make a failed plugin creation due soon, so creation recovery deletes any
+ * workload the provider made for it. Best effort: on a write failure the intent
+ * keeps its settle deadline, which still recovers it, only later. */
+async function expediteFailedCreation(db: Db, operation: SandboxCreationOperation): Promise<void> {
+  const dueAt = new Date(Date.now() + FAILED_CREATION_RECHECK_MS);
+  try {
+    await writeEnvironmentCleanup(db, tx => tx.update(sandboxCreationOperations).set({
+      nextAttemptAt: sql`least(${sandboxCreationOperations.nextAttemptAt}, ${dueAt.toISOString()}::timestamptz)`,
+      metadata: sql`coalesce(${sandboxCreationOperations.metadata}, '{}'::jsonb) || '{"creationFailed":true}'::jsonb`,
+      updatedAt: new Date(),
+    }).where(and(eq(sandboxCreationOperations.id, operation.id), eq(sandboxCreationOperations.state, "pending"))),
+    { companyId: operation.companyId, runId: operation.runId });
+  } catch {
+    logger.warn({ errorKind: "sandbox_creation_failure_recheck_failed", operationId: operation.id, companyId: operation.companyId },
+      "Failed sandbox creation keeps its saved recovery deadline");
   }
 }
 
@@ -211,7 +243,7 @@ export async function recoverSandboxCreations(db: Db,
         throw new Error("Sandbox creation recovery returned foreign ownership");
       }
       // An early lookup after a lost creator may precede provider materialization.
-      if (existingCompany && !cleanup && creationAbsenceInconclusive(candidate)) {
+      if (existingCompany && !cleanup && creationAbsenceInconclusive(candidate, observation !== null)) {
         throw new Error("Sandbox creation has not settled yet");
       }
       await db.transaction(async tx => {
