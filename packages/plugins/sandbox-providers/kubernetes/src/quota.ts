@@ -13,7 +13,8 @@
  * outlives the wait's deadline.
  */
 
-import type { ConfigurationOptions, Middleware } from "@kubernetes/client-node";
+import { Observable } from "@kubernetes/client-node";
+import type { ConfigurationOptions, ObservableMiddleware, RequestContext, ResponseContext } from "@kubernetes/client-node";
 import type { KubeClients } from "./kube-client.js";
 
 /** Set by ensureTenant; the provisioner Role may `get` only this name. */
@@ -227,16 +228,18 @@ async function sandboxHasPod(
  */
 function abortable<T>(read: (options: ConfigurationOptions) => Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason);
-  const setSignal: Middleware = {
-    pre: async (context) => {
+  // Per-call middleware reaches the generated Observable API unwrapped, and
+  // its pipeline calls `pre(ctx).toPromise()`, so it must return the client's
+  // Observable, not a Promise. Appended, it runs after the client's own
+  // middleware.
+  const setSignal: ObservableMiddleware = {
+    pre: (context: RequestContext) => {
       context.setSignal(signal);
-      return context;
+      return new Observable(Promise.resolve(context));
     },
-    post: async (context) => context,
+    post: (context: ResponseContext) => new Observable(Promise.resolve(context)),
   };
-  // The generated client wraps per-call middleware as promise middleware at
-  // runtime, though ConfigurationOptions names the observable form.
-  const options = { middleware: [setSignal], middlewareMergeStrategy: "append" } as unknown as ConfigurationOptions;
+  const options: ConfigurationOptions = { middleware: [setSignal], middlewareMergeStrategy: "append" };
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });

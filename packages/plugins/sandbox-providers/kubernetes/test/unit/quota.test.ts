@@ -136,8 +136,9 @@ describe("createQuotaGate", () => {
   });
 
   // A read that never answers, like an API proxy that accepts the connection
-  // and then hangs; it settles only when aborted.
-  const stalled = (_param: unknown, options?: { middleware?: Array<{ pre(c: unknown): Promise<unknown> }> }) =>
+  // and then hangs; it settles only when aborted. The real client pipeline is
+  // covered in quota-real-client.test.ts.
+  const stalled = (_param: unknown, options?: { middleware?: Array<{ pre(c: unknown): unknown }> }) =>
     new Promise((_resolve, reject) => {
       let signal: AbortSignal | undefined;
       void options?.middleware?.[0]?.pre({ setSignal: (s: AbortSignal) => { signal = s; } });
