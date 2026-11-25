@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -262,29 +262,64 @@ describe("claude sandbox session transcript across leases", () => {
     expect(run.sessionId).not.toBe(sessionId);
   });
 
-  it("does not carry a session across environments", async () => {
+  async function listFilesRecursive(dir: string): Promise<string[]> {
+    const entries = await readdir(dir, { withFileTypes: true, recursive: true }).catch(() => []);
+    return entries.filter((entry) => entry.isFile()).map((entry) => path.join(entry.parentPath, entry.name));
+  }
+
+  it.each([
+    { name: "a different environment", mismatch: { environmentId: "env-other" } },
+    { name: "a different provider", mismatch: { providerKey: "e2b" } },
+    { name: "a different remote cwd", mismatch: { remoteCwd: "/elsewhere/workspace" } },
+  ])("does not upload or resume a transcript saved on $name", async ({ mismatch }) => {
     const { rootDir, hostClaudeConfigDir, workspaceDir } = await setup();
-    const remoteCwd = path.join(rootDir, "pod", "workspace");
+    const podRoot = path.join(rootDir, "pod");
+    const savedRemoteExecution = {
+      transport: "sandbox",
+      providerKey: "kubernetes",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd: path.join(podRoot, "workspace"),
+      ...mismatch,
+    };
     const sessionId = randomUUID();
-    const storePath = resolveClaudeTranscriptStorePath({ storeConfigDir: hostClaudeConfigDir, remoteCwd, sessionId });
+    const secret = `transcript-bytes-that-must-not-leave-${randomUUID()}`;
+    const storePath = resolveClaudeTranscriptStorePath({
+      storeConfigDir: hostClaudeConfigDir,
+      remoteCwd: savedRemoteExecution.remoteCwd,
+      sessionId,
+    });
     await mkdir(path.dirname(storePath), { recursive: true });
-    await writeFile(storePath, "{}\n");
+    await writeFile(storePath, `${JSON.stringify({ type: "user", secret })}\n`);
     const claudeRuns: string[][] = [];
     const logs: string[] = [];
+    const uploadedAssets: Array<{ key: string; files: string[] }> = [];
+    const prepare = prepareAdapterExecutionTargetRuntime.getMockImplementation()!;
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input: { assets?: Asset[] }) => {
+      for (const asset of input.assets ?? []) {
+        uploadedAssets.push({ key: asset.key, files: await readdir(asset.localDir).catch(() => []) });
+      }
+      return await prepare(input);
+    });
 
-    await runOnLease({
+    const run = await runOnLease({
       runId: "run-2",
-      target: createLease(path.join(rootDir, "pod"), "lease-2", claudeRuns),
+      target: createLease(podRoot, "lease-2", claudeRuns),
       workspaceDir,
-      sessionParams: {
-        sessionId,
-        cwd: workspaceDir,
-        remoteExecution: { transport: "sandbox", providerKey: "kubernetes", environmentId: "env-other", leaseId: "lease-1", remoteCwd },
-      },
+      sessionParams: { sessionId, cwd: workspaceDir, remoteExecution: savedRemoteExecution },
       logs,
     });
 
+    expect(run.exitCode).toBe(0);
     expect(logs.join("")).toContain("does not match the current execution target");
     expect(claudeRuns[0]).not.toContain("--resume");
+    // Nothing was staged for upload ...
+    const transcriptAsset = uploadedAssets.find((asset) => asset.key === "session-transcript");
+    expect(transcriptAsset?.files ?? []).toEqual([]);
+    // ... and no byte of the saved transcript reached the lease.
+    for (const file of await listFilesRecursive(podRoot)) {
+      expect(await readFile(file, "utf8").catch(() => "")).not.toContain(secret);
+    }
+    expect(await readFile(storePath, "utf8")).toContain(secret);
   });
 });

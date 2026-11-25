@@ -649,10 +649,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const savedRemoteExecution = parseObject(savedSessionParams.remoteExecution);
     const savedRemoteCwd = asString(savedRemoteExecution.remoteCwd, "");
     const savedLeaseId = asString(savedRemoteExecution.leaseId, "");
+    // Only stage (and so upload) the transcript into a lease of the same
+    // sandbox environment, provider and remote cwd it was saved from. The
+    // sandbox workspace is realized at the target's remote cwd (no
+    // `workspaceRemoteDir` override is passed below), so this is the identity
+    // the resume check compares after prepare. Anything else must not receive
+    // the earlier transcript's bytes, even though `--resume` would be refused.
     if (
       isClaudeTranscriptSessionId(savedSessionId) &&
       savedRemoteCwd.length > 0 &&
-      savedLeaseId !== (executionTarget?.leaseId ?? "")
+      savedLeaseId !== (executionTarget?.leaseId ?? "") &&
+      adapterExecutionTargetSessionMatches(savedRemoteExecution, executionTarget, { ignoreSandboxLeaseId: true })
     ) {
       transcriptStage = await stageClaudeTranscriptForSandbox({
         storeConfigDir: transcriptStoreConfigDir,
@@ -662,7 +669,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
   }
-  const copyBackSandboxTranscript = async (readFile: (remotePath: string) => Promise<Buffer>) => {
+  const copyBackSandboxTranscript = async () => {
     const remote = transcriptRemote;
     const sessionIdToCarry = transcriptCopyBackSessionId;
     if (!remote || !sessionIdToCarry) return;
@@ -678,7 +685,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec: 30,
           onLog: async () => {},
         }),
-      readFile,
     });
     const line = result.copied
       ? `[paperclip] Saved Claude session "${sessionIdToCarry}" transcript (${result.bytes} bytes) for the next sandbox lease.\n`
@@ -729,9 +735,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ? [{
                 key: CLAUDE_SANDBOX_TRANSCRIPT_ASSET_KEY,
                 localDir: transcriptStagingDir,
-                // Never rejects: a failed copy-back must not fail the workspace restore.
-                restore: async ({ readFile }: { readFile: (remotePath: string) => Promise<Buffer> }) =>
-                  await copyBackSandboxTranscript(readFile),
+                // Used only as the teardown hook. The copy-back reads with its own
+                // size-bounded chunks rather than the unbounded `readFile` it is
+                // offered, and never rejects: a failed copy-back must not fail
+                // the workspace restore.
+                restore: async () => await copyBackSandboxTranscript(),
               }]
               : []),
           ],

@@ -114,7 +114,66 @@ export function buildClaudeTranscriptRestoreCommand(input: {
 /** Shell command that prints the transcript's byte size, or `missing`. */
 export function buildClaudeTranscriptSizeCommand(remotePath: string): string {
   const quoted = shellQuote(remotePath);
-  return `if [ -f ${quoted} ]; then wc -c < ${quoted}; else printf 'missing'; fi`;
+  // A symlink could point the copy-back at any other file in the lease.
+  return `if [ -f ${quoted} ] && [ ! -L ${quoted} ]; then wc -c < ${quoted}; else printf 'missing'; fi`;
+}
+
+/** Bytes read per sandbox round-trip during copy-back. */
+export const CLAUDE_SANDBOX_TRANSCRIPT_READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Shell command that prints one chunk of the transcript, base64-encoded.
+ * `dd count=1` never emits more than `chunkBytes`, however large the file has
+ * grown since the size probe.
+ */
+export function buildClaudeTranscriptChunkReadCommand(
+  remotePath: string,
+  chunkIndex: number,
+  chunkBytes: number = CLAUDE_SANDBOX_TRANSCRIPT_READ_CHUNK_BYTES,
+): string {
+  const quoted = shellQuote(remotePath);
+  return `[ ! -L ${quoted} ] && dd if=${quoted} bs=${chunkBytes} skip=${chunkIndex} count=1 2>/dev/null | base64`;
+}
+
+class TranscriptTooLargeError extends Error {
+  constructor(readonly bytes: number) {
+    super(`more than ${bytes} bytes`);
+  }
+}
+
+/**
+ * Reads at most `maxBytes + 1` bytes of the remote file, one bounded chunk per
+ * round-trip, and stops as soon as the cap is exceeded. The size probe that
+ * runs first is only an early exit: the file can grow or be replaced after it,
+ * so the cap is enforced here, during the read, rather than on the result.
+ */
+async function readRemoteTranscriptBounded(input: {
+  remotePath: string;
+  maxBytes: number;
+  chunkBytes: number;
+  runShell: (command: string) => Promise<{ exitCode: number | null; stdout: string }>;
+}): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  // base64 of one chunk, plus line breaks.
+  const maxEncodedChunkChars = Math.ceil(input.chunkBytes / 3) * 4 + Math.ceil(input.chunkBytes / 57) + 16;
+  for (let chunkIndex = 0; ; chunkIndex++) {
+    const result = await input.runShell(
+      buildClaudeTranscriptChunkReadCommand(input.remotePath, chunkIndex, input.chunkBytes),
+    );
+    if (result.exitCode !== 0) throw new Error(`reading the transcript exited with code ${result.exitCode ?? "null"}`);
+    if (result.stdout.length > maxEncodedChunkChars) {
+      throw new Error("a transcript chunk was larger than requested");
+    }
+    const chunk = Buffer.from(result.stdout.replace(/\s+/g, ""), "base64");
+    if (chunk.byteLength > input.chunkBytes) throw new Error("a transcript chunk was larger than requested");
+    if (chunk.byteLength === 0) break;
+    total += chunk.byteLength;
+    if (total > input.maxBytes) throw new TranscriptTooLargeError(input.maxBytes);
+    chunks.push(chunk);
+    if (chunk.byteLength < input.chunkBytes) break;
+  }
+  return Buffer.concat(chunks, total);
 }
 
 export type ClaudeTranscriptCopyBackResult =
@@ -133,8 +192,8 @@ export async function copyBackClaudeTranscriptFromSandbox(input: {
   storeConfigDir: string;
   /** Runs a shell command in the sandbox and returns its stdout. */
   runShell: (command: string) => Promise<{ exitCode: number | null; stdout: string }>;
-  readFile: (remotePath: string) => Promise<Buffer>;
   maxBytes?: number;
+  chunkBytes?: number;
 }): Promise<ClaudeTranscriptCopyBackResult> {
   try {
     if (!isClaudeTranscriptSessionId(input.sessionId)) {
@@ -150,9 +209,19 @@ export async function copyBackClaudeTranscriptFromSandbox(input: {
       return { copied: false, reason: "error", detail: "could not read the transcript size" };
     }
     if (size > maxBytes) return { copied: false, reason: "too_large", detail: `${size} bytes` };
-    const contents = await input.readFile(remotePath);
-    if (contents.length > maxBytes) {
-      return { copied: false, reason: "too_large", detail: `${contents.length} bytes` };
+    let contents: Buffer;
+    try {
+      contents = await readRemoteTranscriptBounded({
+        remotePath,
+        maxBytes,
+        chunkBytes: input.chunkBytes ?? CLAUDE_SANDBOX_TRANSCRIPT_READ_CHUNK_BYTES,
+        runShell: input.runShell,
+      });
+    } catch (error) {
+      if (error instanceof TranscriptTooLargeError) {
+        return { copied: false, reason: "too_large", detail: error.message };
+      }
+      throw error;
     }
     const targetPath = resolveClaudeTranscriptStorePath(input);
     await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
