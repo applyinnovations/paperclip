@@ -57,7 +57,7 @@ function fakeGitHub(pages: Attempt[][], options: { listStatus?: number; refuse?:
       if (options.listStatus) return json(options.listStatus, { message: "Bad credentials -----BEGIN RSA PRIVATE KEY-----" });
       const cursor = url.searchParams.get("cursor");
       const index = cursor ? Number(cursor.slice(1)) : 0;
-      const next = index + 1 < pages.length
+      const next: Record<string, string> = index + 1 < pages.length
         ? { link: `<https://api.github.com/app/hook/deliveries?per_page=100&cursor=c${index + 1}>; rel="next"` }
         : {};
       return json(200, pages[index] ?? [], next);
