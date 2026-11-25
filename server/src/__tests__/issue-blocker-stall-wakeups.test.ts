@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentWakeupRequests, companies, createDb, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issueRelations,
@@ -474,5 +474,121 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       status: "escalated", ownerType: "board", cause: "execution_recovery_budget_exhausted", fingerprint: "fixture-2", nextAction: "Retry" });
     await wakeWaitersOfStalledIssues(db, enqueueWakeup as never, { companyId: f.companyId });
     expect(calls).toHaveLength(4);
+  });
+
+  // APP-138, 2026-11-23: a waiter whose own worktree was broken ran 59 failed
+  // setups in ten hours, one per stall wake. Drive the sweep on a fake clock and
+  // let every woken run end the way `outcome` says, as the queue records it.
+  async function simulate(f: Awaited<ReturnType<typeof fixture>>, calls: Array<{ agentId: string; input: Record<string, any> }>,
+    enqueueWakeup: unknown, input: { start: number; hours: number; stepMinutes: number;
+      outcome: { refused: true } | { errorCode: string | null; error: string | null } }) {
+    const results: Array<Awaited<ReturnType<typeof wakeWaitersOfStalledIssues>>> = [];
+    for (let at = input.start; at <= input.start + input.hours * 60 * 60_000; at += input.stepMinutes * 60_000) {
+      vi.setSystemTime(at);
+      const before = calls.length;
+      results.push(await wakeWaitersOfStalledIssues(db, enqueueWakeup as never, { companyId: f.companyId }));
+      for (const call of calls.slice(before)) {
+        const key = eq(agentWakeupRequests.idempotencyKey, call.input.idempotencyKey);
+        const refused = "refused" in input.outcome;
+        await db.update(agentWakeupRequests).set({ requestedAt: new Date(at), status: refused ? "skipped" : "failed" })
+          .where(and(key, eq(agentWakeupRequests.status, "queued")));
+        if (!refused) await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: call.agentId, invocationSource: "automation",
+          status: "failed", errorCode: (input.outcome as { errorCode: string | null }).errorCode,
+          error: (input.outcome as { error: string | null }).error, createdAt: new Date(at), finishedAt: new Date(at),
+          contextSnapshot: call.input.contextSnapshot });
+      }
+    }
+    return results;
+  }
+  const brokenWorktree = { errorCode: "setup_failed",
+    error: `Configured worktree path "/repo/.paperclip/worktrees/APP-110" already exists and is not a reusable git worktree (git resolves this path to a different repository root).` };
+
+  describe("on a fake clock", () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("wakes a waiter whose workspace is broken once in 24 hours, until its state changes", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const f = await fixture();
+      const { calls, enqueueWakeup } = wakeRecorder();
+      const start = Date.now();
+      await simulate(f, calls, enqueueWakeup, { start, hours: 24, stepMinutes: 5, outcome: brokenWorktree });
+      expect(calls).toHaveLength(1);
+      // workspace_validation_failed is just as final.
+      const g = await fixture();
+      const other = wakeRecorder();
+      await simulate(g, other.calls, other.enqueueWakeup, { start, hours: 24, stepMinutes: 5,
+        outcome: { errorCode: "workspace_validation_failed", error: "source_registration_unproven" } });
+      expect(other.calls).toHaveLength(1);
+
+      // A status change is a new waiter state: one more attempt, then quiet again.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.parent.id));
+      await simulate(f, calls, enqueueWakeup, { start: start + 25 * 60 * 60_000, hours: 24, stepMinutes: 5, outcome: brokenWorktree });
+      expect(calls).toHaveLength(2);
+      // So is a new assignee, and a new execution workspace binding.
+      const newOwner = randomUUID();
+      await db.insert(agents).values({ id: newOwner, companyId: f.companyId, name: "New owner", role: "engineer", status: "idle" });
+      companyIdOf.set(newOwner, f.companyId);
+      await db.update(issues).set({ assigneeAgentId: newOwner }).where(eq(issues.id, f.parent.id));
+      await simulate(f, calls, enqueueWakeup, { start: start + 50 * 60 * 60_000, hours: 2, stepMinutes: 5, outcome: brokenWorktree });
+      expect(calls.map(call => call.agentId)).toEqual([f.parentAgent, f.parentAgent, newOwner]);
+      const [workspace] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, sourceIssueId: f.parent.id,
+        name: "Fresh worktree", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "local_fs",
+        status: "active", cwd: `/repo/.paperclip/worktrees/${randomUUID()}` }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace.id }).where(eq(issues.id, f.parent.id));
+      await simulate(f, calls, enqueueWakeup, { start: start + 53 * 60 * 60_000, hours: 2, stepMinutes: 5, outcome: brokenWorktree });
+      expect(calls).toHaveLength(4);
+      expect(calls.at(-1)!.input.contextSnapshot.blockerStallWaiterState).toEqual({ status: "in_progress",
+        assigneeAgentId: newOwner, executionWorkspaceId: workspace.id });
+    });
+
+    it("caps a waiter whose runs fail for other reasons at three runs in 24 hours", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const f = await fixture();
+      const { calls, enqueueWakeup } = wakeRecorder();
+      await simulate(f, calls, enqueueWakeup, { start: Date.now(), hours: 24, stepMinutes: 5,
+        outcome: { errorCode: "adapter_failed", error: "The model provider returned an error." } });
+      expect(calls).toHaveLength(3);
+    });
+
+    it("backs off refused wakes exponentially, to about ten in 24 hours instead of 144", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const f = await fixture();
+      const { calls, enqueueWakeup } = wakeRecorder();
+      const start = Date.now();
+      await simulate(f, calls, enqueueWakeup, { start, hours: 24, stepMinutes: 5, outcome: { refused: true } });
+      // 10, 20, 40, 80, 160 minutes, then every 4 hours.
+      expect(calls.length).toBeGreaterThanOrEqual(8);
+      expect(calls.length).toBeLessThanOrEqual(11);
+      const requested = (await db.select({ at: agentWakeupRequests.requestedAt }).from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, f.companyId)).orderBy(agentWakeupRequests.requestedAt))
+        .map(row => row.at.getTime());
+      const minutes = requested.slice(1).map((at, index) => Math.round((at - requested[index]!) / 60_000));
+      expect(minutes.slice(0, 6)).toEqual([10, 20, 40, 80, 160, 240]);
+      expect(Math.max(...minutes)).toBe(240);
+
+      // A new waiter state starts the refusals again at ten minutes.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.parent.id));
+      const before = calls.length;
+      await simulate(f, calls, enqueueWakeup, { start: start + 25 * 60 * 60_000, hours: 0.25, stepMinutes: 5, outcome: { refused: true } });
+      expect(calls.length - before).toBe(2);
+    });
+
+    it("backs off a waiter whose agent takes no wakes, with no wake row to count", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const f = await fixture();
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, f.parentAgent));
+      const { calls, enqueueWakeup } = wakeRecorder();
+      const start = Date.now();
+      const results = await simulate(f, calls, enqueueWakeup, { start, hours: 24, stepMinutes: 5, outcome: { refused: true } });
+      expect(calls).toEqual([]);
+      const retries = [...new Set(results.map(result => result.retryAt))].map(at => Math.round((at! - start) / 60_000));
+      expect(retries.slice(0, 6)).toEqual([10, 30, 70, 150, 310, 550]);
+      expect(retries.length).toBeLessThanOrEqual(11);
+      // Taking wakes again delivers the stall on the next due sweep.
+      await db.update(agents).set({ runtimeConfig: {} }).where(eq(agents.id, f.parentAgent));
+      vi.setSystemTime(start + 30 * 60 * 60_000);
+      await wakeWaitersOfStalledIssues(db, enqueueWakeup as never, { companyId: f.companyId });
+      expect(calls).toHaveLength(1);
+    });
   });
 });
