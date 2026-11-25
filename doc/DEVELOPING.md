@@ -2561,6 +2561,7 @@ Set `PAPERCLIP_METRICS_PORT` to serve Prometheus metrics at `GET /metrics` on a 
 - `nodejs_array_buffers_bytes`: memory held by `ArrayBuffer`s and `Buffer`s
 - `paperclip_plugin_worker_resident_memory_bytes{plugin_id}`: RSS of each plugin worker child process, read from `/proc` on Linux. Sandbox providers run transfers in these workers, so this memory counts toward the container but not toward the server's own RSS.
 - `paperclip_sandbox_transfers_active`, `paperclip_sandbox_transfers_queued`, `paperclip_sandbox_transfers_limit`
+- `paperclip_board_items_resolved_stale{company,company_id}`: per company (label `company` is the issue prefix, e.g. `APP`; archived companies are left out, every other company reports `0` when it has none), the open issues assigned to a user, not hidden, not updated for more than `PAPERCLIP_METRICS_STALE_BOARD_ITEM_DAYS` days (default `3`), that have at least one link and whose links have all resolved: `pull_request` work products `merged`, `closed` or `archived`; mentioned external pull requests terminal; blockers `done` or `cancelled`. These are board items that should already have closed or gone back to an agent, so anything above `0` means that mechanism missed one. The count is one query, cached for 60 s across scrapes; if it fails, the scrape still succeeds without this series and the server logs a warning.
 
 ## Worktree-local Instances
 
