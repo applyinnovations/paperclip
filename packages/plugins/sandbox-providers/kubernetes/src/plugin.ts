@@ -48,6 +48,7 @@ import {
   NETWORK_EGRESS_GRANT_PATH,
   parseScopedNetworkEgressGrant,
 } from "./scoped-network-egress.js";
+import { assessEgressPosture, buildEgressProxyEnv, EgressModeCannotEnforceError } from "./egress-mode.js";
 import {
   deriveCompanySlug,
   deriveNamespaceName,
@@ -302,6 +303,32 @@ async function resolveLoginPodExec(target: LoginLeaseTarget): Promise<LoginPodEx
   };
 }
 
+/**
+ * Egress status for probe output, using the environment's default adapter.
+ * Never throws: a mode that can't enforce the hostname list is reported as
+ * "new sandboxes are refused" rather than failing the probe.
+ */
+function describeEgress(config: KubernetesProviderConfig): {
+  mode: KubernetesProviderConfig["egressMode"];
+  enforcement: "observe" | "enforce" | null;
+  hostnamesEnforced: boolean;
+  provisionsNewSandboxes: boolean;
+  summary: string;
+} {
+  const base = {
+    mode: config.egressMode,
+    enforcement: config.egressMode === "proxy" ? config.egressProxy?.enforcement ?? null : null,
+  };
+  const adapterDefaults = getAdapterDefaults(config.adapterType, config.adapters);
+  try {
+    const posture = assessEgressPosture(config, [...adapterDefaults.allowFqdns, ...config.egressAllowFqdns]);
+    return { ...base, ...posture, provisionsNewSandboxes: true };
+  } catch (err) {
+    if (!(err instanceof EgressModeCannotEnforceError)) throw err;
+    return { ...base, hostnamesEnforced: false, provisionsNewSandboxes: false, summary: err.message };
+  }
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     pluginContext = ctx;
@@ -324,18 +351,13 @@ const plugin = definePlugin({
     }
     const warnings: string[] = [];
     const cfg = parsed.data;
-    const adapterDefaults = getAdapterDefaults(cfg.adapterType, cfg.adapters);
-    const totalFqdns = [...adapterDefaults.allowFqdns, ...cfg.egressAllowFqdns];
-    if (cfg.egressMode === "standard" && totalFqdns.length > 0) {
-      if (cfg.egressAllowCidrs.length === 0) {
-        warnings.push(
-          `egressMode=standard cannot enforce FQDN-based egress rules (Kubernetes NetworkPolicy is CIDR-only). To keep the configured FQDNs reachable (${totalFqdns.join(", ")}) without operator intervention, the plugin will allow public IPv4 egress on TCP 80/443 with private/link-local/loopback/multicast ranges excluded. This is broader than exact FQDN allow-listing — switch egressMode to "cilium" (requires Cilium CNI) for precise enforcement, or set egressAllowCidrs explicitly to override the fallback.`,
-        );
-      } else {
-        warnings.push(
-          `egressMode=standard cannot enforce FQDN-based egress rules. The following FQDNs are reachable only via the operator-supplied egressAllowCidrs: ${totalFqdns.join(", ")}. Switch egressMode to "cilium" (requires Cilium CNI) for exact FQDN allow-listing.`,
-        );
-      }
+    // A mode that can't enforce the hostname list is reported here, but the
+    // config is still accepted: rejecting it would take the whole environment
+    // (and its running sandboxes) offline. New sandboxes are refused at
+    // acquire time instead.
+    const egress = describeEgress(cfg);
+    if (!egress.provisionsNewSandboxes || (cfg.egressMode === "proxy" && !egress.hostnamesEnforced)) {
+      warnings.push(egress.summary);
     }
     return { ok: true, normalizedConfig: cfg as Record<string, unknown>, warnings: warnings.length > 0 ? warnings : undefined };
   },
@@ -373,10 +395,11 @@ const plugin = definePlugin({
         if (code !== 404) throw err;
         // 404 means namespace doesn't exist yet — cluster is reachable.
       }
+      const egress = describeEgress(config);
       return {
         ok: true,
-        summary: `Kubernetes cluster reachable. Tenant namespace: ${namespace}.`,
-        metadata: { namespace, provider: "kubernetes" },
+        summary: `Kubernetes cluster reachable. Tenant namespace: ${namespace}. ${egress.summary}`,
+        metadata: { namespace, provider: "kubernetes", egress },
       };
     } catch (err) {
       return {
@@ -419,21 +442,18 @@ const plugin = definePlugin({
     // the lease as before.
     const effectiveAdapterType = resolveRunAdapterType(params.adapterType, config.adapterType);
 
-    // Emit a runtime warning if FQDNs are configured but egressMode=standard
-    // cannot enforce them. Mirrors the validateConfig warning so operators see
-    // it in paperclip-server logs even if they missed the validation step.
-    const adapterDefaultsForWarn = getAdapterDefaults(effectiveAdapterType, config.adapters);
-    const totalFqdnsForWarn = [...adapterDefaultsForWarn.allowFqdns, ...config.egressAllowFqdns];
-    if (config.egressMode === "standard" && totalFqdnsForWarn.length > 0) {
-      if (config.egressAllowCidrs.length === 0) {
-        console.warn(
-          `[plugin-kubernetes] egressMode=standard cannot enforce FQDN-based egress rules; falling back to public-IPv4 (TCP 80/443) with private/link-local ranges excluded so the configured FQDNs (${totalFqdnsForWarn.join(", ")}) remain reachable. Switch egressMode to "cilium" for exact FQDN allow-listing.`,
-        );
-      } else {
-        console.warn(
-          `[plugin-kubernetes] egressMode=standard cannot enforce FQDN-based egress rules. The following FQDNs are reachable only via operator-supplied egressAllowCidrs: ${totalFqdnsForWarn.join(", ")}. Switch egressMode to "cilium" for exact FQDN allow-listing.`,
-        );
-      }
+    // Fail closed before anything is created in the cluster: a hostname list
+    // the active egress mode can't enforce refuses the new sandbox (APP-464
+    // AC4). Running sandboxes are never re-checked.
+    const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
+    const adapterDefaults = getAdapterDefaults(effectiveAdapterType, config.adapters);
+    const egressPosture = assessEgressPosture(config, [
+      ...adapterDefaults.allowFqdns,
+      ...config.egressAllowFqdns,
+      ...scopedNetworkEgress.allowFqdns,
+    ]);
+    if (!egressPosture.hostnamesEnforced && config.egressMode === "proxy") {
+      console.warn(`[plugin-kubernetes] ${egressPosture.summary}`);
     }
 
     const kc = createKubeConfig({
@@ -444,8 +464,6 @@ const plugin = definePlugin({
 
     // Ensure the tenant namespace and all its RBAC / network policy resources
     // exist before we try to create the Job.
-    const adapterDefaults = getAdapterDefaults(effectiveAdapterType, config.adapters);
-
     await ensureTenant(clients, {
       namespace,
       companyId: params.companyId,
@@ -510,7 +528,6 @@ const plugin = definePlugin({
         });
 
     const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
-    const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
     // The adapter's sign-in hosts join this run's scoped policy in cilium mode,
     // where FQDN rules are enforced (standard mode cannot enforce them; see
     // validateConfig). The sandbox-provider acquire does not say whether a lease
@@ -548,6 +565,11 @@ const plugin = definePlugin({
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
+    adapterEnv.PAPERCLIP_NETWORK_EGRESS_MODE = config.egressMode;
+    if (config.egressMode === "proxy") {
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_PROXY_ENFORCEMENT = config.egressProxy!.enforcement;
+    }
+    Object.assign(adapterEnv, buildEgressProxyEnv(config));
     const bootstrapToken = generateBootstrapToken();
 
     // Secret ownerRef: for job backend, the Job owns the Secret (cascade delete).

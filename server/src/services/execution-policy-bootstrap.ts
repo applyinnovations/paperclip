@@ -125,6 +125,37 @@ function parseList(value: string | undefined): string[] | undefined {
 }
 
 /**
+ * `PAPERCLIP_K8S_EGRESS_PROXY_URL`, `PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT`
+ * (`observe` | `enforce`, no default) and optional
+ * `PAPERCLIP_K8S_EGRESS_PROXY_NO_PROXY` (comma-separated). Required together
+ * with `PAPERCLIP_K8S_EGRESS_MODE=proxy` and rejected without it, so a
+ * half-applied config fails at boot instead of at the first sandbox.
+ */
+function parseEgressProxy(
+  env: ExecutionPolicyBootstrapEnv,
+  egressMode: string | undefined,
+): KubernetesEnvironmentConfigInput["egressProxy"] {
+  const url = env.PAPERCLIP_K8S_EGRESS_PROXY_URL?.trim();
+  const enforcement = env.PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT?.trim();
+  const noProxy = parseList(env.PAPERCLIP_K8S_EGRESS_PROXY_NO_PROXY);
+  if (egressMode !== "proxy") {
+    if (url || enforcement || noProxy) {
+      throw new Error("PAPERCLIP_K8S_EGRESS_PROXY_* only applies with PAPERCLIP_K8S_EGRESS_MODE=proxy.");
+    }
+    return undefined;
+  }
+  if (!url) {
+    throw new Error("PAPERCLIP_K8S_EGRESS_MODE=proxy requires PAPERCLIP_K8S_EGRESS_PROXY_URL.");
+  }
+  if (enforcement !== "observe" && enforcement !== "enforce") {
+    throw new Error(
+      `PAPERCLIP_K8S_EGRESS_MODE=proxy requires PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT to be "observe" or "enforce" (got "${enforcement ?? ""}").`,
+    );
+  }
+  return { url, enforcement, ...(noProxy ? { noProxy } : {}) };
+}
+
+/**
  * Parse the forced-execution-mode env config. Returns null when execution is
  * unrestricted (no env, or `PAPERCLIP_EXECUTION_MODE=any`). Throws on an
  * unrecognized mode so a misconfigured deployment fails loudly instead of
@@ -166,13 +197,15 @@ export function parseExecutionPolicyBootstrapEnv(
 
   const egressMode = env.PAPERCLIP_K8S_EGRESS_MODE?.trim();
   if (egressMode) {
-    if (egressMode !== "cilium" && egressMode !== "standard") {
+    if (egressMode !== "cilium" && egressMode !== "standard" && egressMode !== "proxy") {
       throw new Error(
-        `PAPERCLIP_K8S_EGRESS_MODE must be "cilium" or "standard" (got "${egressMode}").`,
+        `PAPERCLIP_K8S_EGRESS_MODE must be "cilium", "standard" or "proxy" (got "${egressMode}").`,
       );
     }
     kubernetesConfig.egressMode = egressMode;
   }
+  const egressProxy = parseEgressProxy(env, egressMode);
+  if (egressProxy) kubernetesConfig.egressProxy = egressProxy;
 
   const runtimeClassName = env.PAPERCLIP_K8S_RUNTIME_CLASS_NAME?.trim();
   if (runtimeClassName) kubernetesConfig.runtimeClassName = runtimeClassName;
@@ -252,6 +285,7 @@ export async function applyExecutionPolicyBootstrap(
       backend: bootstrap.kubernetesConfig.backend,
       runtimeClassName: bootstrap.kubernetesConfig.runtimeClassName,
       egressMode: bootstrap.kubernetesConfig.egressMode,
+      egressProxyEnforcement: bootstrap.kubernetesConfig.egressProxy?.enforcement,
     },
     "applied forced Kubernetes execution policy",
   );

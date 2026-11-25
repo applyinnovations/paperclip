@@ -76,8 +76,32 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           egressMode: {
             type: "string",
-            enum: ["standard", "cilium"],
-            description: "Network policy mode. `cilium` enables FQDN-based egress filtering via CiliumNetworkPolicy.",
+            enum: ["standard", "cilium", "proxy"],
+            description:
+              "Egress mode. `standard` is NetworkPolicy only (CIDR-only) and refuses new sandboxes when a hostname list is configured, because it can't enforce one. `cilium` uses CiliumNetworkPolicy toFQDNs. `proxy` sends sandbox HTTP(S) through the egress proxy in `egressProxy`.",
+          },
+          egressProxy: {
+            type: "object",
+            description: "Required when egressMode is `proxy`.",
+            properties: {
+              url: {
+                type: "string",
+                description: "Egress proxy URL as sandboxes reach it, e.g. http://paperclip-egress-proxy.paperclip.svc:3128. Set as HTTPS_PROXY/HTTP_PROXY.",
+              },
+              enforcement: {
+                type: "string",
+                enum: ["observe", "enforce"],
+                description:
+                  "`observe`: the proxy only logs hostnames; the hostname list is NOT enforced. `enforce`: the proxy denies hosts outside its allowlist.",
+              },
+              noProxy: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "Extra NO_PROXY entries. localhost, 127.0.0.1, ::1, paperclip-server, .svc and .cluster.local are always included.",
+              },
+            },
+            required: ["url", "enforcement"],
           },
           runtimeClassName: {
             type: "string",

@@ -90,7 +90,14 @@ function acquire(overrides: Record<string, unknown> = {}, config: Record<string,
     companyId: "company-1",
     environmentId: "env-1",
     runId: "run-1",
-    config: { inCluster: true, ...config },
+    // Built-in adapters always carry a hostname list, which egressMode=standard
+    // refuses (APP-464 AC4), so these leases use the proxy in observe mode.
+    config: {
+      inCluster: true,
+      egressMode: "proxy",
+      egressProxy: { url: "http://paperclip-egress-proxy.paperclip.svc:3128", enforcement: "observe" },
+      ...config,
+    },
     ...overrides,
   } as never);
 }
@@ -278,9 +285,9 @@ describe("sign-in egress", () => {
     expect(h.scopedGrants[0]?.allowFqdns).toEqual(["auth.openai.com", "github.com"]);
   });
 
-  it("adds nothing when the host says the lease is a run, or in standard mode", async () => {
+  it("adds nothing when the host says the lease is a run, or in proxy mode", async () => {
     await acquire({ adapterType: "codex_local", purpose: "run" }, { egressMode: "cilium" });
-    await acquire({ adapterType: "codex_local" }, { egressMode: "standard" });
+    await acquire({ adapterType: "codex_local" }, { egressMode: "proxy" });
     expect(h.scopedGrants[0]?.allowFqdns).toEqual([]);
     expect(h.scopedGrants[1]?.allowFqdns).toEqual([]);
   });

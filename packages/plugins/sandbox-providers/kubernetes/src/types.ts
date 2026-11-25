@@ -18,7 +18,30 @@ export const kubernetesProviderConfigSchema = z
 
     egressAllowFqdns: z.array(z.string()).default([]),
     egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).default([]),
-    egressMode: z.enum(["cilium", "standard"]).default("standard"),
+    /**
+     * - `standard`: NetworkPolicy only (CIDR-only). Refuses new sandboxes
+     *   when a hostname list is configured, because it can't enforce one.
+     * - `cilium`: CiliumNetworkPolicy `toFQDNs`.
+     * - `proxy`: sandboxes use the in-cluster egress proxy in `egressProxy`.
+     */
+    egressMode: z.enum(["cilium", "standard", "proxy"]).default("standard"),
+    /**
+     * Required when `egressMode` is `proxy`. `enforcement` is deliberately
+     * not defaulted: the operator states whether the proxy only observes
+     * (hostnames NOT enforced) or enforces its allowlist.
+     */
+    egressProxy: z
+      .object({
+        /** Proxy URL as sandboxes should see it, e.g. `http://paperclip-egress-proxy.paperclip.svc:3128`. */
+        url: z
+          .string()
+          .url()
+          .refine((v) => /^https?:\/\//.test(v), { message: "egressProxy.url must be an http:// or https:// URL" }),
+        enforcement: z.enum(["observe", "enforce"]),
+        /** Extra NO_PROXY entries, added to the built-in cluster-internal list. */
+        noProxy: z.array(z.string().min(1)).default([]),
+      })
+      .optional(),
 
     defaultResources: z
       .object({
@@ -78,6 +101,14 @@ export const kubernetesProviderConfigSchema = z
     {
       message:
         "kubernetes provider requires one of `inCluster` or `kubeconfig`",
+    },
+  )
+  .refine(
+    (cfg) => cfg.egressMode !== "proxy" || cfg.egressProxy !== undefined,
+    {
+      message:
+        'egressMode=proxy requires egressProxy.url and egressProxy.enforcement ("observe" or "enforce")',
+      path: ["egressProxy"],
     },
   );
 
