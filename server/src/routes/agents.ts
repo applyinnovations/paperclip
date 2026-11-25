@@ -91,6 +91,8 @@ import {
   resolveAgentInstructionCandidateSchema,
   updateAgentInstructionsBundleSchema,
   updateAgentPermissionsSchema,
+  updateMemberPermissionsSchema,
+  type UpdateMemberPermissions,
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
@@ -5111,6 +5113,73 @@ export function agentRoutes(
     });
 
     res.json(await buildAgentDetail(agent));
+  });
+
+  // The board sets an agent's explicit grants. Agents never may, the CEO
+  // included, so no agent can widen its own or a peer's grants; connection
+  // management authority does not extend to grants either.
+  async function assertBoardCanManageAgentGrants(req: Request, companyId: string) {
+    if (req.actor.type !== "board") throw forbidden("Only the board can manage an agent's grants");
+    await assertBoardCanManageAgentsForCompany(req, companyId);
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "users:manage_permissions",
+      resource: { type: "company", companyId },
+    });
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  async function agentGrantsResponse(agent: { id: string; companyId: string }) {
+    return {
+      agentId: agent.id,
+      companyId: agent.companyId,
+      grants: await access.listPrincipalGrants(agent.companyId, "agent", agent.id),
+    };
+  }
+
+  router.get("/agents/:id/grants", async (req, res) => {
+    if (req.actor.type !== "board") throw forbidden("Only the board can manage an agent's grants");
+    const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!agent) return;
+    await assertBoardCanManageAgentGrants(req, agent.companyId);
+    res.json(await agentGrantsResponse(agent));
+  });
+
+  router.put("/agents/:id/grants", validate(updateMemberPermissionsSchema), async (req, res) => {
+    if (req.actor.type !== "board") throw forbidden("Only the board can manage an agent's grants");
+    const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!agent) return;
+    await assertBoardCanManageAgentGrants(req, agent.companyId);
+
+    const grants: UpdateMemberPermissions["grants"] = req.body.grants ?? [];
+    const seen = new Set<string>();
+    for (const grant of grants) {
+      if (seen.has(grant.permissionKey)) throw badRequest(`Duplicate grant for ${grant.permissionKey}; send each permissionKey once`);
+      seen.add(grant.permissionKey);
+    }
+
+    const previous = await access.listPrincipalGrants(agent.companyId, "agent", agent.id);
+    await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
+    await access.setPrincipalGrants(agent.companyId, "agent", agent.id, grants, req.actor.userId ?? null);
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "agent.grants_updated",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        previousPermissionKeys: previous.map((grant) => grant.permissionKey).sort(),
+        permissionKeys: grants.map((grant) => grant.permissionKey).sort(),
+        grantCount: grants.length,
+      },
+    });
+
+    res.json(await agentGrantsResponse(agent));
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {

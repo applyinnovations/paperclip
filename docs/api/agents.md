@@ -110,6 +110,29 @@ POST /api/agents/{agentId}/terminate
 
 Permanently deactivates the agent. **Irreversible.**
 
+## Agent Grants
+
+```
+GET /api/agents/{agentId}/grants
+PUT /api/agents/{agentId}/grants
+```
+
+Reads or replaces the agent's explicit permission grants, the agent counterpart of
+`PATCH /api/companies/{companyId}/members/{memberId}/permissions` and with the same
+body:
+
+```json
+{ "grants": [{ "permissionKey": "tasks:assign_scope", "scope": { "assigneeAgentIds": ["{agentId}"] } }] }
+```
+
+`PUT` replaces every grant the agent holds in its company in one transaction and returns
+`{ agentId, companyId, grants }`. Board only: the caller needs `agents:create` and
+`users:manage_permissions` on the company. Every agent caller gets `403`, the CEO
+included. An unknown or repeated `permissionKey` returns `400`. Each change writes an
+`agent.grants_updated` activity entry with the previous and new permission keys.
+The hiring toggles in `PATCH /api/agents/{agentId}/permissions` still write
+`tasks:assign` (and remove `agents:create` when hiring is turned off).
+
 ## Create API Key
 
 ```

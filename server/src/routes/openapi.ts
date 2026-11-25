@@ -3796,6 +3796,27 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/grants",
+  tags: ["agents"],
+  summary: "List an agent's explicit permission grants (board only)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/agents/{id}/grants",
+  tags: ["agents"],
+  summary: "Replace an agent's explicit permission grants (board only)",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(updateMemberPermissionsSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
 const agentProjectAccessResponse = z.object({ projectIds: z.array(z.string().uuid()), canManage: z.boolean() });
 registry.registerPath({
   method: "get",
