@@ -818,6 +818,21 @@ Required SDK clients:
 
 Plugins that need filesystem, git, terminal, or process operations handle those directly using standard Node APIs or libraries. The host provides project workspace metadata through `ctx.projects` so plugins can resolve workspace paths, but the host does not proxy low-level OS operations.
 
+### 14.0.1 Host-mediated sync I/O for environment drivers
+
+Environment-driver plugins that implement `onEnvironmentSyncIn` /
+`onEnvironmentSyncOut` receive a second hook argument, `io`
+(`PluginEnvironmentSyncHostIo`). Through it the host reads a mapping's host
+source or writes its host target on the plugin's behalf, addressed by mapping
+index and never by path. Each call gets a handle bound to the plugin, the
+company and the call. The host confines every mapping to the per-run host roots
+its caller declared and refuses protected paths and shared parents. Every
+refusal is a structured `PluginSyncIoError`. The API, its semantics and its
+confinement rules are specified in
+[`SANDBOX_FILE_SYNC_HOOKS.md`](./SANDBOX_FILE_SYNC_HOOKS.md#host-mediated-sync-io)
+next to the sync contract. The worker-to-host methods are `environmentSync.*`
+and require `environment.drivers.register`.
+
 ## 14.1 Issue Orchestration APIs
 
 Trusted orchestration plugins can create and update Paperclip issues through `ctx.issues` instead of importing server internals. The public issue contract includes parent/project/goal links, board or agent assignees, blocker IDs, labels, billing code, request depth, execution workspace inheritance, and plugin origin metadata.

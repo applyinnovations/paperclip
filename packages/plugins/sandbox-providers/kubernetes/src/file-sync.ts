@@ -58,6 +58,7 @@ import type {
   PluginSyncFileMapping,
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
+import { findArchiveMemberEscape } from "@paperclipai/plugin-sdk";
 
 const execFileAsync = promisify(execFile);
 
@@ -136,15 +137,6 @@ export function assertConfinedSandboxPath(remoteDir: string, candidate: string, 
   if (normalized !== normalizedRoot && !normalized.startsWith(prefix)) {
     throw new Error(`Kubernetes sync ${label} path escapes the workspace remote dir: ${candidate}`);
   }
-}
-
-/**
- * True when `relative` (a POSIX path) escapes its anchoring directory once
- * normalized: an absolute path, `..`, or a `..`-leading traversal all break out.
- */
-function posixPathEscapes(relative: string): boolean {
-  const normalized = path.posix.normalize(relative);
-  return normalized === ".." || normalized.startsWith("../") || path.posix.isAbsolute(normalized);
 }
 
 async function withHostTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -402,17 +394,15 @@ async function assertTarballEntriesConfined(archivePath: string, rejectSpecialMo
       name = split.name;
       linkTarget = split.target;
     }
-    const cleanName = name.replace(/\/+$/, "");
-    if (cleanName.length > 0 && posixPathEscapes(cleanName)) {
+    // The same member/link confinement policy the host applies to sync-out
+    // entry streams (`findArchiveMemberEscape` in the plugin SDK).
+    if (findArchiveMemberEscape({ name })) {
       throw new Error(`Kubernetes syncOut refusing tarball member that escapes the extraction dir: ${name}`);
     }
-    if (linkTarget !== null) {
-      const resolved = path.posix.join(path.posix.dirname(cleanName), linkTarget);
-      if (path.posix.isAbsolute(linkTarget) || posixPathEscapes(resolved)) {
-        throw new Error(
-          `Kubernetes syncOut refusing tarball link whose target escapes the extraction dir: ${name} -> ${linkTarget}`,
-        );
-      }
+    if (linkTarget !== null && findArchiveMemberEscape({ name, linkTarget })) {
+      throw new Error(
+        `Kubernetes syncOut refusing tarball link whose target escapes the extraction dir: ${name} -> ${linkTarget}`,
+      );
     }
   }
 }

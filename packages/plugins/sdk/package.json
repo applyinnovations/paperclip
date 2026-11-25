@@ -49,6 +49,10 @@
     "./dev-server": {
       "types": "./dist/dev-server.d.ts",
       "import": "./dist/dev-server.js"
+    },
+    "./sync-host": {
+      "types": "./dist/environment-sync-io-host.d.ts",
+      "import": "./dist/environment-sync-io-host.js"
     }
   },
   "bin": {
@@ -92,6 +96,10 @@
       "./dev-server": {
         "types": "./dist/dev-server.d.ts",
         "import": "./dist/dev-server.js"
+      },
+      "./sync-host": {
+        "types": "./dist/environment-sync-io-host.d.ts",
+        "import": "./dist/environment-sync-io-host.js"
       }
     },
     "main": "./dist/index.js",

@@ -1175,6 +1175,13 @@ export function createPluginWorkerHandle(
     childProcess.stdin.write(serialized);
   }
 
+  // Structured refusal data a host handler attaches to its error (for example
+  // a sync I/O refusal code), so the worker can act on it without parsing text.
+  function rpcErrorDataForWorkerHostError(err: unknown): Record<string, unknown> | undefined {
+    const data = (err as { rpcErrorData?: unknown } | null)?.rpcErrorData;
+    return isRecord(data) ? data : undefined;
+  }
+
   function errorCodeForWorkerHostError(err: unknown): number {
     const code = (err as { code?: unknown } | null)?.code;
     const pluginErrorCodes: readonly number[] = Object.values(PLUGIN_RPC_ERROR_CODES);
@@ -2947,6 +2954,7 @@ export function createPluginWorkerHandle(
             request.id,
             errorCodeForWorkerHostError(err),
             errorMessage,
+            rpcErrorDataForWorkerHostError(err),
           ),
         );
       } catch {

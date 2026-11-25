@@ -371,7 +371,7 @@ export function createRemoteWorkspaceFiles(db: Db, options: RemoteWorkspaceFileO
           await options.environmentRuntime!.syncOut({ environment: environment!, lease: lease!, operations: [{
             operationId: `workspace-file:${randomUUID()}`,
             files: [{ sourcePath: path.posix.join(root, relativePath), targetPath: path.join(directory, "file"), kind: "file", mode: 0o600 }],
-          }] }).catch(() => { throw fileFailure("workspace_unavailable"); });
+          }], hostRoots: [directory] }).catch(() => { throw fileFailure("workspace_unavailable"); });
           await verifyDownload(path.join(directory, "file"), expected);
           await checkCurrent();
           return { stream: createReadStream(path.join(directory, "file")), byteSize: expected.byteSize!, cleanup };

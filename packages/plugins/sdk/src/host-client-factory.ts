@@ -48,6 +48,7 @@
  * @see PLUGIN_SPEC.md §15 — Capability Model
  */
 
+import { ENVIRONMENT_SYNC_IO_METHODS, PluginSyncIoError, type EnvironmentSyncIoMethodName } from "./environment-sync-io.js";
 import type { PluginCapability } from "@paperclipai/shared";
 import type { WorkerHostCallContext, WorkerToHostMethods, WorkerToHostMethodName } from "./protocol.js";
 import { PLUGIN_RPC_ERROR_CODES } from "./protocol.js";
@@ -205,6 +206,20 @@ export interface HostServices {
       params: WorkerToHostMethods["span.record"][0],
       context?: WorkerHostCallContext,
     ): Promise<void>;
+  };
+
+  /**
+   * Provides the host-mediated sync I/O methods (`environmentSync.*`). The
+   * host binds each request to the sync call that issued its handle; `context`
+   * carries the request's host-derived invocation scope. Optional: a host that
+   * omits it answers every request with `PluginSyncIoError` code `unavailable`.
+   */
+  environmentSync?: {
+    dispatch<M extends EnvironmentSyncIoMethodName>(
+      method: M,
+      params: WorkerToHostMethods[M][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods[M][1]>;
   };
 
   /** Provides `companies.list`, `companies.get`. */
@@ -452,6 +467,15 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Logger — always allowed
   "log": null,
+
+  // Host-mediated sync I/O for environment drivers. The host also binds each
+  // request to the plugin, company and call that issued the handle.
+  "environmentSync.openSource": "environment.drivers.register",
+  "environmentSync.readSource": "environment.drivers.register",
+  "environmentSync.openTarget": "environment.drivers.register",
+  "environmentSync.writeTarget": "environment.drivers.register",
+  "environmentSync.finishTarget": "environment.drivers.register",
+  "environmentSync.closeStream": "environment.drivers.register",
 
   // Timing sink for environment drivers or workspace providers. Parentage
   // still derives solely from the current host-owned invocation.
@@ -734,6 +758,16 @@ export function createHostClientHandlers(
     };
   }
 
+  function syncIoHandlers(): { [M in EnvironmentSyncIoMethodName]: HostHandler<M> } {
+    const entries = ENVIRONMENT_SYNC_IO_METHODS.map((method) => [method, gated(method, async (params, context) => {
+      if (!services.environmentSync) {
+        throw new PluginSyncIoError("unavailable", "This host does not provide host-mediated sync I/O.");
+      }
+      return services.environmentSync.dispatch(method, params as never, context) as never;
+    })]);
+    return Object.fromEntries(entries) as { [M in EnvironmentSyncIoMethodName]: HostHandler<M> };
+  }
+
   // -------------------------------------------------------------------------
   // Build the complete handler map
   // -------------------------------------------------------------------------
@@ -853,6 +887,9 @@ export function createHostClientHandlers(
     "log": gated("log", async (params) => {
       return services.logger.log(params);
     }),
+
+    // Host-mediated sync I/O (see environment-sync-io.ts).
+    ...syncIoHandlers(),
 
     // Provider span sink. The context carries the host-minted `traceparent`.
     "span.record": gated("span.record", async (params, context) => {
