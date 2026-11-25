@@ -182,7 +182,9 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
   try {
     parsed = new URL(urlString);
   } catch {
-    throw new Error(`Invalid URL: ${urlString}`);
+    // The URL is plugin input and may carry `user:pass@` or `?token=`; never
+    // echo it into the host log or the JSON-RPC error (APP-335).
+    throw new Error("Invalid URL passed to http.fetch");
   }
 
   if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
@@ -248,7 +250,14 @@ function buildPinnedRequestOptions(
   target: ValidatedFetchTarget,
   init?: RequestInit,
 ): { options: HttpRequestOptions & { servername?: string }; body: string | undefined } {
-  const headers = new Headers(init?.headers);
+  let headers: Headers;
+  try {
+    headers = new Headers(init?.headers);
+  } catch {
+    // Header validation errors can quote the rejected name or value, which is
+    // often a credential; report the problem without the header (APP-335).
+    throw new Error("Invalid request headers passed to http.fetch");
+  }
   const method = init?.method ?? "GET";
   const body = init?.body === undefined || init?.body === null
     ? undefined

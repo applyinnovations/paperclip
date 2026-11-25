@@ -13,7 +13,11 @@ function sendNestedHostRequest(originalRequest, invocationId) {
   const mode = params.mode;
   const requestedCompanyId = params.requestedCompanyId;
   const hostMethod = params.hostMethod || "companies.get";
-  const nestedParams = hostMethod === "secrets.resolve"
+  // `hostParams` sends the given params verbatim, for tests that need the host
+  // handler to see a specific (e.g. malformed) argument.
+  const nestedParams = params.hostParams && typeof params.hostParams === "object"
+    ? params.hostParams
+    : hostMethod === "secrets.resolve"
     ? {
         companyId: requestedCompanyId,
         secretRef: {

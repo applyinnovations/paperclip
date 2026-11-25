@@ -20,10 +20,34 @@ import { unprocessable } from "../errors.js";
 // Error helpers
 // ---------------------------------------------------------------------------
 
+const SECRET_REF_KNOWN_KEYS = new Set(["type", "secretId", "version"]);
+
+/**
+ * Describe the shape of a rejected secret ref without its value. Plugins pass
+ * operator-entered config here, so a raw token pasted into a secret field must
+ * not reach the host log or the JSON-RPC error (APP-335).
+ */
+function describeSecretRefShape(secretRef: unknown): string {
+  if (secretRef === null) return "null";
+  if (Array.isArray(secretRef)) return `array(length ${secretRef.length})`;
+  if (typeof secretRef === "string") {
+    return secretRef.trim().length === 0 ? "empty string" : "string";
+  }
+  if (typeof secretRef === "object") {
+    // Name only the keys the binding schema knows; any other key could itself
+    // be operator-entered text, so it is counted rather than echoed.
+    const keys = Object.keys(secretRef as Record<string, unknown>);
+    const known = keys.filter((key) => SECRET_REF_KNOWN_KEYS.has(key));
+    const otherCount = keys.length - known.length;
+    const parts = [...known, ...(otherCount > 0 ? [`${otherCount} other`] : [])];
+    return `object with keys [${parts.join(", ")}]`;
+  }
+  return typeof secretRef;
+}
+
 function invalidSecretRef(secretRef: unknown): Error {
-  const rendered = typeof secretRef === "string" ? secretRef : JSON.stringify(secretRef);
   const err = new Error(
-    `Invalid secret reference for plugin: ${rendered ?? "<empty>"}. Use { type: "secret_ref", secretId, version? }`,
+    `Invalid secret reference for plugin: got ${describeSecretRefShape(secretRef)}. Use { type: "secret_ref", secretId, version? }`,
   );
   err.name = "InvalidSecretRefError";
   return err;
@@ -222,7 +246,7 @@ export function createPluginSecretsHandler(
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
       if (typeof params.secretRef === "string") {
-        throw invalidSecretRef(params.secretRef.trim() || "<empty>");
+        throw invalidSecretRef(params.secretRef);
       }
 
       const bindingRef = parseSecretRefBinding(params.secretRef);

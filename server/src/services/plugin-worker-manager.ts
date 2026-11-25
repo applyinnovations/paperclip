@@ -69,6 +69,7 @@ import {
   type LoginCommandKey,
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
+import { redactPluginHostErrorMessage } from "./plugin-host-error-redaction.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { context as otelContext } from "@opentelemetry/api";
 import { traceparentFromContextToken } from "../instrumentation.js";
@@ -2939,7 +2940,10 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      // Handlers and the libraries they wrap can echo their arguments (URLs,
+      // headers, bound query values) into the message, so scrub it before it
+      // reaches the log or the worker (APP-335).
+      const errorMessage = redactPluginHostErrorMessage(err instanceof Error ? err.message : String(err));
       log.error({ method, err: errorMessage }, "host handler error");
       try {
         sendMessage(
