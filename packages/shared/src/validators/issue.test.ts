@@ -37,6 +37,16 @@ describe("issue validators", () => {
     expect(updateIssueSchema.parse({}).expectedExecutionPolicy).toBeUndefined();
     expect(updateIssueSchema.safeParse({ expectedExecutionPolicy: [] }).success).toBe(false);
   });
+  it("keeps omitted execution policy fields absent in an update", () => {
+    const monitor = { nextCheckAt: "2026-12-01T12:00:00.000Z" };
+    const policy = updateIssueSchema.parse({ executionPolicy: { monitor } }).executionPolicy;
+    expect(policy).not.toHaveProperty("stages");
+    expect(policy).not.toHaveProperty("mode");
+    expect(policy).not.toHaveProperty("maxReviewRounds");
+    expect(updateIssueSchema.parse({ executionPolicy: { stages: [] } }).executionPolicy?.stages).toEqual([]);
+    expect(updateIssueSchema.parse({ executionPolicy: { reviewPreset: null } }).executionPolicy?.reviewPreset).toBeNull();
+    expect(updateIssueSchema.parse({ executionPolicy: null }).executionPolicy).toBeNull();
+  });
   it("accepts private visibility without adding defaults to updates", () => {
     expect(createIssueSchema.parse({ title: "Private", visibility: "private" }).visibility).toBe("private");
     expect(createIssueSchema.parse({ title: "Open" }).visibility).toBe("open");

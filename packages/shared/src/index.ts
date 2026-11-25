@@ -1995,6 +1995,7 @@ export {
   updateIssueSchema,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
+  issueExecutionPolicyUpdateSchema,
   requiredQualityReviewSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionStateSchema,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, mergeIssueExecutionPolicyUpdate, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "../../../ui/src/lib/issue-execution-policy.ts";
 
@@ -8,6 +8,40 @@ const qaAgentId = "22222222-2222-4222-8222-222222222222";
 const ctoAgentId = "33333333-3333-4333-8333-333333333333";
 const ctoUserId = "cto-user";
 const boardUserId = "board-user";
+
+describe("mergeIssueExecutionPolicyUpdate", () => {
+  const stored = normalizeIssueExecutionPolicy({
+    mode: "auto",
+    stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    maxReviewRounds: 4,
+    authorizationPolicy: { protectedAgent: { blockAssignment: true, blockReason: "Protected executor" } },
+    monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z" },
+  })!;
+  const monitor = { nextCheckAt: "2099-02-01T00:00:00.000Z" };
+
+  it("keeps every omitted field except the monitor", () => {
+    const merged = normalizeIssueExecutionPolicy(mergeIssueExecutionPolicyUpdate(stored, { monitor }));
+    expect(merged).toEqual({ ...stored, monitor: expect.objectContaining(monitor) });
+  });
+
+  it("keeps the replace semantics of the monitor", () => {
+    const { monitor: _monitor, ...withoutMonitor } = stored;
+    expect(normalizeIssueExecutionPolicy(mergeIssueExecutionPolicyUpdate(stored, { maxReviewRounds: 4 })))
+      .toEqual(withoutMonitor);
+  });
+
+  it("removes a field sent as null and every stage sent as an empty list", () => {
+    const merged = normalizeIssueExecutionPolicy(
+      mergeIssueExecutionPolicyUpdate(stored, { monitor, stages: [], maxReviewRounds: null, authorizationPolicy: null }),
+    );
+    expect(merged).toEqual({ mode: "auto", commentRequired: true, stages: [], monitor: expect.objectContaining(monitor) });
+  });
+
+  it("clears the whole policy for null and applies an update to no stored policy", () => {
+    expect(mergeIssueExecutionPolicyUpdate(stored, null)).toBeNull();
+    expect(mergeIssueExecutionPolicyUpdate(null, { monitor })).toEqual({ monitor });
+  });
+});
 
 describe("stripMonitorFromExecutionPolicy", () => {
   it.each([

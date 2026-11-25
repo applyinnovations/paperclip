@@ -412,6 +412,35 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   };
 }
 
+const EXECUTION_POLICY_KEYS_KEPT_WHEN_OMITTED = [
+  "mode",
+  "stages",
+  "requiredQualityReview",
+  "reviewPreset",
+  "authorizationPolicy",
+  "maxReviewRounds",
+] as const;
+
+/**
+ * Merge an issue update's `executionPolicy` into the stored policy. A field the
+ * update omits keeps its stored value, so a monitor-only update cannot drop the
+ * stages and with them the live review progress. A `null` field is removed.
+ * `monitor` keeps replace semantics. `null` for the whole policy clears it.
+ * Returns raw input for `normalizeIssueExecutionPolicy`.
+ */
+export function mergeIssueExecutionPolicyUpdate(
+  stored: IssueExecutionPolicy | null,
+  update: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (update === null) return null;
+  const merged: Record<string, unknown> = { ...update };
+  for (const key of EXECUTION_POLICY_KEYS_KEPT_WHEN_OMITTED) {
+    if (merged[key] === undefined && stored?.[key] !== undefined) merged[key] = stored[key];
+    if (merged[key] === null) delete merged[key];
+  }
+  return merged;
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);

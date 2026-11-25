@@ -476,6 +476,21 @@ export const issueExecutionPolicySchema = z.object({
     .default(null),
 });
 
+/**
+ * `executionPolicy` in an issue update. The server merges it into the stored
+ * policy: an omitted field keeps its stored value, so a monitor-only update
+ * leaves the stages (and the review progress that depends on them) alone.
+ * `null` removes a field; `stages: []` removes every stage. `monitor` keeps
+ * replace semantics: an omitted monitor is removed.
+ */
+export const issueExecutionPolicyUpdateSchema = objectWithoutDefaults(issueExecutionPolicySchema)
+  .partial()
+  .extend({
+    requiredQualityReview: requiredQualityReviewSchema.optional().nullable(),
+    reviewPreset: lowTrustReviewPresetPolicySchema.optional().nullable(),
+    authorizationPolicy: trustAuthorizationPolicySchema.optional().nullable(),
+  });
+
 export const issueExecutionMonitorStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_MONITOR_STATE_STATUSES),
   nextCheckAt: z.string().datetime().nullable(),
@@ -974,6 +989,7 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
+    executionPolicy: issueExecutionPolicyUpdateSchema.optional().nullable(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),

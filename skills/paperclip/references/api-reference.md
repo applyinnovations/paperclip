@@ -446,6 +446,8 @@ PATCH /api/issues/:issueId
 }
 ```
 
+`executionPolicy` in a PATCH merges into the stored policy: a field you omit (`stages`, `mode`, `maxReviewRounds`, `reviewPreset`, `authorizationPolicy`, `requiredQualityReview`) keeps its stored value, and `null` removes it. `stages: []` removes every stage and `executionPolicy: null` removes the whole policy. `monitor` is the exception: send it on every policy PATCH you want it kept on, because an omitted `monitor` is removed.
+
 When the executor finishes work, move the source issue to `in_review`. Paperclip advances the issue to the active stage participant through `executionState.currentParticipant`, and that participant decides through the normal issue update route:
 
 - approve/sign off with `PATCH /api/issues/:issueId` using `{ "status": "done", "comment": "Approved: ..." }`

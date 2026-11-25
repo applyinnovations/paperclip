@@ -832,6 +832,109 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  describe("partial executionPolicy updates", () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const executorAgentId = "44444444-4444-4444-8444-444444444444";
+    const stageIds = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "66666666-6666-4666-8666-666666666666",
+      "77777777-7777-4777-8777-777777777777",
+    ];
+    const stagedPolicy = () => normalizeIssueExecutionPolicy({
+      stages: stageIds.map((id, index) => ({
+        id,
+        type: index === stageIds.length - 1 ? "approval" : "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      })),
+      maxReviewRounds: 3,
+    })!;
+    // Stage 1 approved, pending at stage 2 with the reviewer assigned.
+    const executionState = {
+      status: "pending",
+      currentStageId: stageIds[1],
+      currentStageIndex: 1,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerAgentId },
+      returnAssignee: { type: "agent", agentId: executorAgentId },
+      reviewRequest: null,
+      completedStageIds: [stageIds[0]],
+      lastDecisionId: "88888888-8888-4888-8888-888888888888",
+      lastDecisionOutcome: "approved",
+    };
+    const stagedIssue = () => ({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1020",
+      title: "Staged review with a monitor",
+      executionPolicy: stagedPolicy(),
+      executionState,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    });
+    const reviewerApp = () => createApp({
+      type: "agent",
+      agentId: reviewerAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    });
+    const patchIssue = async (body: Record<string, unknown>, app = reviewerApp) => {
+      const issue = stagedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      const res = await request(await app())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send(body);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown> | undefined;
+      return { res, issue, patch, updated: { ...issue, ...patch } };
+    };
+
+    it("keeps the stages and review progress on a monitor-only update", async () => {
+      const { res, issue, patch, updated } = await patchIssue({
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z", notes: "Wait for CI." },
+        },
+      });
+
+      expect(res.status).toBe(200);
+      expect(patch?.monitorNextCheckAt).toEqual(new Date("2026-12-01T12:00:00.000Z"));
+      const policy = updated.executionPolicy as NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
+      expect(policy.stages).toEqual(issue.executionPolicy.stages);
+      expect(policy.maxReviewRounds).toBe(3);
+      expect(policy.monitor).toMatchObject({ nextCheckAt: "2026-12-01T12:00:00.000Z", scheduledBy: "assignee" });
+      expect(updated.status).toBe("in_review");
+      expect(updated.assigneeAgentId).toBe(reviewerAgentId);
+      expect(updated.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: stageIds[1],
+        completedStageIds: [stageIds[0]],
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: executorAgentId },
+      });
+    });
+
+    it("clears the policy and review progress on an explicit empty stage list", async () => {
+      const { res, updated } = await patchIssue({
+        executionPolicy: { stages: [], maxReviewRounds: null },
+      }, () => createApp());
+
+      expect(res.status).toBe(200);
+      expect(updated.executionPolicy).toBeNull();
+      expect(updated.executionState).toBeNull();
+    });
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

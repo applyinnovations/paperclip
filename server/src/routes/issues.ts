@@ -364,6 +364,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergeIssueExecutionPolicyUpdate,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -14929,15 +14930,17 @@ export function issueRoutes(
           }
         }
       }
-      if (req.body.executionPolicy !== undefined) {
-        updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
-          actor.actorType,
-        );
-      }
       const previousExecutionPolicy = normalizeIssueExecutionPolicy(
         existing.executionPolicy ?? null,
       );
+      if (req.body.executionPolicy !== undefined) {
+        updateFields.executionPolicy = applyActorMonitorScheduledBy(
+          normalizeIssueExecutionPolicy(
+            mergeIssueExecutionPolicyUpdate(previousExecutionPolicy, req.body.executionPolicy),
+          ),
+          actor.actorType,
+        );
+      }
       const nextExecutionPolicy =
         updateFields.executionPolicy !== undefined
           ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
