@@ -28,7 +28,7 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName: "pc-workload",
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: "pc-workload", uid: "uid-1" },
-      grant: { allowFqdns: ["github.com", "pypi.org"], allowCidrs: [] },
+      grant: { allowFqdns: [], allowCidrs: ["203.0.113.0/24"] },
     });
     expect(createNamespacedNetworkPolicy).toHaveBeenCalledWith(expect.objectContaining({
       namespace: "paperclip-acme",
@@ -50,11 +50,28 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName,
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: workloadName, uid: "uid-1" },
-      grant: { allowFqdns: ["github.com"], allowCidrs: [] },
+      grant: { allowFqdns: [], allowCidrs: ["203.0.113.0/24"] },
     });
 
     expect(name).toHaveLength(253);
     expect(name).toMatch(/unique-tail-egress$/);
+  });
+
+  it("creates no NetworkPolicy for a hostname-only grant (NetworkPolicy is CIDR-only)", async () => {
+    const createNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+    for (const mode of ["standard", "proxy"] as const) {
+      const name = await createScopedNetworkEgressPolicy({
+        clients: { networking: { createNamespacedNetworkPolicy } } as never,
+        namespace: "paperclip-acme",
+        mode,
+        runId: "run-123",
+        workloadName: "pc-workload",
+        ownerReference: { apiVersion: "batch/v1", kind: "Job", name: "pc-workload", uid: "uid-1" },
+        grant: { allowFqdns: ["github.com"], allowCidrs: [] },
+      });
+      expect(name).toBeNull();
+    }
+    expect(createNamespacedNetworkPolicy).not.toHaveBeenCalled();
   });
 
   it("adds the policy and grant path to likely network denials", () => {
@@ -79,7 +96,7 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName: "pc-workload",
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: "pc-workload", uid: "uid-1" },
-      grant: { allowFqdns: ["github.com"], allowCidrs: [] },
+      grant: { allowFqdns: [], allowCidrs: ["203.0.113.0/24"] },
     }, releaseWorkload)).rejects.toBe(policyError);
     expect(releaseWorkload).toHaveBeenCalledOnce();
   });

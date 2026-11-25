@@ -30,7 +30,7 @@ export function parseScopedNetworkEgressGrant(settings: unknown): ScopedNetworkE
 export async function createScopedNetworkEgressPolicy(input: {
   clients: KubeClients;
   namespace: string;
-  mode: "standard" | "cilium";
+  mode: "standard" | "cilium" | "proxy";
   runId: string;
   workloadName: string;
   ownerReference: Record<string, unknown>;
@@ -62,10 +62,12 @@ export async function createScopedNetworkEgressPolicy(input: {
       body: manifest,
     });
   } else {
+    // NetworkPolicy is CIDR-only. FQDN grants are rejected before this point
+    // in `standard` mode and left to the egress proxy in `proxy` mode.
+    if (input.grant.allowCidrs.length === 0) return null;
     const [, manifest] = buildNetworkPolicyManifests({
       namespace: input.namespace,
       paperclipServerNamespace: "",
-      egressAllowFqdns: input.grant.allowFqdns,
       egressAllowCidrs: input.grant.allowCidrs,
       name,
       podSelector: { "paperclip.io/run-id": input.runId },

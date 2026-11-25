@@ -73,7 +73,7 @@ describe("plugin", () => {
     expect(result.status).toBe("ok");
   });
 
-  it("validateConfig warns about FQDN limitation in standard mode", async () => {
+  it("validateConfig warns that standard mode can't enforce the hostname list and refuses new sandboxes", async () => {
     const result = await plugin.definition.onEnvironmentValidateConfig!({
       driverKey: "kubernetes",
       config: { inCluster: true, adapterType: "claude_local" },
@@ -81,6 +81,7 @@ describe("plugin", () => {
     expect(result.ok).toBe(true);
     expect(result.warnings).toBeDefined();
     expect(result.warnings?.some((w) => w.includes("api.anthropic.com"))).toBe(true);
+    expect(result.warnings?.some((w) => w.includes("public IPv4"))).toBe(false);
   });
 
   it("validateConfig does NOT warn when egressMode is cilium", async () => {

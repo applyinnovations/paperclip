@@ -129,7 +129,13 @@ export interface KubernetesEnvironmentConfigInput {
   backend?: "sandbox-cr" | "job";
   inCluster?: boolean;
   runtimeClassName?: string;
-  egressMode?: "cilium" | "standard";
+  egressMode?: "cilium" | "standard" | "proxy";
+  /** Required by the plugin when `egressMode` is `proxy`. */
+  egressProxy?: {
+    url: string;
+    enforcement: "observe" | "enforce";
+    noProxy?: string[];
+  };
   egressAllowFqdns?: string[];
   egressAllowCidrs?: string[];
   namespacePrefix?: string;

@@ -69,7 +69,8 @@ Common optional fields:
 | `imagePullSecrets` | `[]` | Names of pre-created Docker image pull secrets in the tenant namespace. |
 | `egressAllowFqdns` | `[]` | Additional FQDNs (beyond adapter defaults like `api.anthropic.com`). |
 | `egressAllowCidrs` | `[]` | Additional CIDRs to allow egress to. |
-| `egressMode` | `"standard"` | `standard` (NetworkPolicy + CIDRs) or `cilium` (CiliumNetworkPolicy + FQDN allow-list). |
+| `egressMode` | `"standard"` | `standard` (NetworkPolicy + CIDRs; refuses new sandboxes when a hostname list is configured), `cilium` (CiliumNetworkPolicy + FQDN allow-list) or `proxy` (in-cluster egress proxy, see below). |
+| `egressProxy` | — | Required when `egressMode` is `proxy`: `{ url, enforcement: "observe" \| "enforce", noProxy? }`. |
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
@@ -92,7 +93,7 @@ Keep provider-level egress defaults narrow, then grant only the destinations a t
 }
 ```
 
-The provider creates a workload-owned policy selected by the task run label, so the additional destinations do not become reachable from other concurrent agent pods. Cilium mode enforces FQDNs directly. Standard NetworkPolicy mode cannot express FQDNs, so an FQDN grant permits public IPv4 TCP 80/443 for that run while excluding private, loopback, link-local, CGNAT, and multicast ranges. Network failures that look policy-related include the grant path in stderr, and the sandbox exposes the effective policy through `PAPERCLIP_NETWORK_EGRESS_*` environment variables.
+The provider creates a workload-owned policy selected by the task run label, so the additional destinations do not become reachable from other concurrent agent pods. Cilium mode enforces FQDNs directly. Standard NetworkPolicy mode cannot express FQDNs, so it refuses a new sandbox whose grant includes an FQDN. In `proxy` mode the scoped policy carries only CIDRs; hostnames are the egress proxy's job. Network failures that look policy-related include the grant path in stderr, and the sandbox exposes the effective policy through `PAPERCLIP_NETWORK_EGRESS_*` environment variables.
 
 ## Subscription sign-in (login PTY)
 
@@ -108,6 +109,26 @@ The driver advertises `supportsLoginPty`, so Paperclip's provider-generic sign-i
 
 The adapter's runtime image must provide `/bin/sh`, `mkdir`, and the CLI on the container `PATH` (the exec does not source login profiles): `claude` for `claude_local`, `codex` for `codex_local`. The Codex credential read also needs `node`. The command runs as the pod user (UID 1000) with `HOME=/home/paperclip`; `/tmp` is a writable `emptyDir`.
 
+### Hostname enforcement and the `proxy` egress mode
+
+Every built-in adapter has a hostname list (`allowFqdns`, e.g. `api.anthropic.com`). Kubernetes NetworkPolicy is CIDR-only and cannot enforce it, so the plugin **fails closed**: in `standard` mode, acquiring a new sandbox with a non-empty hostname list (adapter, `egressAllowFqdns` or task grant) is refused with an error that names the mode and the fix. There is no "public IPv4 on 80/443" fallback. Running sandboxes are not re-checked, and `validateConfig` still accepts the config (with a warning) so an environment is never taken offline by it.
+
+`proxy` mode points sandboxes at an in-cluster egress proxy. The plugin sets `HTTPS_PROXY`/`HTTP_PROXY` (and lower-case forms) to `egressProxy.url`, and `NO_PROXY` to `localhost,127.0.0.1,::1,paperclip-server,.svc,.cluster.local` plus `egressProxy.noProxy`, so the in-pod runner, the paperclip-server callback and other cluster Services stay direct. The plugin does not run or configure the proxy, and does not change NetworkPolicy for it.
+
+`egressProxy.enforcement` must be set explicitly:
+
+- `observe`: the proxy only logs destination hostnames. **The hostname list is not enforced.** The plugin says so in `validateConfig` warnings, the probe summary and a log line per new sandbox.
+- `enforce`: the proxy denies hostnames outside its allowlist. Enforcement also needs the cluster to deny direct public egress, which is outside this plugin.
+
+```json
+{
+  "egressMode": "proxy",
+  "egressProxy": { "url": "http://paperclip-egress-proxy.paperclip.svc:3128", "enforcement": "observe" }
+}
+```
+
+Sandboxes also get `PAPERCLIP_NETWORK_EGRESS_MODE` and, in proxy mode, `PAPERCLIP_NETWORK_EGRESS_PROXY_ENFORCEMENT`.
+
 ### Sign-in egress
 
 The browser opens the provider's authorize page on the user's machine; the sandbox only calls the token endpoints:
@@ -117,7 +138,7 @@ The browser opens the provider's authorize page on the user's machine; the sandb
 | `claude_local` | `platform.claude.com` | `api.anthropic.com` |
 | `codex_local` | `auth.openai.com` | none |
 
-In `cilium` mode these hosts are added to the run's scoped policy (below). The sandbox-provider acquire does not say whether a lease is for a login, so they apply to every lease of that adapter unless the server marks the lease `purpose: "run"`. In `standard` mode FQDNs cannot be enforced; the hosts are reachable to the same extent as the adapter's other FQDNs (the public-IPv4 fallback, or your `egressAllowCidrs`). With an adapter registry (`adapters`, replace semantics) set `loginAllowFqdns` on the entry; an entry without it allows no sign-in hosts.
+In `cilium` mode these hosts are added to the run's scoped policy (below). The sandbox-provider acquire does not say whether a lease is for a login, so they apply to every lease of that adapter unless the server marks the lease `purpose: "run"`. In `standard` mode FQDNs cannot be enforced, so new sandboxes are refused (see above). In `proxy` mode sign-in hosts go through the proxy like any other host. With an adapter registry (`adapters`, replace semantics) set `loginAllowFqdns` on the entry; an entry without it allows no sign-in hosts.
 
 Running an agent on the subscription afterwards needs the provider's runtime hosts as well (for Codex, `chatgpt.com` and `auth.openai.com` for token refresh). Add them with `egressAllowFqdns`, a task grant, or the registry entry's `allowFqdns`.
 

@@ -56,7 +56,14 @@ function acquire(config: Record<string, unknown> = {}) {
     companyId: "company-1",
     environmentId: "env-1",
     runId: "run-1",
-    config: { inCluster: true, ...config },
+    // Built-in adapters always carry a hostname list, which egressMode=standard
+    // refuses (APP-464 AC4), so these leases use the proxy in observe mode.
+    config: {
+      inCluster: true,
+      egressMode: "proxy",
+      egressProxy: { url: "http://paperclip-egress-proxy.paperclip.svc:3128", enforcement: "observe" },
+      ...config,
+    },
   } as never);
 }
 

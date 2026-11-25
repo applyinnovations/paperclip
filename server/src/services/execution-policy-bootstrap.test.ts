@@ -73,6 +73,48 @@ describe("parseExecutionPolicyBootstrapEnv", () => {
     });
   });
 
+  it("parses proxy egress mode with its proxy settings", () => {
+    const parsed = parseExecutionPolicyBootstrapEnv(
+      env({
+        PAPERCLIP_EXECUTION_MODE: "kubernetes",
+        PAPERCLIP_K8S_EGRESS_MODE: "proxy",
+        PAPERCLIP_K8S_EGRESS_PROXY_URL: "http://paperclip-egress-proxy.paperclip.svc:3128",
+        PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT: "observe",
+        PAPERCLIP_K8S_EGRESS_PROXY_NO_PROXY: "registry.internal, .corp",
+      }),
+    );
+    expect(parsed?.kubernetesConfig).toMatchObject({
+      egressMode: "proxy",
+      egressProxy: {
+        url: "http://paperclip-egress-proxy.paperclip.svc:3128",
+        enforcement: "observe",
+        noProxy: ["registry.internal", ".corp"],
+      },
+    });
+  });
+
+  it("requires a proxy URL and an explicit enforcement in proxy mode", () => {
+    const base = { PAPERCLIP_EXECUTION_MODE: "kubernetes", PAPERCLIP_K8S_EGRESS_MODE: "proxy" };
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ ...base, PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT: "observe" })),
+    ).toThrow(/PAPERCLIP_K8S_EGRESS_PROXY_URL/);
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(env({ ...base, PAPERCLIP_K8S_EGRESS_PROXY_URL: "http://proxy:3128" })),
+    ).toThrow(/PAPERCLIP_K8S_EGRESS_PROXY_ENFORCEMENT/);
+  });
+
+  it("rejects proxy settings without proxy mode", () => {
+    expect(() =>
+      parseExecutionPolicyBootstrapEnv(
+        env({
+          PAPERCLIP_EXECUTION_MODE: "kubernetes",
+          PAPERCLIP_K8S_EGRESS_MODE: "standard",
+          PAPERCLIP_K8S_EGRESS_PROXY_URL: "http://proxy:3128",
+        }),
+      ),
+    ).toThrow(/only applies with PAPERCLIP_K8S_EGRESS_MODE=proxy/);
+  });
+
   it("defaults inCluster false and omits unset optional fields", () => {
     const parsed = parseExecutionPolicyBootstrapEnv(
       env({ PAPERCLIP_EXECUTION_MODE: "kubernetes" }),

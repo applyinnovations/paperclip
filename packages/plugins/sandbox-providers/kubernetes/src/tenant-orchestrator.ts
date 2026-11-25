@@ -7,7 +7,7 @@ export interface EnsureTenantInput {
   companyId: string;
   paperclipServerNamespace: string;
   serviceAccountAnnotations: Record<string, string>;
-  egressMode: "standard" | "cilium";
+  egressMode: "standard" | "cilium" | "proxy";
   egressAllowFqdns: string[];
   egressAllowCidrs: string[];
   resourceQuota: {
@@ -39,7 +39,13 @@ const LIMIT_RANGE_NAME = "paperclip-limits";
  *
  * Particular gotcha: switching egressMode "standard" → "cilium" leaves the
  * old paperclip-egress-allow NetworkPolicy in place alongside the new
- * CiliumNetworkPolicy. Both apply; the effective egress is the intersection.
+ * CiliumNetworkPolicy. Both apply, and allow rules are additive: the
+ * effective egress is the UNION of everything either policy allows, so the
+ * old NetworkPolicy keeps granting its destinations until it is deleted.
+ *
+ * `proxy` mode uses the same standard NetworkPolicy as `standard` (DNS,
+ * paperclip-server and any CIDRs). Reaching the egress proxy, and denying
+ * direct public egress, is the cluster's NetworkPolicy job, not the plugin's.
  */
 export async function ensureTenant(clients: KubeClients, input: EnsureTenantInput): Promise<void> {
   await ensureNamespace(clients, input);
@@ -211,7 +217,6 @@ async function ensureNetworkPolicies(clients: KubeClients, input: EnsureTenantIn
     namespace: input.namespace,
     paperclipServerNamespace: input.paperclipServerNamespace,
     egressAllowCidrs: input.egressAllowCidrs,
-    egressAllowFqdns: input.egressAllowFqdns,
   });
 
   await ensureNetworkPolicy(clients, input.namespace, denyAll);
