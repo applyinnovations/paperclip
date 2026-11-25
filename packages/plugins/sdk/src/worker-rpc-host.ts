@@ -693,6 +693,22 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             ...(options.companyId ? { companyId: options.companyId } : {}),
           });
         },
+        async recordPushEvidence(input) {
+          return callHost("githubApp.recordPushEvidence", {
+            headers: input.headers,
+            rawBody: input.rawBody,
+          });
+        },
+        async listBranchUpdates(options) {
+          return callHost("githubApp.listBranchUpdates", {
+            repository: options.repository,
+            ref: options.ref,
+            ...(options.afterSha !== undefined ? { afterSha: options.afterSha } : {}),
+            ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+            ...(options.limit !== undefined ? { limit: options.limit } : {}),
+            ...(options.companyId ? { companyId: options.companyId } : {}),
+          });
+        },
       },
 
       activity: {

@@ -746,6 +746,58 @@ export type PluginGitHubAppWebhookVerification =
         | "installation_mismatch";
     };
 
+/** Attribution state of one GitHub ref update. See {@link PluginGitHubAppClient.listBranchUpdates}. */
+export type PluginBranchUpdateState = "attempted" | "confirmed" | "unattributed" | "ambiguous";
+
+/** A run that reported pushing one ref update through its managed `git` launcher. */
+export interface PluginBranchUpdatePusher {
+  agentId: string;
+  runId: string;
+  /** The run's originating issue, from the server-side run record. */
+  issueId: string | null;
+  /** `succeeded`: the remote reported ok. `unknown`: no report. Failed attempts are never listed. */
+  outcome: "succeeded" | "unknown";
+  reportedAt: string;
+}
+
+/** One transition of a ref (`beforeSha` -> `afterSha`). All-zero `beforeSha` creates, all-zero `afterSha` deletes. */
+export interface PluginBranchUpdate {
+  id: string;
+  state: PluginBranchUpdateState;
+  repository: string;
+  ref: string;
+  beforeSha: string;
+  afterSha: string;
+  /** GitHub's `forced` flag; null until GitHub's evidence arrives. */
+  forced: boolean | null;
+  /** attempted: one or more; confirmed: exactly one; ambiguous: two or more; unattributed: none. */
+  pushers: PluginBranchUpdatePusher[];
+  /** Set only when `state` is `confirmed`. */
+  agentId: string | null;
+  runId: string | null;
+  issueId: string | null;
+  firstSeenAt: string;
+  /** When the host recorded GitHub's verified evidence, or null. */
+  githubReceivedAt: string | null;
+}
+
+/** A page of branch updates, oldest first. `complete` is true only when there is no further page. */
+export interface PluginBranchUpdatePage {
+  updates: PluginBranchUpdate[];
+  nextCursor: string | null;
+  complete: boolean;
+}
+
+export type PluginPushEvidenceResult =
+  | { recorded: true; duplicate: boolean }
+  | {
+      recorded: false;
+      reason:
+        | Extract<PluginGitHubAppWebhookVerification, { verified: false }>["reason"]
+        | "not_push_event"
+        | "invalid_payload";
+    };
+
 /**
  * `ctx.githubApp` — the operator-owned GitHub App of a company.
  *
@@ -781,6 +833,40 @@ export interface PluginGitHubAppClient {
    * `getInstallationToken`, a `companyId` other than the invocation's company is denied.
    */
   getApprovalsToken(options: { repository: string; companyId?: string }): Promise<PluginGitHubApprovalsToken | null>;
+
+  /**
+   * Record GitHub's own evidence of a ref update. Requires `github.push-provenance.record`.
+   * Pass a `push` delivery's headers and raw body from `onWebhook` unchanged: the host
+   * re-verifies the signature and takes the company from the verified App, never from the
+   * plugin. Other events resolve `{ recorded: false, reason: "not_push_event" }`.
+   * Redelivery is idempotent (`duplicate: true`).
+   */
+  recordPushEvidence(input: {
+    headers: Record<string, string | string[]>;
+    rawBody: string;
+  }): Promise<PluginPushEvidenceResult>;
+
+  /**
+   * Who updated a branch, for the invocation's company. Requires `github.push-provenance.read`.
+   *
+   * Each update is one `before -> after` transition of the ref. It is `confirmed` only when
+   * GitHub's verified push evidence matches exactly one run's reported push; `attempted`
+   * when runs reported it but GitHub's evidence has not arrived; `unattributed` when GitHub
+   * reported it and no run did; `ambiguous` when two or more runs claimed it. Updates are
+   * never removed by later pushes or force-pushes, and state is derived on every read.
+   *
+   * Pages are oldest first. Follow `nextCursor` until `complete` is true; a partial read is
+   * not evidence that no other update exists. `limit` is 1..200 (default 100). A
+   * `companyId` other than the invocation's company is denied.
+   */
+  listBranchUpdates(options: {
+    repository: string;
+    ref: string;
+    afterSha?: string;
+    cursor?: string | null;
+    limit?: number;
+    companyId?: string;
+  }): Promise<PluginBranchUpdatePage>;
 }
 
 /**

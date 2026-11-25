@@ -226,7 +226,7 @@ Paperclip. It is not available yet. When it is:
    **Check suite**, **Check run** and **Status**. The final list is set by the
    plugin.
 
-The plugin never reads App private keys or webhook secrets. Plugins use two
+The plugin never reads App private keys or webhook secrets. Plugins use these
 host services, each behind its own capability:
 
 - `ctx.githubApp.getInstallationToken()` (`github.app.token`) returns a
@@ -239,6 +239,43 @@ host services, each behind its own capability:
   the App's company only when the signature is valid and the delivery is for
   the configured installation. The plugin must deduplicate on
   `X-GitHub-Delivery`, because a valid signature does not prevent replay.
+- `ctx.githubApp.recordPushEvidence({ headers, rawBody })`
+  (`github.push-provenance.record`) records GitHub's own `push` evidence
+  (repository, ref, before and after SHAs, `forced`). The host re-verifies the
+  signature and takes the company from the verified App. Redelivery is
+  idempotent.
+- `ctx.githubApp.listBranchUpdates({ repository, ref, afterSha?, cursor?, limit? })`
+  (`github.push-provenance.read`) says which run updated a branch of the
+  invocation's company. See "Push provenance" below.
+
+### Push provenance
+
+A run's managed `git` launcher reports each `git push` it makes to
+`POST /runtime-tools/github/push-attempts`, using the run's GitHub capability.
+The launcher reads the ref updates it actually sent (full SHAs) and the
+remote's per-ref `ok`/`ng` report from git's own packet trace, written to a
+private temporary file that is deleted afterwards. Company, run, agent and
+originating issue come from the run's authentication and its `heartbeat_runs`
+row, never from the request body. A ref the remote rejected is stored as
+`failed` and never counts. A push that sends no update records nothing. The
+report never changes the exit status of `git push`.
+
+Each `before -> after` transition of a ref is one update
+(`github_ref_updates`). Run reports are stored in `github_push_attempts`.
+`listBranchUpdates` works out each update's state when it is read:
+
+| State | Meaning |
+| --- | --- |
+| `attempted` | One or more runs reported it; GitHub's evidence has not arrived. |
+| `confirmed` | GitHub's evidence matches exactly one run's report. Only this state names a single `agentId`/`runId`/`issueId`. |
+| `unattributed` | GitHub reported it and no run did. Examples: the web UI, the REST API, an unmanaged client, or a report that failed. |
+| `ambiguous` | Two or more runs reported the same transition. All of them are listed in `pushers`. |
+
+Pages are oldest first. `complete` is true only when `nextCursor` is null, and
+there is no silent cap. A merge gate must treat anything short of a complete
+read in which every relevant update is `confirmed` as pending, and must treat
+every listed pusher as an implementer. Updates are never removed, so a later
+push or force-push cannot erase an earlier one.
 
 ## Identity resolution
 

@@ -85,6 +85,8 @@ import type {
   PluginGitHubAppInstallationToken,
   PluginGitHubAppWebhookVerification,
   PluginGitHubApprovalsToken,
+  PluginBranchUpdatePage,
+  PluginPushEvidenceResult,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1763,6 +1765,21 @@ export interface WorkerToHostMethods {
   "githubApp.getApprovalsToken": [
     params: { repository: string; companyId?: string },
     result: PluginGitHubApprovalsToken | null,
+  ];
+  "githubApp.recordPushEvidence": [
+    params: { headers: Record<string, string | string[]>; rawBody: string },
+    result: PluginPushEvidenceResult,
+  ];
+  "githubApp.listBranchUpdates": [
+    params: {
+      repository: string;
+      ref: string;
+      afterSha?: string;
+      cursor?: string | null;
+      limit?: number;
+      companyId?: string;
+    },
+    result: PluginBranchUpdatePage,
   ];
 
   // Activity

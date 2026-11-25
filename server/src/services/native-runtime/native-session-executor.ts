@@ -102,6 +102,7 @@ import { RUNNERD_CONTROL_PLANE_STATE_SCHEMAS, runnerdStateIsIncompleteBootstrap,
 import { createNativeDeliverableTextObservation } from "./native-deliverable-text.js";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
 import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
+import { recordPushAttempts } from "../github-push-provenance.js";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { createArtifactInstaller } from "./artifact-transfer.js";
@@ -10974,6 +10975,7 @@ async function executePaperclipNativeSessionAttempt(
           cwd: input.execution.workspace.cwd!,
           env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
           resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
+          recordPushAttempts: (binding, body) => recordPushAttempts(input.db, binding, body),
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();

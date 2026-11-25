@@ -470,3 +470,105 @@ it("captures the current task broker file once per invocation and never falls ba
   expect((await run()).stdout).toBe("anonymous");
   expect(captured).toEqual(["Bearer first-run", "Bearer next-run"]);
 });
+
+describe("managed push provenance reports", () => {
+  const before = "cd24b048da21e60a9fb6fdc45051c403fc2cd86e";
+  const after = "7d091de1de2e70c45b98967fdfca3dd3820bf4f2";
+  const other = "1111111111111111111111111111111111111111";
+  // Lines in git 2.54's GIT_TRACE_PACKET / GIT_TRACE2_EVENT formats. The receive-pack lines
+  // (only present for local transports) must be ignored; the remote URL's token is redacted by git.
+  const packets = [
+    `11:05:53.072437 pkt-line.c:85           packet:         push< ${before} refs/heads/main\\0report-status delete-refs side-band-64k`,
+    `11:05:53.072460 pkt-line.c:85           packet:         push< ${other} refs/heads/rejected`,
+    `11:05:53.072654 pkt-line.c:85           packet:         push> ${before} ${after} refs/heads/main\\0 report-status-v2 side-band-64k quiet`,
+    `11:05:53.072655 pkt-line.c:85           packet:         push> ${other} ${after} refs/heads/rejected`,
+    `11:05:53.072656 pkt-line.c:85           packet: receive-pack< ${other} ${before} refs/heads/forged`,
+    `11:05:53.072664 pkt-line.c:85           packet:         push> 0000`,
+    `11:05:53.091804 pkt-line.c:85           packet:     sideband< \\1000eunpack ok0017ok refs/heads/main0000`,
+    `11:05:53.091836 pkt-line.c:85           packet:         push< unpack ok`,
+    `11:05:53.091846 pkt-line.c:85           packet:         push< ok refs/heads/main`,
+    `11:05:53.091847 pkt-line.c:85           packet:         push< ng refs/heads/rejected protected branch hook declined`,
+  ].join("\n") + "\n";
+  const events = [
+    JSON.stringify({ event: "start", argv: ["git", "push", "--force", "origin", "main", "rejected"] }),
+    JSON.stringify({ event: "child_start", child_class: "remote-https",
+      argv: ["git", "remote-https", "origin", "https://x-access-token:<REDACTED>@github.com/Acme/Widgets.git"] }),
+  ].join("\n") + "\n";
+
+  async function fixture(options: { packets?: string; status?: number; brokerStatus?: number } = {}) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-push-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real"), seenEnv = path.join(root, "env.json");
+    await mkdir(bin); await mkdir(real);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "git"), `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(seenEnv)}, JSON.stringify({ packet: process.env.GIT_TRACE_PACKET || null, trace2: process.env.GIT_TRACE2_EVENT || null }));
+if (process.argv[2] === "push" && process.env.GIT_TRACE_PACKET) {
+  fs.appendFileSync(process.env.GIT_TRACE_PACKET, ${JSON.stringify(options.packets ?? packets)});
+  fs.appendFileSync(process.env.GIT_TRACE2_EVENT, ${JSON.stringify(events)});
+}
+process.exit(${options.status ?? 0});
+`, { mode: 0o700 });
+    const reports: Array<{ headers: Record<string, unknown>; body: unknown }> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        if (req.url === "/runtime-tools/github/push-attempts") {
+          reports.push({ headers: { capability: req.headers["x-paperclip-github-capability"] }, body: JSON.parse(body) });
+          res.writeHead(options.brokerStatus ?? 200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ recorded: 1 }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "secret-installation-token" } }));
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "run-capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}${path.delimiter}${real}${path.delimiter}${process.env.PATH}` };
+    const run = (args: string[]) => exec(path.join(bin, "git"), args, { env, cwd: root });
+    const tracedWith = async () => JSON.parse(await readFile(seenEnv, "utf8")) as { packet: string | null; trace2: string | null };
+    return { run, reports, tracedWith, root };
+  }
+
+  it("reports exactly the ref updates the remote received, with the remote's per-ref result", async () => {
+    const { run, reports, tracedWith } = await fixture();
+    await run(["push", "--force", "origin", "main", "rejected"]);
+    expect(reports).toEqual([{ headers: { capability: "run-capability" }, body: {
+      repository: "acme/widgets", exitCode: 0, forced: true,
+      updates: [
+        { ref: "refs/heads/main", before, after, result: "ok" },
+        { ref: "refs/heads/rejected", before: other, after, result: "ng" },
+      ],
+    } }]);
+    // No URL, token or trace text leaves the launcher, and the private trace files are gone.
+    expect(JSON.stringify(reports)).not.toMatch(/secret|REDACTED|x-access-token|https:/);
+    const traced = await tracedWith();
+    expect(traced.packet).toMatch(/push-packets\.trace$/);
+    await expect(readFile(traced.packet!, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports nothing for a push that sent no ref update, and never traces other commands", async () => {
+    const noop = await fixture({ packets: `11:05:53.072437 pkt-line.c:85           packet:         push< ${before} refs/heads/main\n` });
+    await noop.run(["push", "origin", "main"]);
+    expect(noop.reports).toEqual([]);
+    const fetch = await fixture();
+    await fetch.run(["fetch", "origin"]);
+    expect(await fetch.tracedWith()).toEqual({ packet: null, trace2: null });
+    expect(fetch.reports).toEqual([]);
+  });
+
+  it("keeps the push's exit status when the push fails or the report is rejected", async () => {
+    const failed = await fixture({ status: 1 });
+    await expect(failed.run(["push", "origin", "main"])).rejects.toMatchObject({ code: 1 });
+    expect(failed.reports).toHaveLength(1);
+    expect((failed.reports[0]!.body as { exitCode: number }).exitCode).toBe(1);
+    const rejected = await fixture({ brokerStatus: 403 });
+    const result = await rejected.run(["push", "origin", "main"]);
+    expect(result.stderr).toContain("push provenance not recorded (rejected_403)");
+    expect(rejected.reports).toHaveLength(1);
+  });
+});

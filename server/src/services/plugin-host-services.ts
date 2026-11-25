@@ -76,6 +76,10 @@ import {
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { githubAppInstallationTokenSource } from "./github-app-installation-credentials.js";
 import { githubAppWebhookVerifier } from "./github-app-webhooks.js";
+import {
+  listBranchUpdates as listGitHubBranchUpdates,
+  recordPushEvidence as recordGitHubPushEvidence,
+} from "./github-push-provenance.js";
 import { githubApprovalsTokenSource } from "./github-approvals-token.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
@@ -1835,6 +1839,22 @@ export function buildHostServices(
           throw new Error("githubApp.verifyWebhook requires headers and rawBody");
         }
         return (options.githubAppWebhooks ?? githubAppWebhookVerifier()).verify(params);
+      },
+      async recordPushEvidence(params) {
+        if (typeof params?.rawBody !== "string" || typeof params.headers !== "object" || params.headers === null) {
+          throw new Error("githubApp.recordPushEvidence requires headers and rawBody");
+        }
+        // The company is the verified App's company; the plugin cannot choose it.
+        const verification = await (options.githubAppWebhooks ?? githubAppWebhookVerifier()).verify(params);
+        if (!verification.verified) return { recorded: false, reason: verification.reason };
+        await ensurePluginAvailableForCompany(verification.companyId);
+        return recordGitHubPushEvidence(db, verification, params.rawBody, { pluginId });
+      },
+      async listBranchUpdates(params) {
+        // The host client handler has already pinned companyId to the invocation's company.
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return listGitHubBranchUpdates(db, companyId, params);
       },
       async getApprovalsToken(params) {
         // The host client handler has already pinned companyId to the invocation's company.

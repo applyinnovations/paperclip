@@ -201,6 +201,15 @@ Policy: Existing run-bound tool, scoped credential lease, execution policy, or a
 Evidence: `source-only` — [route](../../server/src/routes/connection-intents.ts); reviewed in the working tree based on the source commit above.
 Verification: `not-run` — individual operation not executed in this audit; shared authorization and representative family flows are exercised by the authenticated integration suite. Follow the route schema, inspect persistence/audit, and assert owner, scope and revoked-authority denial.
 Gaps: This individual operation has source review but no recorded HTTP verification. Provider availability and live setup remain unqualified.
+
+### `post-runtime-tools-github-push-attempts`
+
+API: `present` — `POST /runtime-tools/github/push-attempts`; JSON REST.
+Agent access: `available` — called by the managed `git` launcher after a `git push`, with the run's GitHub capability (directly, through the sandbox callback bridge, or through the native session broker).
+Policy: The run capability must have `github_credentials` scope and its run must still be running. Company, run, agent and issue come from the capability and the run row; the body names only the repository and ref updates. Browser requests are refused.
+Evidence: `verified` — [push provenance integration tests](../../server/src/__tests__/github-push-provenance.test.ts) run the route against a real database. They cover concurrent runs, retries, failed and no-op pushes, ended runs, and identity fields in the body being ignored.
+Verification: `passed` — deterministic local fixture; no live GitHub push.
+Gaps: No live GitHub push or webhook in this audit.
 ## `handoff`
 
 Capability ID: `connection-setup/handoff`.
