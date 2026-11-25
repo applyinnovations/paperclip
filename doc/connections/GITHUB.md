@@ -140,8 +140,12 @@ integration id (a merge gate: an `approval` commit status posted when a
 reviewer approves in Paperclip). Plugins with the `github.approvals.token`
 capability call `ctx.githubApp.getApprovalsToken({ repository: "owner/name" })`
 and receive an installation token scoped to that one repository, with
-`statuses: write`, `issues: write` and `contents`, `metadata`,
-`pull_requests: read`. They never receive the key or a JWT.
+`statuses: write`, `pull_requests: write`, `issues: write` and `contents`,
+`metadata: read`. They never receive the key or a JWT. The App and its
+installation must grant all of these: GitHub refuses to mint a token that asks
+for more than the installation accepted. `pull_requests: write` is what lets a
+gate put a removed label back on a pull request; with only `issues: write`
+GitHub answers `403 Resource not accessible by integration`.
 
 ```json
 {

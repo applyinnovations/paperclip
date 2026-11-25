@@ -144,6 +144,17 @@ describe("approvals token source", () => {
     expect(GITHUB_APPROVALS_TOKEN_PERMISSIONS).not.toHaveProperty("contents", "write");
   });
 
+  it("can put a removed label back on a pull request (APP-461)", () => {
+    // GitHub labels a PR through the issues API only with pull_requests: write.
+    expect(GITHUB_APPROVALS_TOKEN_PERMISSIONS).toEqual({
+      statuses: "write",
+      pull_requests: "write",
+      contents: "read",
+      metadata: "read",
+      issues: "write",
+    });
+  });
+
   it("caches per repository and never shares a token across repositories", async () => {
     const { stub, tokens } = source();
     const a = await tokens.resolve(COMPANY_A, "acme/deployments");

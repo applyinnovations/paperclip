@@ -18,10 +18,17 @@ import { GITHUB_APP_TOKEN_REFRESH_MARGIN_MS } from "./github-app-installation-cr
  * module. A company only gets tokens for repositories the operator allowlisted for it.
  */
 
-/** The permissions every approvals token is minted with: post statuses, read the PR, keep labels. */
+/**
+ * The permissions every approvals token is minted with: post statuses, read the PR, keep labels.
+ *
+ * Putting a label back on a pull request (`POST /repos/{o}/{r}/issues/{n}/labels`) needs
+ * `pull_requests: write`; `issues: write` covers only issues, and GitHub answers a PR with
+ * `403 Resource not accessible by integration` (APP-461). The approvals App and its installation
+ * must grant every permission listed here, or GitHub refuses to mint the token at all.
+ */
 export const GITHUB_APPROVALS_TOKEN_PERMISSIONS = {
   statuses: "write",
-  pull_requests: "read",
+  pull_requests: "write",
   contents: "read",
   metadata: "read",
   issues: "write",
