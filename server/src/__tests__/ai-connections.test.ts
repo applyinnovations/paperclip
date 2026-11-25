@@ -1617,6 +1617,33 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     } finally { fetchSpy.mockRestore(); }
   });
 
+  it("revokes a shared grant after a failed run only when the provider also rejects the credential (APP-199)", async () => {
+    const secret = "shared-revoke-check-secret";
+    const account = await service.save(companyId, "alice", { provider: "anthropic", method: "subscription", ownership: "shared", name: "Shared revoke check", loginSessionId: "fixture", agentIds: [], allAgents: true }, secret);
+    const generation = createHash("sha256").update(secret).digest("hex").slice(0, 16);
+    const fail = () => service.markAuthenticationFailed({ companyId, agentId, runStartedAt: new Date(), attribution: {
+      provider: "anthropic", method: "subscription", connectionId: account.connectionId, grantId: account.grantId,
+      mode: "shared", responsibleUserId: null, identity: `${account.grantId}:shared:${generation}`,
+    } as never });
+    const status = async () => (await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0].status;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      // The credential still works: one failed run must not take the company offline.
+      fetchSpy.mockImplementation(async () => new Response(JSON.stringify({ five_hour: { utilization: 42 } })));
+      await fail();
+      expect(await status()).toBe("active");
+      expect(fetchSpy).toHaveBeenCalledWith("https://api.anthropic.com/api/oauth/usage", expect.anything());
+      // The provider is unreachable: the failure is unconfirmed, so keep the grant.
+      fetchSpy.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+      await fail();
+      expect(await status()).toBe("active");
+      // The provider rejects the credential too: revoke.
+      fetchSpy.mockImplementation(async () => new Response("unauthorized", { status: 401 }));
+      await fail();
+      expect(await status()).toBe("needs_reauthorization");
+    } finally { fetchSpy.mockRestore(); }
+  });
+
   it("vaults routed credentials, enforces compatibility and access, and configures both Codex runners", async () => {
     const routing = { kind: "openrouter", protocol: "responses", auth: "bearer", models: [{ id: "openai/gpt-5.4" }] } as const;
     const saved = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Routed test", ownership: "personal", apiKey: "fixture", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "fixture-routed-credential");

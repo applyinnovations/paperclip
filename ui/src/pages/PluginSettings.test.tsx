@@ -210,6 +210,94 @@ describe("PluginSettings", () => {
     });
   });
 
+  function configurablePlugin() {
+    return basePlugin({
+      pluginKey: "acme.approval-gate",
+      status: "ready",
+      manifestJson: {
+        displayName: "Approval Gate",
+        version: "0.1.0",
+        capabilities: [],
+        instanceConfigSchema: {
+          type: "object",
+          properties: { mode: { type: "string", title: "Mode" } },
+        },
+      },
+    });
+  }
+
+  it("renders a file-managed plugin config read-only with a note", async () => {
+    mockPluginsApi.get.mockResolvedValue(configurablePlugin());
+    mockPluginsApi.getConfig.mockResolvedValue({
+      id: "config-1",
+      pluginId: "plugin-1",
+      companyId: "company-1",
+      configJson: { mode: "enforce" },
+      lastError: null,
+      managedBy: "file",
+    });
+
+    const root = await renderSettings(container);
+
+    expect(container.querySelector('[data-testid="plugin-config-managed-note"]')?.textContent)
+      .toContain("PAPERCLIP_PLUGIN_CONFIG_FILE");
+    expect(container.textContent).not.toContain("Save Configuration");
+    const input = container.querySelector("input") as HTMLInputElement | null;
+    expect(input?.value).toBe("enforce");
+    expect(input?.disabled).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("renders a file-managed pair with no stored config read-only, without Save", async () => {
+    mockPluginsApi.get.mockResolvedValue(configurablePlugin());
+    mockPluginsApi.getConfig.mockResolvedValue({
+      id: null,
+      pluginId: "plugin-1",
+      companyId: "company-1",
+      configJson: {},
+      lastError: null,
+      managedBy: "file",
+      createdAt: null,
+      updatedAt: null,
+    });
+
+    const root = await renderSettings(container);
+
+    const note = container.querySelector('[data-testid="plugin-config-managed-note"]')?.textContent;
+    expect(note).toContain("PAPERCLIP_PLUGIN_CONFIG_FILE");
+    expect(note).toContain("has not been applied yet");
+    expect(container.textContent).not.toContain("Save Configuration");
+    expect((container.querySelector("input") as HTMLInputElement | null)?.disabled).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("keeps a plugin config the file does not manage editable", async () => {
+    mockPluginsApi.get.mockResolvedValue(configurablePlugin());
+    mockPluginsApi.getConfig.mockResolvedValue({
+      id: "config-1",
+      pluginId: "plugin-1",
+      companyId: "company-1",
+      configJson: { mode: "shadow" },
+      lastError: null,
+    });
+
+    const root = await renderSettings(container);
+
+    expect(container.querySelector('[data-testid="plugin-config-managed-note"]')).toBeNull();
+    expect(container.textContent).toContain("Save Configuration");
+    expect((container.querySelector("input") as HTMLInputElement | null)?.disabled).toBe(false);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("renders unconfigured manifest local folders with required paths", async () => {
     const declaration = wikiFolderDeclaration();
     mockPluginsApi.get.mockResolvedValue(basePlugin({

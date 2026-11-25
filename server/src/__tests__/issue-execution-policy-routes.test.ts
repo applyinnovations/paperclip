@@ -1252,6 +1252,31 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it.each([
+    ["an explicit null policy opts out of", { executionPolicy: null }, true],
+    ["an omitted policy keeps", {}, false],
+  ])("%s the project's default stages on child creation", async (_label, policyField, skip) => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "11111111-1111-4111-8111-111111111111",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1001",
+      title: "Parent issue",
+      executionPolicy: null,
+      executionState: null,
+    });
+
+    const res = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/children")
+      .send({ title: "Release", ...policyField });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild.mock.calls[0]?.[1]).toMatchObject({ skipProjectDefaultExecutionStages: skip });
+  });
+
   it("rejects child monitor scheduling by a non-assignee agent even with task assignment permission", async () => {
     mockAccessService.hasPermission.mockResolvedValue(true);
     mockIssueService.getById.mockResolvedValue({

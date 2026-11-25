@@ -44,6 +44,7 @@ import type {
   PaperclipPluginManifestV1,
   PluginBridgeErrorCode,
   PluginLauncherRenderContextSnapshot,
+  PluginConfigManagedWithoutRow,
 } from "@paperclipai/shared";
 import {
   PLUGIN_STATUSES,
@@ -79,6 +80,7 @@ import {
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
+  assertPluginLocalFolderRootAllowed,
   findLocalFolderDeclaration,
   getStoredLocalFolders,
   inspectPluginLocalFolder,
@@ -95,7 +97,13 @@ import {
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import {
+  applyPluginConfig,
+  PluginConfigSchemaError,
+  validatePluginSecretRefsForCompany as validateConfigSecretRefsForCompany,
+} from "../services/plugin-config-apply.js";
+import type { PluginConfigFileManagedCheck } from "../services/plugin-config-file.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -538,6 +546,8 @@ export function pluginRoutes(
   toolDeps?: PluginRouteToolDeps,
   bridgeDeps?: PluginRouteBridgeDeps,
   toolGatewayDeps?: PluginRouteToolGatewayDeps,
+  /** PAPERCLIP_PLUGIN_CONFIG_FILE: (plugin, company) pairs whose config the file owns. */
+  configFile?: PluginConfigFileManagedCheck,
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
@@ -787,20 +797,7 @@ export function pluginRoutes(
     companyId: string,
     refs: ReturnType<typeof extractSecretRefBindingsFromConfig>,
   ): Promise<void> {
-    if (refs.length === 0) return;
-    const secretsSvc = secretService(db);
-    const checked = new Set<string>();
-    for (const ref of refs) {
-      if (checked.has(ref.secretId)) continue;
-      checked.add(ref.secretId);
-      const secret = await secretsSvc.getById(ref.secretId);
-      if (!secret || secret.companyId !== companyId) {
-        throw unprocessable("Plugin config references a secret outside the selected company");
-      }
-      if (secret.status === "deleted") {
-        throw unprocessable("Plugin config references a deleted secret");
-      }
-    }
+    await validateConfigSecretRefsForCompany(db, companyId, refs);
   }
 
   function performActionActorContext(req: Request, companyId: string | undefined): PluginPerformActionActorContext {
@@ -2345,9 +2342,11 @@ export function pluginRoutes(
    * Retrieve the current company-scoped configuration for a plugin.
    *
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
-   * has not yet been configured.
+   * has not yet been configured. A pair PAPERCLIP_PLUGIN_CONFIG_FILE manages
+   * carries `managedBy: "file"`, with or without a stored row (without one,
+   * the response is a `PluginConfigManagedWithoutRow`).
    *
-   * Response: `PluginConfig | null`
+   * Response: `PluginConfig | PluginConfigManagedWithoutRow | null`
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/config", async (req, res) => {
@@ -2362,7 +2361,29 @@ export function pluginRoutes(
     }
 
     const config = await registry.getConfig(plugin.id, companyId);
-    res.json(config);
+    const managedBy = configFile?.managedBy(plugin.pluginKey, companyId) ?? null;
+    if (!managedBy) {
+      res.json(config);
+      return;
+    }
+    if (config) {
+      res.json({ ...config, managedBy: managedBy.source });
+      return;
+    }
+    // Managed, but the file's entry has not been stored (it failed to apply,
+    // or the file has not been read): still read-only, so the UI never offers
+    // a save the POST route would refuse.
+    const managedWithoutRow: PluginConfigManagedWithoutRow = {
+      id: null,
+      pluginId: plugin.id,
+      companyId,
+      configJson: {},
+      lastError: null,
+      managedBy: managedBy.source,
+      createdAt: null,
+      updatedAt: null,
+    };
+    res.json(managedWithoutRow);
   });
 
   /**
@@ -2395,6 +2416,10 @@ export function pluginRoutes(
 
     const body = req.body as { companyId?: unknown; configJson?: Record<string, unknown> } | undefined;
     const companyId = requirePluginConfigCompanyId(req, body?.companyId);
+    const managedBy = configFile?.managedBy(plugin.pluginKey, companyId) ?? null;
+    if (managedBy) {
+      throw conflict(managedBy.message, { code: "plugin_config_managed", managedBy: managedBy.source });
+    }
     if (!body?.configJson || typeof body.configJson !== "object" || Array.isArray(body.configJson)) {
       res.status(400).json({ error: '"configJson" is required and must be an object' });
       return;
@@ -2410,86 +2435,30 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
-    // Validate configJson against the plugin's instanceConfigSchema (if declared).
-    // This ensures CLI/API callers get the same validation the UI performs client-side.
-    const schema = plugin.manifestJson?.instanceConfigSchema;
-    if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
-      if (!validation.valid) {
-        res.status(400).json({
-          error: "Configuration does not match the plugin's instanceConfigSchema",
-          fieldErrors: validation.errors,
-        });
-        return;
-      }
-    }
-
+    // Validation (instanceConfigSchema, secret refs), persistence and worker
+    // delivery are shared with PAPERCLIP_PLUGIN_CONFIG_FILE (applyPluginConfig).
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
-      await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      await secretService(db).syncSecretRefsForTarget(
-        companyId,
-        { targetType: "plugin", targetId: plugin.id },
-        secretRefs,
-        { replaceAll: true },
+      const { row, secretRefCount } = await applyPluginConfig(
+        db,
+        {
+          workerManager: bridgeDeps?.workerManager,
+          restartWorker: (id) => lifecycle.restartWorker(id),
+        },
+        { plugin, companyId, configJson: body.configJson },
       );
-
-      const result = await registry.upsertConfig(plugin.id, companyId, {
-        companyId,
-        configJson: body.configJson,
-      });
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
         companyId,
-        secretRefCount: secretRefs.length,
+        secretRefCount,
         configKeyCount: Object.keys(body.configJson).length,
       });
-
-      // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
-      // If the worker implements onConfigChanged, send the new config via RPC.
-      // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
-      // up the new config on re-initialize. If no worker is running, skip.
-      if (bridgeDeps?.workerManager.isRunning(plugin.id)) {
-        // Refresh the worker's authorized proactive company scopes so the
-        // just-configured company can be acted on from proactive loops (e.g.
-        // the chat gateway's notifier drain) without requiring a restart
-        // (LOOA-629). The set is exactly the plugin's configured companies.
-        try {
-          const configRows = await registry.listConfigs(plugin.id);
-          bridgeDeps.workerManager.setProactiveCompanyScopes(
-            plugin.id,
-            configRows.map((row) => row.companyId),
-          );
-        } catch {
-          // Non-fatal: the set is rebuilt from the DB on the next worker start.
-        }
-
-        try {
-          await bridgeDeps.workerManager.call(
-            plugin.id,
-            "configChanged",
-            { config: body.configJson, companyId },
-          );
-        } catch (rpcErr) {
-          if (
-            rpcErr instanceof JsonRpcCallError &&
-            rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
-          ) {
-            // Worker doesn't handle live config — restart it.
-            try {
-              await lifecycle.restartWorker(plugin.id);
-            } catch {
-              // Restart failure is non-fatal for the config save response.
-            }
-          }
-          // Other RPC errors (timeout, unavailable) are non-fatal — config is
-          // already persisted and will take effect on next worker restart.
-        }
-      }
-
-      res.json(result);
+      res.json(row);
     } catch (err) {
+      if (err instanceof PluginConfigSchemaError) {
+        res.status(400).json({ error: err.message, fieldErrors: err.fieldErrors });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
@@ -3021,6 +2990,7 @@ export function pluginRoutes(
 
     const existing = await registry.getCompanySettings(plugin.id, companyId);
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
+    assertPluginLocalFolderRootAllowed(body.path);
     const status = await inspectPluginLocalFolder({
       folderKey,
       declaration,

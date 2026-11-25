@@ -2916,6 +2916,57 @@ function buildExecutionStageWakeup(input: {
     };
   }
 
+  // Final-stage approval of a review the executor requested without marking
+  // the work complete: the issue is handed back so the executor can finish
+  // delivery (merge, release, verification) and close it.
+  if (
+    nextState.status === "completed" &&
+    nextState.lastDecisionOutcome === "approved" &&
+    nextState.completionRequested !== true &&
+    previousState?.status === "pending"
+  ) {
+    const agentId =
+      nextState.returnAssignee?.type === "agent"
+        ? (nextState.returnAssignee.agentId ?? null)
+        : null;
+    if (!agentId) return null;
+
+    const executionStage = buildExecutionStageWakeContext({
+      state: {
+        ...nextState,
+        currentStageId: previousState.currentStageId,
+        currentStageType: previousState.currentStageType,
+      },
+      wakeRole: "executor",
+      allowedActions: ["continue_delivery", "mark_done"],
+    });
+
+    return {
+      agentId,
+      wakeup: {
+        source: "assignment" as const,
+        triggerDetail: "system" as const,
+        reason: "issue_assigned",
+        payload: {
+          issueId,
+          mutation: "update",
+          executionStage,
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+        },
+        requestedByActorType: input.requestedByActorType,
+        requestedByActorId: input.requestedByActorId,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+          source: "issue.execution_stage",
+          executionStage,
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+        },
+      },
+    };
+  }
+
   return null;
 }
 
@@ -13142,6 +13193,8 @@ export function issueRoutes(
         originRunId: createBody.originRunId ?? actor.runId,
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
+        // An explicit `executionPolicy: null` opts out of the project's default stages.
+        skipProjectDefaultExecutionStages: createBody.executionPolicy === null,
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -13544,6 +13597,8 @@ export function issueRoutes(
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
         executionPolicy,
+        // An explicit `executionPolicy: null` opts out of the project's default stages.
+        skipProjectDefaultExecutionStages: createBody.executionPolicy === null,
         ...(currentSerializedChild
           ? {
               status: "blocked",

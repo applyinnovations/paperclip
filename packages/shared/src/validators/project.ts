@@ -3,6 +3,7 @@ import { PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema } from "./trust-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
+import { issueExecutionStageSchema } from "./issue.js";
 
 export const projectDiscoverySchema = z.object({
   limit: z.number().int().min(1).max(50).default(50),
@@ -21,6 +22,16 @@ const executionWorkspaceStrategySchema = z
   })
   .strict();
 
+/**
+ * Execution stages (review, approval) that every issue created in the project
+ * starts with, unless the issue is created with stages of its own.
+ */
+export const projectDefaultExecutionPolicySchema = z.object({
+  stages: z.array(issueExecutionStageSchema).max(10),
+}).strict();
+
+export type ProjectDefaultExecutionPolicyInput = z.infer<typeof projectDefaultExecutionPolicySchema>;
+
 export const projectExecutionWorkspacePolicySchema = z
   .object({
     enabled: z.boolean(),
@@ -37,6 +48,7 @@ export const projectExecutionWorkspacePolicySchema = z
     runtimePolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     cleanupPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     authorizationPolicy: trustAuthorizationPolicySchema.optional().nullable(),
+    defaultIssueExecutionPolicy: projectDefaultExecutionPolicySchema.optional().nullable(),
   })
   .strict();
 

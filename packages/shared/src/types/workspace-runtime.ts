@@ -1,5 +1,6 @@
 import type { TrustAuthorizationPolicy } from "../trust-policy.js";
 import type { RuntimeExposureStatus } from "./runtime-exposure.js";
+import type { ProjectDefaultExecutionPolicy } from "./project.js";
 
 export type ExecutionWorkspaceStrategyType =
   | "project_primary"
@@ -184,6 +185,11 @@ export interface ProjectExecutionWorkspacePolicy {
   runtimePolicy?: Record<string, unknown> | null;
   cleanupPolicy?: Record<string, unknown> | null;
   authorizationPolicy?: TrustAuthorizationPolicy | null;
+  /**
+   * Stages every issue created in the project starts with, unless the issue
+   * is created with stages of its own.
+   */
+  defaultIssueExecutionPolicy?: ProjectDefaultExecutionPolicy | null;
 }
 
 export interface IssueExecutionWorkspaceSettings {
