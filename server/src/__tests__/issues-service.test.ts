@@ -2961,6 +2961,7 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -3059,6 +3060,129 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
 
     const found = await svc.findOpenAncestorCreatedByAgent(parentId, delegatorId);
     expect(found?.id).toBe(midId);
+  });
+
+  async function seedAgent(companyId: string, name: string) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name,
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return id;
+  }
+
+  async function logAssignment(input: {
+    companyId: string;
+    issueId: string;
+    actorType: "agent" | "user";
+    actorId: string;
+    from: string | null;
+    to: string | null;
+    at: Date;
+  }) {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.actorType === "agent" ? input.actorId : null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issueId,
+      details: {
+        assigneeAgentId: input.to,
+        changes: { assigneeAgentId: { from: input.from, to: input.to } },
+      },
+      createdAt: input.at,
+    });
+  }
+
+  it("ignores an agent-created ancestor another agent has since re-routed (filed finding shaped then planned)", async () => {
+    // Engineer files the finding, the Product Owner shapes it and hands it to
+    // the CTO, and the CTO plans the build back to the Engineer.
+    const { companyId, delegatorId: engineerId, midId } = await seedChain();
+    const productOwnerId = await seedAgent(companyId, "Product Owner");
+    const ctoId = await seedAgent(companyId, "CTO");
+    await db.update(issues).set({ assigneeAgentId: ctoId }).where(eq(issues.id, midId));
+    await logAssignment({
+      companyId, issueId: midId, actorType: "agent", actorId: engineerId,
+      from: null, to: productOwnerId, at: new Date("2026-11-01T00:00:00Z"),
+    });
+    await logAssignment({
+      companyId, issueId: midId, actorType: "agent", actorId: productOwnerId,
+      from: productOwnerId, to: ctoId, at: new Date("2026-11-02T00:00:00Z"),
+    });
+
+    expect(await svc.findOpenAncestorCreatedByAgent(midId, engineerId)).toBeNull();
+  });
+
+  it("ignores an agent-created ancestor a board user re-assigned", async () => {
+    const { companyId, delegatorId, midId } = await seedChain();
+    const holderId = await seedAgent(companyId, "Holder");
+    await logAssignment({
+      companyId, issueId: midId, actorType: "user", actorId: "board-user",
+      from: null, to: holderId, at: new Date("2026-11-02T00:00:00Z"),
+    });
+
+    expect(await svc.findOpenAncestorCreatedByAgent(midId, delegatorId)).toBeNull();
+  });
+
+  it("still finds the ancestor when its creator made the last assignment (direct hot-potato)", async () => {
+    // A creates the work and delegates it to B; B handing it back to A is the
+    // cycle the guard exists for.
+    const { companyId, delegatorId, midId } = await seedChain();
+    const delegateId = await seedAgent(companyId, "Delegate");
+    await logAssignment({
+      companyId, issueId: midId, actorType: "agent", actorId: delegatorId,
+      from: null, to: delegateId, at: new Date("2026-11-01T00:00:00Z"),
+    });
+
+    expect((await svc.findOpenAncestorCreatedByAgent(midId, delegatorId))?.id).toBe(midId);
+  });
+
+  it("uses the most recent assignee change and ignores unrelated updates", async () => {
+    const { companyId, delegatorId, midId } = await seedChain();
+    const otherId = await seedAgent(companyId, "Other");
+    await logAssignment({
+      companyId, issueId: midId, actorType: "agent", actorId: otherId,
+      from: null, to: otherId, at: new Date("2026-11-01T00:00:00Z"),
+    });
+    await logAssignment({
+      companyId, issueId: midId, actorType: "agent", actorId: delegatorId,
+      from: otherId, to: randomUUID(), at: new Date("2026-11-02T00:00:00Z"),
+    });
+    // A later non-assignment edit and a no-op reassignment by someone else
+    // do not re-route the work.
+    await db.insert(activityLog).values([
+      {
+        companyId, actorType: "agent", actorId: otherId, agentId: otherId,
+        action: "issue.updated", entityType: "issue", entityId: midId,
+        details: { status: "in_progress", changes: { status: { from: "todo", to: "in_progress" } } },
+        createdAt: new Date("2026-11-03T00:00:00Z"),
+      },
+      {
+        companyId, actorType: "agent", actorId: otherId, agentId: otherId,
+        action: "issue.reassigned", entityType: "issue", entityId: midId,
+        details: { changed: false },
+        createdAt: new Date("2026-11-04T00:00:00Z"),
+      },
+    ]);
+
+    expect((await svc.findOpenAncestorCreatedByAgent(midId, delegatorId))?.id).toBe(midId);
+
+    await db.insert(activityLog).values({
+      companyId, actorType: "agent", actorId: otherId, agentId: otherId,
+      action: "issue.reassigned", entityType: "issue", entityId: midId,
+      details: { changed: true, assigneeAgentId: otherId },
+      createdAt: new Date("2026-11-05T00:00:00Z"),
+    });
+    expect(await svc.findOpenAncestorCreatedByAgent(midId, delegatorId)).toBeNull();
   });
 
   it("terminates on a corrupted parent-graph cycle", async () => {

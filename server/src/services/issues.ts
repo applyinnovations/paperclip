@@ -8824,6 +8824,18 @@ export function issueService(db: Db) {
      * chain regardless of depth; `UNION` (not `UNION ALL`) deduplicates
      * revisited rows, so a parent graph corrupted into a loop terminates
      * instead of recursing forever.
+     *
+     * An ancestor stops counting as `agentId`'s delegation once someone else
+     * has re-routed it: when its most recent assignee change by an agent or
+     * user was made by anyone other than `agentId`. That is the shape of an
+     * agent-filed finding that a manager shaped and planned (Engineer files,
+     * Product Owner reassigns to the CTO, CTO plans a child back to the
+     * Engineer). The direct hot-potato stays caught: A creates the ancestor
+     * (assigned to B at creation or later by A), so A is still the last
+     * assigner when B tries to hand the work back. Assignee changes are read
+     * from the activity log (`issue.updated` with a recorded
+     * `changes.assigneeAgentId`/`assigneeUserId` diff, or `issue.reassigned`);
+     * an ancestor with no such record keeps the creator as its delegator.
      */
     findOpenAncestorCreatedByAgent: async (
       parentIssueId: string,
@@ -8848,6 +8860,23 @@ export function issueService(db: Db) {
         JOIN ancestors a ON a.id = i.id
         WHERE i.created_by_agent_id = ${agentId}
           AND i.status NOT IN ('done', 'cancelled')
+          AND coalesce((
+            SELECT al.actor_type = 'agent' AND al.actor_id = ${agentId}::text
+            FROM activity_log al
+            WHERE al.company_id = i.company_id
+              AND al.entity_type = 'issue'
+              AND al.entity_id = i.id::text
+              AND al.actor_type IN ('agent', 'user')
+              AND (
+                (al.action = 'issue.updated'
+                  AND jsonb_typeof(al.details -> 'changes') = 'object'
+                  AND (al.details -> 'changes') ?| array['assigneeAgentId', 'assigneeUserId'])
+                OR (al.action = 'issue.reassigned'
+                  AND coalesce(al.details ->> 'changed', 'true') <> 'false')
+              )
+            ORDER BY al.created_at DESC, al.id DESC
+            LIMIT 1
+          ), true)
         LIMIT 1
       `);
       const first = (Array.isArray(rows) ? rows[0] : null) as Record<
