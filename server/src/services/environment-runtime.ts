@@ -112,6 +112,7 @@ import {
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
 import { withoutServerProcessEnv } from "./remote-command-env.js";
+import { getSandboxTransferLimiter } from "./sandbox-transfer-limiter.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -4485,7 +4486,8 @@ export function environmentRuntimeService(
       if (!driver.syncIn) {
         throw new Error(`Environment driver "${driver.driver}" does not support native file sync.`);
       }
-      return await driver.syncIn(input);
+      const syncIn = driver.syncIn.bind(driver);
+      return await getSandboxTransferLimiter().run(() => syncIn(input));
     },
 
     async syncOut(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult> {
@@ -4493,7 +4495,8 @@ export function environmentRuntimeService(
       if (!driver.syncOut) {
         throw new Error(`Environment driver "${driver.driver}" does not support native file sync.`);
       }
-      return await driver.syncOut(input);
+      const syncOut = driver.syncOut.bind(driver);
+      return await getSandboxTransferLimiter().run(() => syncOut(input));
     },
 
     async openDuplexChannel(
