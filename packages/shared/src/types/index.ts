@@ -1081,6 +1081,7 @@ export type {
   PluginManagedSkillDeclaration,
   PluginManagedSkillFileDeclaration,
   PluginLocalFolderDeclaration,
+  PluginSandboxDeclaration,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
   PluginManagedRoutineResolution,

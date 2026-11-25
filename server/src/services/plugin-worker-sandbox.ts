@@ -22,6 +22,11 @@ export { collectProtectedSecretPaths };
  * apps file itself) must never fall inside an allowed path; the host refuses to
  * start a worker whose allowlist would cover one.
  *
+ * A plugin from a trusted plugin root may declare extra read-only paths in
+ * `manifest.sandbox.fsRead`. They are ignored (with a warning) for any other
+ * plugin, and a grant at, above or beside a protected secret file refuses the
+ * worker start.
+ *
  * See doc/plugins/PLUGIN_SPEC.md §12.6.
  */
 
@@ -71,6 +76,10 @@ export type PluginWorkerSandboxPlan =
       writePaths: string[];
       /** Protected secret paths the startup probe tries to open. */
       probePaths: string[];
+      /** Manifest `sandbox.fsRead` grants added to `readPaths` (as declared and their realpaths). */
+      grantedReadPaths: string[];
+      /** Set when the manifest declared read grants the host did not honour. */
+      ignoredReadGrants?: { paths: string[]; reason: "untrusted-plugin-root" };
     };
 
 export class PluginWorkerSandboxError extends Error {
@@ -83,7 +92,7 @@ export class PluginWorkerSandboxError extends Error {
 export interface PluginWorkerSandboxInput {
   pluginId: string;
   entrypointPath: string;
-  manifest: Pick<PaperclipPluginManifestV1, "capabilities">;
+  manifest: Pick<PaperclipPluginManifestV1, "capabilities" | "sandbox">;
   execArgv?: readonly string[];
   /** Defaults to process.env. */
   processEnv?: NodeJS.ProcessEnv;
@@ -290,6 +299,30 @@ function importTargets(execArgv: readonly string[]): string[] {
   return out;
 }
 
+/**
+ * Returns the protected secret file a read grant would reach, or null when the
+ * grant is clear. A grant may not be, contain, or sit in the directory of an
+ * operator secret file: that covers the file itself, every ancestor (`/`,
+ * `/etc`, ...), its parent directory and any sibling in it. Both the declared path and its realpath are checked, so a
+ * symlink to a forbidden location is refused too.
+ */
+export function findForbiddenReadGrant(grant: string, protectedSecretPaths: readonly string[]): string | null {
+  const candidates = [...new Set([path.resolve(grant), realpathOrResolve(grant)])];
+  for (const secret of protectedSecretPaths) {
+    const secretDir = path.dirname(secret);
+    for (const candidate of candidates) {
+      if (isWithin(candidate, secret) || isWithin(secretDir, candidate)) return secret;
+    }
+  }
+  return null;
+}
+
+function isTrustedPluginEntry(input: PluginWorkerSandboxInput, processEnv: NodeJS.ProcessEnv): boolean {
+  const trustedRoots = (input.trustedPluginRoots ?? DEFAULT_TRUSTED_PLUGIN_ROOTS(processEnv)).map(realpathOrResolve);
+  const entry = realpathOrResolve(input.entrypointPath);
+  return trustedRoots.some((root) => isWithin(root, entry));
+}
+
 function sanitizeForPath(pluginId: string): string {
   return pluginId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "plugin";
 }
@@ -315,9 +348,7 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
   const capabilities = (input.manifest.capabilities ?? []) as readonly string[];
   const exceptionCapability = UNSANDBOXED_TRUSTED_CAPABILITIES.find((c) => capabilities.includes(c));
   if (exceptionCapability) {
-    const trustedRoots = (input.trustedPluginRoots ?? DEFAULT_TRUSTED_PLUGIN_ROOTS(processEnv)).map(realpathOrResolve);
-    const entry = realpathOrResolve(input.entrypointPath);
-    if (trustedRoots.some((root) => isWithin(root, entry))) {
+    if (isTrustedPluginEntry(input, processEnv)) {
       return {
         mode: "disabled",
         reason: "trusted-exception",
@@ -346,6 +377,32 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
   read.add(realTmpDir);
   const write = [realTmpDir];
 
+  const declaredGrants = input.manifest.sandbox?.fsRead ?? [];
+  const grantedReadPaths: string[] = [];
+  let ignoredReadGrants: { paths: string[]; reason: "untrusted-plugin-root" } | undefined;
+  if (declaredGrants.length > 0) {
+    if (isTrustedPluginEntry(input, processEnv)) {
+      for (const grant of declaredGrants) {
+        const secret = findForbiddenReadGrant(grant, probePaths);
+        if (secret) {
+          throw new PluginWorkerSandboxError(
+            `Refusing to start plugin worker "${input.pluginId}": its manifest read grant ${grant} ` +
+              `is, contains or sits beside the operator secret file ${secret}. Read grants may not reach ` +
+              `a protected secret file, its directory or any ancestor of it.`,
+          );
+        }
+        // fs calls are checked against the path as given and module loads against
+        // the realpath, so grant both; findForbiddenReadGrant checked both.
+        for (const p of new Set([path.resolve(grant), realpathOrResolve(grant)])) {
+          grantedReadPaths.push(p);
+          read.add(p);
+        }
+      }
+    } else {
+      ignoredReadGrants = { paths: [...declaredGrants], reason: "untrusted-plugin-root" };
+    }
+  }
+
   const readPaths = [...read].sort();
   for (const secret of probePaths) {
     const covering = [...readPaths, ...write].find((allowed) => isWithin(allowed, secret));
@@ -373,5 +430,7 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
     readPaths,
     writePaths: write,
     probePaths,
+    grantedReadPaths,
+    ...(ignoredReadGrants ? { ignoredReadGrants } : {}),
   };
 }

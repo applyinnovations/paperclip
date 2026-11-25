@@ -16,6 +16,7 @@ vi.mock("../middleware/logger.js", () => {
   return { logger: mockLogger, httpLogger: vi.fn() };
 });
 
+import { logger } from "../middleware/logger.js";
 import { createPluginWorkerHandle, parseSandboxProbeMessage } from "../services/plugin-worker-manager.js";
 import {
   collectProtectedSecretPaths,
@@ -55,11 +56,16 @@ afterEach(() => {
   fs.rmSync(secretsDir, { recursive: true, force: true });
 });
 
-function probeHandle(pluginId = "test.sandbox", hostHandlers: Record<string, unknown> = {}, env?: Record<string, string>) {
+function probeHandle(
+  pluginId = "test.sandbox",
+  hostHandlers: Record<string, unknown> = {},
+  options: { env?: Record<string, string>; manifest?: PaperclipPluginManifestV1 } = {},
+) {
+  const { env, manifest = MANIFEST } = options;
   return createPluginWorkerHandle(pluginId, {
     ...(env ? { env } : {}),
     entrypointPath: PROBE_WORKER,
-    manifest: MANIFEST,
+    manifest,
     config: {},
     instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
     apiVersion: 1,
@@ -222,7 +228,7 @@ describe("plugin worker filesystem sandbox (real worker process)", () => {
     vi.stubEnv("PAPERCLIP_PLUGIN_WORKER_SANDBOX", "off");
     vi.stubEnv("PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE", keyFile);
     const expected = collectProtectedSecretPaths(process.env);
-    const handle = probeHandle("test.sandbox", {}, { FORGE_SANDBOX_PROBE: JSON.stringify(expected) });
+    const handle = probeHandle("test.sandbox", {}, { env: { FORGE_SANDBOX_PROBE: JSON.stringify(expected) } });
     try {
       await handle.start();
       const report = handle.diagnostics().sandbox;
@@ -240,6 +246,57 @@ describe("plugin worker filesystem sandbox (real worker process)", () => {
     try {
       await handle.start();
       expect(await probe(handle, { op: "read", file: keyFile })).toBe("ok");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+describe("manifest read grants (real worker process)", () => {
+  let grantDir: string;
+  beforeEach(() => {
+    grantDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sandbox-grant-"));
+    fs.writeFileSync(path.join(grantDir, "granted.txt"), "granted contents");
+    fs.writeFileSync(path.join(grantDir, "sibling.txt"), "sibling contents");
+  });
+  afterEach(() => {
+    fs.rmSync(grantDir, { recursive: true, force: true });
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  const grantManifest = (): PaperclipPluginManifestV1 => ({
+    ...MANIFEST,
+    sandbox: { fsRead: [path.join(grantDir, "granted.txt")] },
+  });
+
+  it("lets a trusted plugin read its granted file and nothing beside it", async () => {
+    // The probe counts as trusted when it sits under the bundled catalog root.
+    vi.stubEnv("PAPERCLIP_BUNDLED_PLUGIN_ROOT", FIXTURES_DIR);
+    const handle = probeHandle("test.sandbox", {}, { manifest: grantManifest() });
+    try {
+      await handle.start();
+      expect(await probe(handle, { op: "read", file: path.join(grantDir, "granted.txt") })).toBe("ok");
+      expect(await probe(handle, { op: "read", file: path.join(grantDir, "sibling.txt") })).toBe("ERR_ACCESS_DENIED");
+      expect(await probe(handle, { op: "read", file: keyFile })).toBe("ERR_ACCESS_DENIED");
+      // Read only: the grant gives neither write nor child-process access.
+      expect(await probe(handle, { op: "write", file: path.join(grantDir, "granted.txt") })).toBe("ERR_ACCESS_DENIED");
+      expect(await probe(handle, { op: "spawn" })).toBe("ERR_ACCESS_DENIED");
+      expect(fs.readFileSync(path.join(grantDir, "granted.txt"), "utf8")).toBe("granted contents");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops the grant of a third-party plugin, logs why, and still runs it sandboxed", async () => {
+    const handle = probeHandle("acme.thirdparty", {}, { manifest: grantManifest() });
+    try {
+      await handle.start();
+      expect(await probe(handle, { op: "read", file: path.join(grantDir, "granted.txt") })).toBe("ERR_ACCESS_DENIED");
+      expect(await probe(handle, { op: "tmp" })).toBe("ok");
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "untrusted-plugin-root", ignoredReadGrants: [path.join(grantDir, "granted.txt")] }),
+        expect.stringMatching(/ignoring sandbox\.fsRead grants declared by plugin "acme\.thirdparty".*not installed from a trusted plugin root/),
+      );
     } finally {
       await handle.stop().catch(() => undefined);
     }
@@ -374,4 +431,105 @@ describe("planPluginWorkerSandbox", () => {
       probeProcess.kill();
     }
   });
+
+  describe("read grants", () => {
+    const withGrants = (fsRead: string[]) => ({ ...MANIFEST, sandbox: { fsRead } });
+    const plan = (fsRead: string[], processEnv: NodeJS.ProcessEnv = {}, trustedPluginRoots = [FIXTURES_DIR]) =>
+      planPluginWorkerSandbox({
+        pluginId: "p", entrypointPath: PROBE_WORKER, manifest: withGrants(fsRead), processEnv,
+        trustedPluginRoots, tmpRoot: tmpRoot(),
+      });
+
+    it("adds a trusted plugin's grant as a read-only path", () => {
+      const granted = path.join(secretsDir, "readable.txt");
+      const result = plan([granted]);
+      expect(result.mode).toBe("enforced");
+      if (result.mode !== "enforced") return;
+      const real = path.join(fs.realpathSync(secretsDir), "readable.txt");
+      expect(result.execArgv).toContain(`--allow-fs-read=${real}`);
+      expect(result.grantedReadPaths).toContain(real);
+      expect(result.writePaths).not.toContain(real);
+      expect(result.execArgv.some((arg) => arg.startsWith("--allow-fs-write=") && arg.includes(real))).toBe(false);
+      expect(result.execArgv.some((arg) => arg.startsWith("--allow-child-process") || arg.startsWith("--allow-worker"))).toBe(false);
+    });
+
+    it("ignores a third-party plugin's grant and reports why", () => {
+      const granted = path.join(secretsDir, "readable.txt");
+      const result = plan([granted], {}, [path.join(secretsDir, "not-the-plugin-root")]);
+      expect(result.mode).toBe("enforced");
+      if (result.mode !== "enforced") return;
+      expect(result.ignoredReadGrants).toEqual({ paths: [granted], reason: "untrusted-plugin-root" });
+      expect(result.grantedReadPaths).toEqual([]);
+      expect(result.execArgv.some((arg) => arg.includes("readable.txt"))).toBe(false);
+    });
+
+    it("does not change the trusted exception: an exempt plugin stays unsandboxed", () => {
+      const result = planPluginWorkerSandbox({
+        pluginId: "p", entrypointPath: PROBE_WORKER,
+        manifest: { capabilities: ["environment.drivers.register"], sandbox: { fsRead: ["/opt/data"] } } as PaperclipPluginManifestV1,
+        processEnv: {}, trustedPluginRoots: [FIXTURES_DIR], tmpRoot: tmpRoot(),
+      });
+      expect(result).toMatchObject({ mode: "disabled", reason: "trusted-exception" });
+    });
+
+    describe("with an approvals key configured", () => {
+      let appsEnv: NodeJS.ProcessEnv;
+      let linkDir: string;
+      let appsDir: string;
+      afterEach(() => {
+        fs.rmSync(appsDir, { recursive: true, force: true });
+        fs.rmSync(linkDir, { recursive: true, force: true });
+      });
+      beforeEach(() => {
+        appsDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sandbox-apps-"));
+        const appsFile = path.join(appsDir, "apps.json");
+        fs.writeFileSync(appsFile, JSON.stringify({ approvalsApp: { appId: 2, privateKeyFile: keyFile } }));
+        appsEnv = { PAPERCLIP_GITHUB_APPS_FILE: appsFile };
+        fs.writeFileSync(path.join(secretsDir, "sibling.txt"), "not a key");
+        linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sandbox-link-"));
+        fs.symlinkSync(secretsDir, path.join(linkDir, "to-secrets"));
+        fs.symlinkSync(keyFile, path.join(linkDir, "to-key"));
+      });
+
+      const refused = () => [
+        ["the key itself", () => keyFile],
+        ["the key's parent directory", () => secretsDir],
+        ["a sibling file in that directory", () => path.join(secretsDir, "sibling.txt")],
+        ["a not-yet-existing path in that directory", () => path.join(secretsDir, "later", "file")],
+        ["an ancestor (/)", () => "/"],
+        ["an ancestor (the tmp dir above the key's directory)", () => path.dirname(secretsDir)],
+        ["a symlink to the parent directory", () => path.join(linkDir, "to-secrets")],
+        ["a symlink to the key", () => path.join(linkDir, "to-key")],
+      ] as const;
+
+      for (const [label, grant] of refused()) {
+        it(`refuses to start when a trusted plugin grants ${label}`, () => {
+          expect(() => plan([grant()], appsEnv)).toThrow(PluginWorkerSandboxError);
+          expect(() => plan([grant()], appsEnv)).toThrow(/manifest read grant .* sits beside the operator secret file /);
+        });
+      }
+
+      it("still allows a grant clear of the key", () => {
+        const result = plan([linkDir], appsEnv);
+        expect(result.mode).toBe("enforced");
+      });
+
+      it("ignores, rather than refuses, a forbidden grant from a third-party plugin", () => {
+        const result = plan([secretsDir], appsEnv, [path.join(linkDir, "elsewhere")]);
+        expect(result.mode).toBe("enforced");
+        if (result.mode !== "enforced") return;
+        expect(result.ignoredReadGrants?.paths).toEqual([secretsDir]);
+        expect(result.readPaths.some((p) => isInside(p, keyFile))).toBe(false);
+      });
+
+      it("refuses a key mounted with PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE too", () => {
+        expect(() => plan([secretsDir], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile })).toThrow(PluginWorkerSandboxError);
+      });
+    });
+  });
 });
+
+function isInside(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}

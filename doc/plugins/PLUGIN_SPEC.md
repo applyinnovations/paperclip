@@ -652,6 +652,31 @@ under this exception are the sandbox providers (including `kubernetes`), the fak
 sandbox, `plugin-workspace-diff`, and the file-browser and kitchen-sink examples.
 `server/src/__tests__/plugin-worker-sandbox-bundled.test.ts` pins this list.
 
+**Read grants.** A manifest may declare extra paths its worker needs to read:
+
+```json
+{ "sandbox": { "fsRead": ["/opt/reference-data"] } }
+```
+
+Each entry must be an absolute, normalised path (no `.` or `..` segments, no
+`//`, no trailing slash, no glob characters), with at most 16 entries; anything
+else fails manifest validation. The host honours grants only for plugins
+installed from the trusted plugin roots (the same check as the trusted
+exceptions below). For any other plugin the grants are ignored: the install
+succeeds, the worker runs sandboxed without them, and every worker start logs a
+warning naming the plugin and the reason. An honoured grant becomes
+`--allow-fs-read` for the path as declared and for its realpath. It is read
+only: it grants no write access and no child processes, worker threads or other
+permission. Some paths are **never grantable**. For every protected secret file
+(below, including `approvalsApp.privateKeyFile`), a grant is refused when its
+declared path or its realpath (the resolved path when it does not exist) is the
+secret file, is an ancestor of it (`/`, `/etc`, ...), or is the secret file's
+directory or anything inside it, such as a sibling file. A trusted plugin that
+declares a forbidden grant does not start: the start fails with an error naming
+the grant and the protected file. Grants do not affect the trusted exceptions,
+which stay unsandboxed. Node follows symlinks inside a granted directory, so
+grant only directories whose contents the image controls.
+
 **Operator escape hatch.** Setting `PAPERCLIP_PLUGIN_WORKER_SANDBOX=off` runs
 every worker without the sandbox. It is meant for local development, is unset in
 the image, and each unsandboxed start is logged as a warning.

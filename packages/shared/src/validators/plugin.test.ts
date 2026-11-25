@@ -541,3 +541,44 @@ describe("plugin task side-panel declarations", () => {
     expect(pluginManifestV1Schema.safeParse({ ...manifest, apiRoutes }).success).toBe(false);
   });
 });
+
+describe("plugin sandbox read grant declarations", () => {
+  const manifest = (sandbox: unknown) => ({
+    id: "example.grants", apiVersion: 1, version: "1.0.0", displayName: "Grants", description: "Grants", author: "Tests",
+    categories: ["automation"], capabilities: ["events.subscribe"], entrypoints: { worker: "worker.js" }, sandbox,
+  });
+  const parse = (fsRead: unknown) => pluginManifestV1Schema.safeParse(manifest({ fsRead }));
+
+  it("accepts absolute normalised paths and an omitted declaration", () => {
+    expect(parse(["/opt/data", "/srv/reference/table.csv", "/"]).success).toBe(true);
+    expect(pluginManifestV1Schema.safeParse(manifest(undefined)).success).toBe(true);
+    expect(pluginManifestV1Schema.parse(manifest({ fsRead: ["/opt/data"] })).sandbox).toEqual({ fsRead: ["/opt/data"] });
+  });
+
+  it.each([
+    ["a relative path", "opt/data"],
+    ["a dot-relative path", "./data"],
+    ["a path containing ..", "/opt/../etc"],
+    ["a trailing ..", "/opt/data/.."],
+    ["a . segment", "/opt/./data"],
+    ["a trailing slash", "/opt/data/"],
+    ["a doubled slash", "/opt//data"],
+    ["a glob", "/opt/*"],
+    ["a brace glob", "/opt/{a,b}"],
+    ["a backslash", "/opt\\data"],
+    ["an empty string", ""],
+  ])("rejects %s", (_label, entry) => {
+    const result = parse([entry]);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects more than 16 entries", () => {
+    const entries = Array.from({ length: 17 }, (_, i) => `/opt/data/${i}`);
+    expect(parse(entries).success).toBe(false);
+    expect(parse(entries.slice(0, 16)).success).toBe(true);
+  });
+
+  it("rejects unknown sandbox keys", () => {
+    expect(pluginManifestV1Schema.safeParse(manifest({ fsWrite: ["/tmp"] })).success).toBe(false);
+  });
+});

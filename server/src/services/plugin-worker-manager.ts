@@ -3442,6 +3442,12 @@ export function createPluginWorkerHandle(
         "plugin worker running without the filesystem sandbox",
       );
     }
+    if (sandbox.mode === "enforced" && sandbox.ignoredReadGrants) {
+      log.warn(
+        { reason: sandbox.ignoredReadGrants.reason, ignoredReadGrants: sandbox.ignoredReadGrants.paths },
+        `ignoring sandbox.fsRead grants declared by plugin "${pluginId}": it is not installed from a trusted plugin root`,
+      );
+    }
 
     intentionalStop = false;
     retirementPending = false;
