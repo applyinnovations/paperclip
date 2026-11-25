@@ -656,6 +656,32 @@ sandbox, `plugin-workspace-diff`, and the file-browser and kitchen-sink examples
 every worker without the sandbox. It is meant for local development, is unset in
 the image, and each unsandboxed start is logged as a warning.
 
+**Startup probe.** Every worker, sandboxed or not, first runs a host-owned probe
+(an `--import` of a `data:` URL, ahead of any other `--import` and the plugin's
+own code). It tries to open each protected secret file and reports only the
+outcome: `readable` or the error code (`ERR_ACCESS_DENIED` under the sandbox,
+`ENOENT` for a configured path that is absent). It never reads: a file that
+opens is closed at once. The path list reaches the probe through
+`PAPERCLIP_PLUGIN_SANDBOX_PROBE_PATHS`, which it deletes from the environment
+before plugin code runs. The result goes to the host over the worker's IPC
+channel; the host accepts only the first probe message and only one naming
+exactly the paths it asked about, so plugin code cannot overwrite it.
+
+The host records the result on the `worker process started and initialized` log
+line (`sandbox`, `sandboxReason`, `sandboxCapability`, `protectedPathProbe`),
+which is written only after the `initialize` RPC succeeds, and in the worker's
+diagnostics. That line is the production evidence that a running worker is denied
+the keys and still answers RPCs, without exec access to the pod. Then:
+
+- a sandboxed worker whose probe can open a protected file is stopped and its
+  start fails: the sandbox did not hold
+- an unsandboxed worker (trusted exception or operator opt-out) that can open
+  one also logs `unsandboxed plugin worker can open protected secret paths` as a
+  warning. This is the expected, accounted-for state of a trusted exception.
+- a probe that never reports is logged as an error
+  (`plugin worker sandbox probe did not report`). The permission flags still
+  apply, but a missing report is not proof of denial.
+
 ## 13. Host-Worker Protocol
 
 The host must support the following worker RPC methods.

@@ -16,11 +16,13 @@ vi.mock("../middleware/logger.js", () => {
   return { logger: mockLogger, httpLogger: vi.fn() };
 });
 
-import { createPluginWorkerHandle } from "../services/plugin-worker-manager.js";
+import { createPluginWorkerHandle, parseSandboxProbeMessage } from "../services/plugin-worker-manager.js";
 import {
   collectProtectedSecretPaths,
   planPluginWorkerSandbox,
   PluginWorkerSandboxError,
+  SANDBOX_PROBE_PATHS_ENV,
+  SANDBOX_PROBE_URL,
 } from "../services/plugin-worker-sandbox.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -53,8 +55,9 @@ afterEach(() => {
   fs.rmSync(secretsDir, { recursive: true, force: true });
 });
 
-function probeHandle(pluginId = "test.sandbox", hostHandlers: Record<string, unknown> = {}) {
+function probeHandle(pluginId = "test.sandbox", hostHandlers: Record<string, unknown> = {}, env?: Record<string, string>) {
   return createPluginWorkerHandle(pluginId, {
+    ...(env ? { env } : {}),
     entrypointPath: PROBE_WORKER,
     manifest: MANIFEST,
     config: {},
@@ -197,6 +200,40 @@ describe("plugin worker filesystem sandbox (real worker process)", () => {
     expect(handle.status).toBe("stopped");
   });
 
+  it("startup probe: the running sandboxed worker is denied the configured key and still serves RPCs", async () => {
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE", keyFile);
+    const handle = probeHandle();
+    try {
+      await handle.start();
+      const report = handle.diagnostics().sandbox;
+      expect(report?.mode).toBe("enforced");
+      expect(report?.protectedPathProbe?.length).toBeGreaterThan(0);
+      expect(report?.protectedPathProbe?.map((r) => r.path)).toContain(fs.realpathSync(keyFile));
+      for (const result of report?.protectedPathProbe ?? []) expect(result.outcome).toBe("ERR_ACCESS_DENIED");
+      await expect(handle.call("health", {} as never)).resolves.toMatchObject({ status: "ok" });
+      // The path list does not stay in the plugin's environment.
+      expect(await probe(handle, { op: "env", name: SANDBOX_PROBE_PATHS_ENV })).toBe("unset");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("startup probe: an unsandboxed worker reports the key as readable, and plugin code cannot overwrite that", async () => {
+    vi.stubEnv("PAPERCLIP_PLUGIN_WORKER_SANDBOX", "off");
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE", keyFile);
+    const expected = collectProtectedSecretPaths(process.env);
+    const handle = probeHandle("test.sandbox", {}, { FORGE_SANDBOX_PROBE: JSON.stringify(expected) });
+    try {
+      await handle.start();
+      const report = handle.diagnostics().sandbox;
+      expect(report).toMatchObject({ mode: "disabled", reason: "operator-opt-out" });
+      expect(report?.protectedPathProbe).toContainEqual({ path: keyFile, outcome: "readable" });
+      await expect(handle.call("health", {} as never)).resolves.toMatchObject({ status: "ok" });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("runs unsandboxed only when the operator opts out", async () => {
     vi.stubEnv("PAPERCLIP_PLUGIN_WORKER_SANDBOX", "off");
     const handle = probeHandle();
@@ -273,12 +310,37 @@ describe("planPluginWorkerSandbox", () => {
       pluginId: "p", entrypointPath: PROBE_WORKER, manifest, processEnv: {},
       trustedPluginRoots: [FIXTURES_DIR], tmpRoot: tmpRoot(), execArgv: ["--import", "x"],
     });
-    expect(trusted.execArgv).toEqual(["--disable-sigusr1", "--import", "x"]);
+    expect(trusted.execArgv).toEqual(["--disable-sigusr1", "--import", SANDBOX_PROBE_URL, "--import", "x"]);
     const optOut = planPluginWorkerSandbox({
       pluginId: "p", entrypointPath: PROBE_WORKER, manifest: MANIFEST,
       processEnv: { PAPERCLIP_PLUGIN_WORKER_SANDBOX: "off" }, tmpRoot: tmpRoot(),
     });
-    expect(optOut.execArgv).toEqual(["--disable-sigusr1"]);
+    expect(optOut.execArgv).toEqual(["--disable-sigusr1", "--import", SANDBOX_PROBE_URL]);
+  });
+
+  it("runs the startup probe first in every worker and hands it the protected paths", () => {
+    const processEnv = { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile };
+    const enforced = planPluginWorkerSandbox({
+      pluginId: "p", entrypointPath: PROBE_WORKER, manifest: MANIFEST, processEnv, tmpRoot: tmpRoot(),
+      execArgv: ["--import", "x"],
+    });
+    const probeAt = enforced.execArgv.indexOf(SANDBOX_PROBE_URL);
+    expect(enforced.execArgv[probeAt - 1]).toBe("--import");
+    expect(enforced.execArgv.indexOf("x")).toBeGreaterThan(probeAt);
+    expect(enforced.probePaths).toEqual(collectProtectedSecretPaths(processEnv));
+    expect(enforced.probePaths).toContain(keyFile);
+    expect(JSON.parse(enforced.env[SANDBOX_PROBE_PATHS_ENV])).toEqual(enforced.probePaths);
+  });
+
+  it("accepts only a well-formed probe message for exactly the expected paths", () => {
+    const expected = ["/a", "/b"];
+    const ok = { type: "paperclip.sandboxProbe", results: [{ path: "/a", outcome: "ERR_ACCESS_DENIED" }, { path: "/b", outcome: "ENOENT" }] };
+    expect(parseSandboxProbeMessage(ok, expected)).toEqual(ok.results);
+    expect(parseSandboxProbeMessage({ ...ok, type: "other" }, expected)).toBeNull();
+    expect(parseSandboxProbeMessage({ ...ok, results: ok.results.slice(0, 1) }, expected)).toBeNull();
+    expect(parseSandboxProbeMessage({ ...ok, results: [ok.results[1], ok.results[0]] }, expected)).toBeNull();
+    expect(parseSandboxProbeMessage({ ...ok, results: [{ path: "/a", outcome: "-----BEGIN" }, ok.results[1]] }, expected)).toBeNull();
+    expect(parseSandboxProbeMessage(null, expected)).toBeNull();
   });
 
   it("starts the production server with --disable-sigusr1", () => {

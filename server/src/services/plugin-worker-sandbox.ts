@@ -54,8 +54,12 @@ export type PluginWorkerSandboxPlan =
       mode: "disabled";
       reason: "operator-opt-out" | "trusted-exception";
       capability?: string;
-      /** The host's execArgv plus {@link WORKER_HARDENING_EXEC_ARGV}. */
+      /** The host's execArgv plus {@link WORKER_HARDENING_EXEC_ARGV} and the startup probe. */
       execArgv: string[];
+      /** Env to merge into the worker env (the startup probe's path list). */
+      env: Record<string, string>;
+      /** Protected secret paths the startup probe tries to open. */
+      probePaths: string[];
     }
   | {
       mode: "enforced";
@@ -65,6 +69,8 @@ export type PluginWorkerSandboxPlan =
       env: Record<string, string>;
       readPaths: string[];
       writePaths: string[];
+      /** Protected secret paths the startup probe tries to open. */
+      probePaths: string[];
     };
 
 export class PluginWorkerSandboxError extends Error {
@@ -199,6 +205,42 @@ export const SANDBOX_TS_RESOLVE_HOOK_URL = `data:text/javascript,${encodeURIComp
  */
 export const WORKER_HARDENING_EXEC_ARGV = ["--disable-sigusr1"] as const;
 
+/** Env var carrying the startup probe's path list (JSON array) into the worker. */
+export const SANDBOX_PROBE_PATHS_ENV = "PAPERCLIP_PLUGIN_SANDBOX_PROBE_PATHS";
+/** IPC message type the startup probe sends to the host. */
+export const SANDBOX_PROBE_MESSAGE_TYPE = "paperclip.sandboxProbe";
+
+/**
+ * Startup probe, the first module every worker runs (sandboxed or not), before
+ * any plugin code. It tries to open each protected secret path the host names
+ * and reports only the outcome: `readable` or the error code (ERR_ACCESS_DENIED
+ * under the sandbox). It never reads: a file that opens is closed at once. The
+ * result goes to the host over the IPC channel; plugin code runs later, so the
+ * host takes the first probe message and ignores any after it. This lets
+ * production verify isolation inside the real running worker from logs alone,
+ * with no exec into the pod. See PLUGIN_SPEC.md §12.6.
+ */
+const SANDBOX_PROBE_SOURCE = `
+import fs from "node:fs";
+const raw = process.env.${SANDBOX_PROBE_PATHS_ENV};
+delete process.env.${SANDBOX_PROBE_PATHS_ENV};
+let paths = [];
+try { const parsed = JSON.parse(raw ?? "[]"); if (Array.isArray(parsed)) paths = parsed.filter((p) => typeof p === "string"); } catch {}
+const results = [];
+for (const path of paths) {
+  let fd;
+  let outcome;
+  try { fd = fs.openSync(path, "r"); outcome = "readable"; }
+  catch (error) { outcome = (error && typeof error.code === "string") ? error.code : "error"; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+  results.push({ path, outcome });
+}
+if (typeof process.send === "function") process.send({ type: "${SANDBOX_PROBE_MESSAGE_TYPE}", results });
+`;
+export const SANDBOX_PROBE_URL = `data:text/javascript,${encodeURIComponent(SANDBOX_PROBE_SOURCE)}`;
+/** Runs the startup probe first, ahead of any host `--import`. */
+export const WORKER_PROBE_EXEC_ARGV = ["--import", SANDBOX_PROBE_URL] as const;
+
 /**
  * Extra flags for sandboxed workers. `node:sqlite` opens database files without
  * consulting the permission model, so it would read and write outside the
@@ -258,8 +300,16 @@ function sanitizeForPath(pluginId: string): string {
  */
 export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): PluginWorkerSandboxPlan {
   const processEnv = input.processEnv ?? process.env;
+  const probePaths = collectProtectedSecretPaths(processEnv);
+  const probeEnv = { [SANDBOX_PROBE_PATHS_ENV]: JSON.stringify(probePaths) };
   if (processEnv[PLUGIN_WORKER_SANDBOX_ENV]?.trim().toLowerCase() === "off") {
-    return { mode: "disabled", reason: "operator-opt-out", execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...(input.execArgv ?? [])] };
+    return {
+      mode: "disabled",
+      reason: "operator-opt-out",
+      execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...WORKER_PROBE_EXEC_ARGV, ...(input.execArgv ?? [])],
+      env: probeEnv,
+      probePaths,
+    };
   }
 
   const capabilities = (input.manifest.capabilities ?? []) as readonly string[];
@@ -272,7 +322,9 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
         mode: "disabled",
         reason: "trusted-exception",
         capability: exceptionCapability,
-        execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...(input.execArgv ?? [])],
+        execArgv: [...WORKER_HARDENING_EXEC_ARGV, ...WORKER_PROBE_EXEC_ARGV, ...(input.execArgv ?? [])],
+        env: probeEnv,
+        probePaths,
       };
     }
   }
@@ -295,7 +347,7 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
   const write = [realTmpDir];
 
   const readPaths = [...read].sort();
-  for (const secret of collectProtectedSecretPaths(processEnv)) {
+  for (const secret of probePaths) {
     const covering = [...readPaths, ...write].find((allowed) => isWithin(allowed, secret));
     if (covering) {
       throw new PluginWorkerSandboxError(
@@ -310,14 +362,16 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
     execArgv: [
       "--permission",
       ...WORKER_HARDENING_EXEC_ARGV,
+      ...WORKER_PROBE_EXEC_ARGV,
       ...SANDBOX_HARDENING_EXEC_ARGV,
       ...readPaths.map((p) => `--allow-fs-read=${p}`),
       ...write.map((p) => `--allow-fs-write=${p}`),
       ...SANDBOX_TYPESCRIPT_EXEC_ARGV,
       ...hostExecArgv,
     ],
-    env: { TMPDIR: realTmpDir, TMP: realTmpDir, TEMP: realTmpDir },
+    env: { TMPDIR: realTmpDir, TMP: realTmpDir, TEMP: realTmpDir, ...probeEnv },
     readPaths,
     writePaths: write,
+    probePaths,
   };
 }
