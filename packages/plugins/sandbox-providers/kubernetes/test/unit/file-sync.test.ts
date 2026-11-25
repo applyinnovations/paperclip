@@ -924,7 +924,7 @@ describe("splitLinkEntryOnce", () => {
 // ---------------------------------------------------------------------------
 interface CraftedMember {
   path: string;
-  type?: "File" | "Directory" | "SymbolicLink" | "Link";
+  type?: "File" | "Directory" | "SymbolicLink" | "Link" | "FIFO";
   linkpath?: string;
   body?: string;
 }
@@ -983,7 +983,12 @@ describe("kubernetes onEnvironmentSyncOut in-process tar member confinement", ()
     return { remoteDir, hostOut, outside, target };
   }
 
-  async function syncOutArchive(remoteDir: string, target: string, members: CraftedMember[]) {
+  async function syncOutArchive(
+    remoteDir: string,
+    target: string,
+    members: CraftedMember[],
+    options: { preserveSourceEntries?: boolean } = {},
+  ) {
     return performSyncOut({
       exec: makeArchiveExec(craftTarball([{ path: "benign.txt", body: "benign" }, ...members])),
       remoteDir,
@@ -991,7 +996,14 @@ describe("kubernetes onEnvironmentSyncOut in-process tar member confinement", ()
       operations: [
         {
           operationId: "op",
-          files: [{ sourcePath: path.join(remoteDir, "artifacts"), targetPath: target, kind: "directory" }],
+          files: [
+            {
+              sourcePath: path.join(remoteDir, "artifacts"),
+              targetPath: target,
+              kind: "directory",
+              ...options,
+            },
+          ],
         },
       ],
     });
@@ -1072,6 +1084,19 @@ describe("kubernetes onEnvironmentSyncOut in-process tar member confinement", ()
     await expect(
       syncOutArchive(remoteDir, target, [{ path: "hl", type: "Link", linkpath: linkpath(outside) }]),
     ).rejects.toThrow(/link whose target escapes/);
+    await expectNothingWritten(target, outside);
+  });
+
+  // node-tar cannot create FIFOs, so accepting one would silently drop it from
+  // an otherwise "successful" sync; the whole archive is refused instead.
+  it.each([
+    ["without source preservation", false],
+    ["with source preservation", true],
+  ])("rejects a FIFO member %s, writing nothing", async (_label, preserveSourceEntries) => {
+    const { remoteDir, outside, target } = await setup();
+    await expect(
+      syncOutArchive(remoteDir, target, [{ path: "pipe", type: "FIFO" }], { preserveSourceEntries }),
+    ).rejects.toThrow(/unsupported type FIFO: pipe/);
     await expectNothingWritten(target, outside);
   });
 
