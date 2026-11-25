@@ -24,7 +24,7 @@ import { markIssueReadSchema } from "@paperclipai/shared";
 import { enqueueFastResponse } from "../services/fast-responses.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
-import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
+import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, isMonitorOnlyExecutionPolicyBody, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints } from "@paperclipai/shared";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
@@ -14930,8 +14930,20 @@ export function issueRoutes(
         }
       }
       if (req.body.executionPolicy !== undefined) {
+        // A body that only carries `monitor` schedules or clears a wait. It
+        // merges onto the stored policy, as the native set_task_monitor tool
+        // does, so a review participant can wait on CI without replacing the
+        // policy and dissolving the review stage it is pending on. A
+        // snapshot-guarded update keeps its full-replacement contract.
+        const monitorOnlyPolicy =
+          expectedExecutionPolicy === undefined &&
+          isMonitorOnlyExecutionPolicyBody(req.body.executionPolicy);
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          normalizeIssueExecutionPolicy(
+            monitorOnlyPolicy && existing.executionPolicy
+              ? { ...existing.executionPolicy, monitor: req.body.executionPolicy.monitor }
+              : req.body.executionPolicy,
+          ),
           actor.actorType,
         );
       }
@@ -15007,7 +15019,14 @@ export function issueRoutes(
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
-        throw unprocessable("unblockDescriptor requires blocked status");
+        throw unprocessable(
+          nextStatus === "in_review"
+            ? "unblockDescriptor requires blocked status. To wait on an external condition (such as CI) " +
+                "while the task stays in review, keep it in_review and schedule an issue monitor with " +
+                "`executionPolicy.monitor` (send `executionPolicy: { monitor: { nextCheckAt, notes } }`); " +
+                "the monitor wakes the assignee when it is due."
+            : "unblockDescriptor requires blocked status",
+        );
       }
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {

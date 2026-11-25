@@ -572,6 +572,97 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(participantRuns.find((run) => run.id === scheduled.id)?.errorCode).not.toBe("issue_assignee_changed");
   });
 
+  it.each([true, false])("a review participant that ended without a decision and left a monitor=%s", async (monitorLeft) => {
+    // APP-448: the reviewer re-reviewed a rebased PR, found nothing blocking
+    // and held approval until CI on the new head passes. Its run was already
+    // the review-participant recovery retry and ended without a stage
+    // decision. A monitor it left is the live posture: recovery must not
+    // block the stage, and the reviewer is woken when the wait is due.
+    const { companyId, issueId, agentId: reviewerAgentId } = await seedFixture({ issueStatus: "in_review" });
+    const executorAgentId = randomUUID();
+    const stageId = randomUUID();
+    const nextCheckAt = new Date(Date.now() + 10 * 60 * 1000);
+    const [seeded] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const seededState = parseIssueExecutionState(seeded.executionState);
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId, type: "review", approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId, userId: null }],
+        }],
+        ...(monitorLeft ? {
+          monitor: {
+            nextCheckAt: nextCheckAt.toISOString(), notes: "Approve once CI is green on the new head",
+            scheduledBy: "assignee", kind: "external_service", serviceName: "tekton", externalRef: "image-build-all-lpbbg",
+          },
+        } : {}),
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: executorAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: monitorLeft ? { ...seededState!.monitor!, nextCheckAt: nextCheckAt.toISOString() } : null,
+      },
+      monitorNextCheckAt: monitorLeft ? nextCheckAt : null,
+      monitorNotes: monitorLeft ? "Approve once CI is green on the new head" : null,
+      monitorScheduledBy: monitorLeft ? "assignee" : null,
+    }).where(eq(issues.id, issueId));
+    const finishedAt = new Date(Date.now() - 5_000);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(), companyId, agentId: reviewerAgentId, invocationSource: "automation", triggerDetail: "system",
+      status: "succeeded", startedAt: new Date(finishedAt.getTime() - 60_000), finishedAt,
+      contextSnapshot: {
+        issueId, taskId: issueId,
+        wakeReason: "execution_review_participant_recovery",
+        retryReason: "execution_review_participant_recovery",
+        currentStageId: stageId, currentStageType: "review",
+      },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const sweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+
+    const [afterSweep] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(afterSweep.status).toBe("in_review");
+    expect(afterSweep.assigneeAgentId).toBe(reviewerAgentId);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const reviewRecoveryWakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "execution_review_participant_recovery"));
+    if (!monitorLeft) {
+      // Control: with no wait recorded the sweep spends another recovery
+      // retry on the reviewer; when that run also ends without a decision the
+      // release tail blocks the issue for the board (the APP-283 path).
+      expect(sweep.reviewParticipantRequeued).toBe(1);
+      expect(reviewRecoveryWakes).toHaveLength(1);
+      return;
+    }
+    expect(sweep).toMatchObject({ reviewParticipantRequeued: 0, escalated: 0, skipped: 1 });
+    expect(reviewRecoveryWakes).toHaveLength(0);
+    expect(parseIssueExecutionState(afterSweep.executionState)).toMatchObject({
+      status: "pending", currentStageId: stageId,
+      currentParticipant: { type: "agent", agentId: reviewerAgentId },
+    });
+    expect(afterSweep.monitorNextCheckAt).toEqual(nextCheckAt);
+
+    // Not yet due: nothing wakes. Due: the reviewer is woken for the wait.
+    expect((await heartbeat.tickIssueMonitors(new Date(nextCheckAt.getTime() - 1_000))).triggered).toBe(0);
+    expect((await heartbeat.tickIssueMonitors(new Date(nextCheckAt.getTime() + 1_000))).triggered).toBe(1);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(wakeups.filter((wake) => wake.reason === "issue_monitor_due")).toHaveLength(1);
+    const [afterTick] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(afterTick.status).toBe("in_review");
+    expect(parseIssueExecutionState(afterTick.executionState)).toMatchObject({ status: "pending", currentStageId: stageId });
+  });
+
   it.each(["in_progress", "blocked"] as const)("lets the board check a scheduled monitor on an %s task", async (status) => {
     const { issueId, agentId, nextCheckAt } = await seedFixture();
     await db.update(issues).set({ status }).where(eq(issues.id, issueId));
