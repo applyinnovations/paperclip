@@ -276,6 +276,20 @@ describe("portable remote workspace archives", () => {
     expect((await fs.stat(path.join(restored, "run"))).mode & 0o777).toBe(0o755);
     expect(await fs.readlink(path.join(restored, "link"))).toBe("data.bin");
   });
+  it("leaves sandbox tool caches under .paperclip-runtime/cache out of the workspace snapshot (APP-20)", async () => {
+    const cwd = await source();
+    await fs.writeFile(path.join(cwd, "README.md"), "kept\n");
+    for (const relative of ["npm/_cacache/index", "pnpm-store/v10/files/00/blob", "xdg/tool/cache.bin"]) {
+      const target = path.join(cwd, ".paperclip-runtime", "cache", relative);
+      await fs.mkdir(path.dirname(target), { recursive: true }); await fs.writeFile(target, "cache\n");
+    }
+    const snapshot = await capture(cwd);
+    const directories = await readRemoteWorkspaceArchiveDirectories(snapshot.archivePath, snapshot.manifestDigest);
+    expect(JSON.stringify(directories)).not.toContain(".paperclip-runtime");
+    const restored = await restore(snapshot);
+    expect(await fs.readFile(path.join(restored, "README.md"), "utf8")).toBe("kept\n");
+    await expect(fs.lstat(path.join(restored, ".paperclip-runtime"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it("round trips an empty workspace", async () => {
     const snapshot = await capture(await source()); const restored = await restore(snapshot);
     expect(await fs.readdir(restored)).toEqual([]);

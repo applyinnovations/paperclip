@@ -2077,6 +2077,11 @@ async function buildRuntime(input: {
       ...(Array.isArray(scratch.tempKeysApplied) ? scratch.tempKeysApplied.filter((key): key is string =>
         typeof key === "string" && ["TMPDIR", "TEMP", "TMP"].includes(key)) : [])])
     : new Set<string>();
+  // Sandbox tool caches (npm/pnpm, XDG and Go module caches on the workspace
+  // volume) are runtime layout, not adapter settings. Forward them, but keep
+  // them out of the hash so a session saved before they existed still resumes.
+  const toolCaches = parseObject(context.paperclipSandboxToolCaches);
+  const toolCacheEnv = toolCaches.type === "workspace_volume" ? parseObject(toolCaches.env) : {};
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -2090,7 +2095,9 @@ async function buildRuntime(input: {
     // The server rotates run-owned scratch paths on every wake. Still forward
     // them, but only hash actual adapter settings. User-supplied temp overrides
     // are absent from tempKeysApplied and keep their compatibility protection.
-    if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
+    if (scratchKeys.has(key) && value === scratch.dir) continue;
+    if (typeof toolCacheEnv[key] === "string" && toolCacheEnv[key] === value) continue;
+    resolvedAdapterEnv[key] = value;
   }
   if (acpxAgent === "claude" && isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
     env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);

@@ -241,6 +241,7 @@ import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { isSandboxToolCachePath } from "../heartbeat/sandbox-tool-caches.js";
 import { appendNativeCredentialUpdate } from "./native-credential-updates.js";
 import { canonicalNativeJson, nativeSha256 } from "./canonical.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
@@ -16150,6 +16151,12 @@ async function createRunnerdBackendWithinSessionClaim(
       }
       // Paths from the controller's account cannot select a remote account's config.
       const hostPathKeys = new Set(["CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]);
+      // The sandbox tool cache (APP-20) points XDG_CACHE_HOME at the target's
+      // own workspace volume. That is a target path, not a controller one.
+      if (remoteTarget?.transport === "sandbox"
+        && isSandboxToolCachePath(remoteTarget.remoteCwd, effectiveRunnerEnvironmentBase.XDG_CACHE_HOME)) {
+        hostPathKeys.delete("XDG_CACHE_HOME");
+      }
       const configured = configuredEnvironment(effectiveRunnerEnvironmentBase);
       for (const key of hostPathKeys) delete effectiveRunnerEnvironmentBase[key];
       if (configured.PAPERCLIP_CONFIGURED_ENV_KEYS !== undefined) {
