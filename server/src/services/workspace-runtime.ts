@@ -123,6 +123,8 @@ import {
 } from "./runtime-exposure/port-reservation.js";
 import { resolveTailscaleDnsName } from "./runtime-exposure/tailscale-hostname.js";
 import { collectNestedRepositoryWorktrees, releaseNestedRepositoryWorktrees } from "./nested-repository-worktrees.js";
+import { selfHealGitWorktreeTarget } from "./git-worktree-self-heal.js";
+import { logger } from "../middleware/logger.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -984,6 +986,15 @@ async function runGit(args: string[], cwd: string, opts?: {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
   }
   return proc.stdout.trim();
+}
+
+/** Runs git and resolves to stdout and stderr together; some commands (`worktree prune --verbose`) report on stderr. */
+async function runGitCombinedOutput(args: string[], cwd: string): Promise<string> {
+  const proc = await executeProcess({ command: "git", args, cwd });
+  if (proc.code !== 0) {
+    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  return [proc.stdout, proc.stderr].filter(Boolean).join("\n").trim();
 }
 
 async function runExpensiveGitStatus(input: {
@@ -3685,6 +3696,33 @@ export async function realizeExecutionWorkspace(input: {
     return { validation, branchName, warnings: [] };
   }
 
+  const registeredBeforeHeal = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
+  const selfHeal = await selfHealGitWorktreeTarget({
+    repoRoot,
+    // Only managed paths: a registration outside the worktree parent is never cleared here.
+    targetPaths: [
+      worktreePath,
+      ...(registeredBeforeHeal && !path.relative(worktreeParentDir, registeredBeforeHeal).startsWith("..")
+        ? [registeredBeforeHeal]
+        : []),
+    ],
+    runGit: runGitCombinedOutput,
+  });
+  if (selfHeal.actions.length > 0 || selfHeal.prunedRegistrations.length > 0) {
+    logger.info(
+      {
+        issueId: input.issue?.id ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        repoRoot,
+        worktreePath,
+        actions: selfHeal.actions,
+        prunedRegistrations: selfHeal.prunedRegistrations,
+      },
+      "git worktree self-heal cleared stale worktree state before setup",
+    );
+  }
+  baseRefreshWarnings.push(...selfHeal.warnings);
+
   const existingWorktree = await directoryExists(worktreePath);
   if (existingWorktree) {
     const reusable = await validateReusableWorktree(worktreePath);
@@ -4516,6 +4554,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             successMessage: `Removed git worktree ${workspacePath}\n`,
             failureLabel: `git worktree remove ${workspacePath}`,
           });
+          logger.info(
+            { issueId: input.workspace.sourceIssueId, workspaceId: input.workspace.id, worktreePath: workspacePath,
+              reason: "execution_workspace_cleanup" },
+            "removed git worktree",
+          );
         } catch (err) {
           warnings.push(err instanceof Error ? err.message : String(err));
         }

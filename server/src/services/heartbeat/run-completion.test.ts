@@ -39,7 +39,7 @@ import { unprocessable } from "../../errors.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure, classifyManagedProjectAuthFailure } from "./run-preparation.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
-import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
+import { buildEffectiveRunSessionConfigMetadata, WorkspaceValidationFailure } from "./workspaces.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { prepareNativeHeartbeatRun } from "../native-runtime/prepare-native-run.js";
@@ -1311,6 +1311,20 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const setupLog = logged.mock.calls.find(call => call[1] === "heartbeat execution setup failed");
     expect(setupLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "setup_failed",
       workspaceProviderFailure: { kind: "provider", reason: "runtime_connection_invalid", retryable: false } });
+  });
+
+  it("logs the issue and the workspace validation reason code of a setup failure", async () => {
+    const f = await fixture();
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Broken worktree" }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.run.contextSnapshot = { issueId: issue.id };
+    const logged = vi.spyOn(logger, "error");
+    onTestFinished(() => logged.mockRestore());
+    await f.completion.failRunSetup(f.setup(new WorkspaceValidationFailure("Persisted git worktree is not reusable", {
+      workspaceValidation: { reason: "git_worktree_not_reusable", reasonCode: "wrong_repository_root" } })));
+    const setupLog = logged.mock.calls.find(call => call[1] === "heartbeat execution setup failed");
+    expect(setupLog?.[0]).toMatchObject({ runId: f.run.id, issueId: issue.id, reasonCode: "wrong_repository_root",
+      errorCode: "workspace_validation_failed" });
   });
 
   it("logs the driver cause code of a wrapped setup query failure without its text", async () => {

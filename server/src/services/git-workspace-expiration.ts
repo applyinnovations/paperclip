@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { acquireGitExpirationLocks } from "./git-workspace-expiration-locks.js";
+import { logger } from "../middleware/logger.js";
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { executionWorkspaces, issues, heartbeatRuns, nativeRunFinalizations, environmentLeases,
   workspaceRuntimeServices, issueRecoveryActions, projectWorkspaces, withDedicatedDbConnection, type Db } from "@paperclipai/db";
@@ -459,6 +460,8 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
               throw error;
             }
             await fs.rename(recipe.worktreePath, state.worktreeTrash);
+            logger.info({ issueId: workspace.sourceIssueId, workspaceId: workspace.id, worktreePath: recipe.worktreePath,
+              trashPath: state.worktreeTrash, reason: "git_cache_expiration" }, "moved expired git worktree to trash");
             await finishGitCacheTrash(workspace);
             result.reclaimedBytes += result.candidateBytes;
           } finally { for (const lock of locks.reverse()) await lock.release(); }
