@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { isGitNotRepositoryStderr } from "../services/heartbeat/workspaces.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -603,6 +604,17 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
       anchor: { localPathOnlyWorkspace: true, baseCwdFallback: false, materializationFailures: [] },
     };
   }
+
+  it("recognizes both wordings of git's not-a-repository result", () => {
+    expect(isGitNotRepositoryStderr("fatal: not a git repository (or any of the parent directories): .git\n")).toBe(true);
+    expect(isGitNotRepositoryStderr(
+      "fatal: not a git repository (or any parent up to mount point /)\n" +
+      "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    )).toBe(true);
+    expect(isGitNotRepositoryStderr("fatal: not a git repository (or any parent up to mount point /tmp)\n")).toBe(false);
+    expect(isGitNotRepositoryStderr("fatal: not a git repository: '/repo/.git'\n")).toBe(false);
+    expect(isGitNotRepositoryStderr(undefined)).toBe(false);
+  });
 
   it("marks a proven non-Git local path as an owner configuration conflict without changing the failure", async () => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-policy-"));
@@ -1775,6 +1787,107 @@ describe("effective run execution workspace config freshness", () => {
     expect(metadata?.configFingerprint).not.toMatchObject({
       workspaceHash: next.fingerprint,
     });
+  });
+
+  it("re-stamps the fingerprint when explicit reuse restores across environment-only drift", () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      environment: {
+        selectedEnvironmentId: "environment-2",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+      },
+      realization: {
+        environmentDriver: "sandbox",
+        environmentProvider: "daytona",
+      },
+    });
+
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: true,
+      workspaceConfigFreshness: decision,
+    });
+
+    expect(decision.action).toBe("replace");
+    expect(decision.changedCategories.length).toBeGreaterThan(0);
+    expect(
+      decision.changedCategories.every((category) =>
+        ["environment", "realization"].includes(category),
+      ),
+    ).toBe(true);
+    expect(policy).toEqual({
+      shouldRestoreExistingWorkspace: true,
+      shouldRefreshWorkspaceConfigSnapshot: false,
+      shouldPersistLatestWorkspaceConfigMetadata: true,
+    });
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: {
+        config: { provisionCommand: "pnpm install" },
+        ...persistedWorkspaceConfigFingerprint(base),
+      },
+      source: "task_session",
+      createdByRuntime: false,
+      strategyType: "project_primary",
+      configSnapshot: { provisionCommand: "pnpm install" },
+      shouldReuseExisting: policy.shouldRestoreExistingWorkspace,
+      shouldRefreshConfigSnapshot: policy.shouldRefreshWorkspaceConfigSnapshot,
+      workspaceConfigMetadata: policy.shouldPersistLatestWorkspaceConfigMetadata ? next : null,
+      baseRef: "origin/main",
+      baseRefSha: "main-sha",
+    });
+
+    expect(metadata?.configFingerprint).toMatchObject({
+      workspaceHash: next.fingerprint,
+    });
+
+    // The next run with the same environment now reuses instead of reporting
+    // "replace" again.
+    const nextRunDecision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: metadata,
+      nextMetadata: next,
+    });
+    expect(nextRunDecision.action).toBe("reuse");
+  });
+
+  it("keeps the stored fingerprint when environment drift comes with repo drift under explicit reuse", () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      repoRef: "origin/release",
+      workspaceStrategy: {
+        type: "git_worktree",
+        baseRef: "origin/release",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
+        worktreeParentDir: ".paperclip/worktrees",
+      },
+      environment: {
+        selectedEnvironmentId: "environment-2",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+      },
+    });
+
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: true,
+      workspaceConfigFreshness: decision,
+    });
+
+    expect(decision.action).toBe("replace");
+    expect(decision.changedCategories).toEqual(
+      expect.arrayContaining(["repo", "environment"]),
+    );
+    expect(policy.shouldPersistLatestWorkspaceConfigMetadata).toBe(false);
   });
 
   it("fails loudly when explicit reuse restore errors", async () => {
