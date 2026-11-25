@@ -9,6 +9,8 @@ export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
 export const ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS = 8_000;
 const SUMMARY_SECTION_MAX_CHARS = 1_200;
+/** Error code the Claude adapter records when its process was SIGKILLed (exit 137). */
+export const PROCESS_KILLED_ERROR_CODE = "process_killed";
 const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.github)\/[A-Za-z0-9._/-]+)/g;
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
@@ -103,6 +105,11 @@ function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
 function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previousNextAction: string | null) {
   if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
   if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
+  if (run.status === "failed" && run.errorCode === PROCESS_KILLED_ERROR_CODE) {
+    // APP-225: the sandbox killed the agent mid-command (usually out of memory).
+    // Running the same command again gets killed again.
+    return "The last run was killed by SIGKILL, most likely out of memory, while running a command. Do not rerun that command unchanged; make it use less memory first, then resume from the most recent concrete action above.";
+  }
   if (run.status === "failed" || run.status === "timed_out") {
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }

@@ -86,6 +86,35 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("tells the next run that its last command was SIGKILLed and not to rerun it unchanged (APP-225)", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "APP-225",
+        title: "OOM-killed runs",
+        description: null,
+        status: "in_progress",
+        priority: "high",
+      },
+      run: {
+        id: "run-3",
+        status: "failed",
+        error: "Claude was killed by SIGKILL (exit code 137) before it finished, most likely by the sandbox's out-of-memory killer.",
+        errorCode: "process_killed",
+        resultJson: null,
+      },
+      agent: {
+        id: "agent-1",
+        name: "Engineer",
+        adapterType: "claude_local",
+      },
+    });
+
+    expect(body).toContain("Latest run error (process_killed): Claude was killed by SIGKILL (exit code 137)");
+    expect(extractContinuationSummaryNextAction(body)).toMatch(/^The last run was killed by SIGKILL.*Do not rerun that command unchanged/);
+    expect(body).not.toContain("Inspect the failed run, fix the cause");
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",
