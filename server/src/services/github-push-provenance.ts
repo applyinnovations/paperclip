@@ -81,7 +81,8 @@ export function parsePushAttemptReport(body: unknown): PushAttemptReport {
     const ref = typeof update.ref === "string" && update.ref.startsWith("refs/") ? canonicalGitRef(update.ref) : null;
     const before = canonicalSha(update.before);
     const after = canonicalSha(update.after);
-    const result = update.result === "ok" || update.result === "ng" || update.result === "unknown" ? update.result : null;
+    const result: "ok" | "ng" | "unknown" | null =
+      update.result === "ok" || update.result === "ng" || update.result === "unknown" ? update.result : null;
     if (!ref || !before || !after || !result || before === after || before.length !== after.length) {
       throw unprocessable(`updates[${index}] needs a full ref, distinct full before/after SHAs and a result`);
     }

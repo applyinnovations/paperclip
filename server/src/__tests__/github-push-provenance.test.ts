@@ -93,7 +93,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   const scope = (companyId: string) => ({ invocationScope: { companyId } });
 
-  function delivery(companyId: string, payload: Record<string, unknown>, deliveryId = randomUUID(), event = "push") {
+  function delivery(companyId: string, payload: Record<string, unknown>, deliveryId: string = randomUUID(), event = "push") {
     const rawBody = JSON.stringify({ installation: { id: Number(`${appIds[companyId]}9`) }, ...payload });
     return {
       rawBody,
