@@ -7933,6 +7933,10 @@ export function issueRoutes(
    * and no one tells the human. Humans are unaffected, and closed ancestors
    * do not count — re-engaging the creator of finished work is normal.
    * Self-assigned decomposition is not delegation back to another agent.
+   * Nor does an ancestor that another agent or user re-assigned after its
+   * creator last did: once someone else has picked the work up and routed
+   * it (an Engineer-filed finding shaped by the Product Owner and planned by
+   * the CTO), assigning the build to its creator is planning, not a cycle.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
