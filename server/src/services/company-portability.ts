@@ -42,11 +42,13 @@ import type {
   CompanyPortabilityIssueMonitorManifestEntry,
   CompanyPortabilityIssueAttachmentManifestEntry,
   CompanyPortabilityIssueManifestEntry,
+  CompanyPortabilityProjectDefaultExecutionPolicy,
   CompanyPortabilitySidebarOrder,
   CompanyPortabilitySkillManifestEntry,
   CompanySkill,
   AgentEnvConfig,
   PermissionKey,
+  ProjectDefaultExecutionPolicy,
   RoutineVariable,
 } from "@paperclipai/shared";
 import {
@@ -1438,6 +1440,63 @@ function stripPortableProjectExecutionWorkspaceRefs(policy: Record<string, unkno
   delete next.defaultProjectWorkspaceKey;
   const cleaned = stripEmptyValues(next);
   return isPlainRecord(cleaned) ? cleaned : null;
+}
+
+/**
+ * Export form of `executionWorkspacePolicy.defaultIssueExecutionPolicy`: agent
+ * participants by slug. Agents outside the export and users are omitted.
+ */
+function withPortableIssueDefaults(
+  projectSlug: string,
+  policy: unknown,
+  agentSlugById: Map<string, string>,
+  warnings: string[],
+): unknown {
+  if (!isPlainRecord(policy) || !("defaultIssueExecutionPolicy" in policy)) return policy;
+  const { defaultIssueExecutionPolicy, ...rest } = policy;
+  const defaults = defaultIssueExecutionPolicy as ProjectDefaultExecutionPolicy | null;
+  const stages: CompanyPortabilityProjectDefaultExecutionPolicy["stages"] = [];
+  for (const stage of defaults?.stages ?? []) {
+    const participants: Array<{ agentSlug: string }> = [];
+    for (const participant of stage.participants) {
+      const agentSlug = participant.type === "agent" && participant.agentId ? agentSlugById.get(participant.agentId) : undefined;
+      if (agentSlug) participants.push({ agentSlug });
+      else warnings.push(`Project ${projectSlug} default ${stage.type} stage participant was omitted from export because only exported agents are portable.`);
+    }
+    if (participants.length > 0) stages.push({ type: stage.type, participants });
+  }
+  return stages.length > 0 ? { ...rest, defaultIssueExecutionPolicy: { stages } } : rest;
+}
+
+/**
+ * Import form of `executionWorkspacePolicy.defaultIssueExecutionPolicy`: each
+ * `agentSlug` becomes the agent of that slug in the importing company.
+ */
+function resolvePortableIssueDefaults(
+  projectSlug: string,
+  policy: Record<string, unknown> | null | undefined,
+  resolveAgentId: (agentSlug: string) => string | null,
+  warnings: string[],
+): Record<string, unknown> | null {
+  if (!policy || !("defaultIssueExecutionPolicy" in policy)) return policy ?? null;
+  const { defaultIssueExecutionPolicy, ...rest } = policy;
+  const rawStages = isPlainRecord(defaultIssueExecutionPolicy) && Array.isArray(defaultIssueExecutionPolicy.stages)
+    ? (defaultIssueExecutionPolicy.stages as unknown[])
+    : [];
+  const stages: Array<{ type: string; participants: Array<{ type: "agent"; agentId: string }> }> = [];
+  for (const stage of rawStages) {
+    const type = isPlainRecord(stage) ? asString(stage.type) : null;
+    const rawParticipants: unknown[] = isPlainRecord(stage) && Array.isArray(stage.participants) ? stage.participants : [];
+    const participants: Array<{ type: "agent"; agentId: string }> = [];
+    for (const participant of rawParticipants) {
+      const agentSlug = isPlainRecord(participant) ? asString(participant.agentSlug) : null;
+      const agentId = agentSlug ? resolveAgentId(agentSlug) : null;
+      if (agentId) participants.push({ type: "agent", agentId });
+      else warnings.push(`Project ${projectSlug} default ${type ?? "unknown"} stage names agent ${agentSlug ?? "(no agentSlug)"}, which is not in the company; participant skipped.`);
+    }
+    if (type && participants.length > 0) stages.push({ type, participants });
+  }
+  return stages.length > 0 ? { ...rest, defaultIssueExecutionPolicy: { stages } } : rest;
 }
 
 async function readGitOutput(cwd: string, args: string[]) {
@@ -4359,7 +4418,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         status: project.status,
         executionWorkspacePolicy: exportPortableProjectExecutionWorkspacePolicy(
           slug,
-          project.executionWorkspacePolicy,
+          withPortableIssueDefaults(slug, project.executionWorkspacePolicy, idToSlug, warnings),
           portableWorkspaces.workspaceKeyById,
           warnings,
         ) ?? undefined,
@@ -5876,6 +5935,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             continue;
           }
 
+          // Agent slugs in the project's issue defaults resolve in the target company.
+          const manifestExecutionWorkspacePolicy = resolvePortableIssueDefaults(
+            manifestProject.slug,
+            manifestProject.executionWorkspacePolicy,
+            (agentSlug) => importedSlugToAgentId.get(agentSlug) ?? existingSlugToAgentId.get(agentSlug) ?? null,
+            warnings,
+          );
           const projectLeadAgentId = manifestProject.leadAgentSlug
             ? importedSlugToAgentId.get(manifestProject.leadAgentSlug)
               ?? existingSlugToAgentId.get(manifestProject.leadAgentSlug)
@@ -5903,7 +5969,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               ? manifestProject.status as typeof PROJECT_STATUSES[number]
               : "backlog",
             env: normalizedProjectEnv,
-            executionWorkspacePolicy: stripPortableProjectExecutionWorkspaceRefs(manifestProject.executionWorkspacePolicy),
+            executionWorkspacePolicy: stripPortableProjectExecutionWorkspaceRefs(manifestExecutionWorkspacePolicy),
           };
 
           let projectId: string | null = null;
@@ -5990,7 +6056,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
 
           const hydratedProjectExecutionWorkspacePolicy = importPortableProjectExecutionWorkspacePolicy(
             planProject.slug,
-            manifestProject.executionWorkspacePolicy,
+            manifestExecutionWorkspacePolicy,
             projectWorkspaceIdByKey,
             warnings,
           );

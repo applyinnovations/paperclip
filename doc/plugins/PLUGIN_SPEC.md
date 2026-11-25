@@ -555,6 +555,107 @@ When the host needs to stop a plugin worker (for upgrade, uninstall, or instance
 
 The shutdown deadline should be configurable per-plugin in plugin config for plugins that need longer drain periods.
 
+## 12.6 Worker Filesystem Sandbox
+
+Every plugin worker is forked under the Node permission model (`--permission`),
+so a plugin cannot read operator secret files such as GitHub App private keys.
+The host plans the sandbox per worker in
+`server/src/services/plugin-worker-sandbox.ts`.
+
+A sandboxed worker **can**:
+
+- read its own package directory and the packages it can resolve: every ancestor
+  `node_modules` and, transitively, the real directories behind linked
+  (`pnpm` workspace) packages
+- read the host's `--import` loader and any absolute `NODE_PATH` entries
+- read and write a private tmp directory,
+  `<os tmpdir>/paperclip-plugin-workers/<plugin id>`. `os.tmpdir()`, `TMPDIR`,
+  `TMP` and `TEMP` point at it.
+- use the network, and everything the host exposes over RPC: config, state,
+  secrets, local folders (`ctx.localFolders.*`), workspaces and so on
+
+A sandboxed worker **cannot**:
+
+- read any other file, including mounted secrets, `/etc`, the server's own
+  source or data directory and other plugins' packages. The call fails with
+  `ERR_ACCESS_DENIED`; the worker keeps running and serving RPCs.
+- write anywhere outside its tmp directory
+- start child processes, worker threads or WASI, load native addons, or open
+  the inspector
+- use `node:sqlite` (`--no-experimental-sqlite`). It opens database files
+  without consulting the permission model, so it would bypass the allowlist.
+
+Local folders keep working because the host reads and writes them on the
+worker's behalf through `ctx.localFolders`, within the board-configured folder
+and access mode. A worker never gets direct filesystem access to them.
+
+**Local folder roots.** The host reads files under a local folder root for the
+worker, so it refuses (HTTP 403) any root that would expose a protected path,
+whether a worker sets it through `ctx.localFolders.configure` or the board sets
+it through the local-folder route. Refused roots are:
+
+- a root that is, or contains, a protected secret file (below), the secrets
+  master key (`PAPERCLIP_SECRETS_MASTER_KEY_FILE` or the instance default), the
+  server config file, or the `.env` file beside it
+- a root that is, contains, or sits inside the instance `secrets` directory,
+  the master key's directory, the embedded Postgres data directory, `/run`,
+  `/var/run`, `/proc`, `/sys`, `/dev` or `/etc`
+- a root that is, contains, or sits inside code the host runs: the server install
+  root (`/app` in the image, which holds the repo plugin tree and
+  `node_modules`), the bundled plugin catalog (`PAPERCLIP_BUNDLED_PLUGIN_ROOT`,
+  including its distribution directory), the local plugin install directory
+  (`~/.paperclip/plugins` and `$PAPERCLIP_HOME/plugins`) and the external
+  adapter directory (`$PAPERCLIP_HOME/adapter-plugins`). A `readWrite` folder
+  there would let a plugin overwrite trusted plugin code, which runs unsandboxed,
+  or code the server imports
+
+The check runs on both the configured path and its realpath, so a symlink to a
+protected directory is refused too. A folder already stored with such a root
+reports the `protected_path` problem, is not readable, and its realPath is
+never returned.
+
+**Signals.** The permission model does not restrict `process.kill`, and Node
+opens its inspector when it receives `SIGUSR1`. Every plugin worker, sandboxed
+or not, is therefore started with `--disable-sigusr1`, and the server must be
+too: the image's `CMD` is `node --disable-sigusr1 server/dist-runtime/index.mjs`.
+A worker can also signal every process of its uid at once (`process.kill(-1,
+"SIGUSR1")`), so every other Node process in the container needs the flag as
+well, including short-lived ones such as `node -e` health probes and agent CLIs.
+The production image therefore sets `NODE_OPTIONS=--disable-sigusr1`. A
+deployment that overrides the server command or `NODE_OPTIONS` must keep the
+flag; otherwise a worker can signal a Node process into opening an inspector and
+run code inside it.
+
+Sandboxed workers load TypeScript with Node's built-in type stripping
+(`--experimental-transform-types`) and a small resolve hook that maps `./x.js`
+to `./x.ts`. `tsx` cannot run under the sandbox because its transform starts a
+worker thread.
+
+**Protected secret files.** The host collects the files named by
+`PAPERCLIP_GITHUB_APPS_FILE` and `PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE`, the
+apps file itself and every `*File` path inside it (`apps[].privateKeyFile`,
+`apps[].webhookSecretFile`, `approvalsApp.privateKeyFile`, ...). If any of these
+falls inside a path the worker would be allowed to read or write, for example a
+key mounted under `node_modules`, the host refuses to start the worker: the
+start fails with an error naming both the allowed path and the secret file.
+
+**Trusted exceptions.** A child process is outside the permission model, so
+granting `--allow-child-process` would let it read any file the server can.
+Plugins that declare a capability whose implementation needs one
+(`environment.drivers.register`, `execution.workspaces.read` or
+`project.workspaces.read`) therefore run **unsandboxed**, but only when they are
+installed from the image's trusted plugin roots: the repository's
+`packages/plugins` tree and the bundled plugin catalog. Any other plugin that
+declares these capabilities stays sandboxed and cannot spawn. The host logs a
+warning for every worker it starts unsandboxed. The bundled plugins that run
+under this exception are the sandbox providers (including `kubernetes`), the fake
+sandbox, `plugin-workspace-diff`, and the file-browser and kitchen-sink examples.
+`server/src/__tests__/plugin-worker-sandbox-bundled.test.ts` pins this list.
+
+**Operator escape hatch.** Setting `PAPERCLIP_PLUGIN_WORKER_SANDBOX=off` runs
+every worker without the sandbox. It is meant for local development, is unset in
+the image, and each unsandboxed start is logged as a warning.
+
 ## 13. Host-Worker Protocol
 
 The host must support the following worker RPC methods.
@@ -1656,6 +1757,68 @@ When an operator updates a plugin config for a company at runtime:
 3. The host sends a `configChanged` notification with `companyId` to the running worker via IPC.
 4. The worker reads the config through `ctx.config.get(companyId)` and applies it without restarting. If the plugin needs to re-initialize connections (e.g. a new API token), it does so internally.
 5. If the plugin does not handle `configChanged`, the host restarts the worker process; the worker must still request company-scoped config explicitly.
+
+#### 25.4.4.1 Plugin Config From A File (`PAPERCLIP_PLUGIN_CONFIG_FILE`)
+
+An operator who manages configuration in Git (for example a Kubernetes
+ConfigMap) can set `PAPERCLIP_PLUGIN_CONFIG_FILE` to the path of a JSON file:
+
+```json
+{
+  "<pluginKey>": {
+    "<companyId>": { "...": "config matching the plugin's instanceConfigSchema" }
+  }
+}
+```
+
+Unset, nothing changes. Set:
+
+- **Same path as the API.** Each entry goes through the steps above: it is
+  validated against the manifest's `instanceConfigSchema` and the company's
+  secrets, written to `plugin_config`, its secret bindings synced, and the
+  worker gets `configChanged`.
+- **When.** At startup, whenever a plugin is activated (installed, upgraded,
+  enabled or restarted; the entry is written before the worker starts, so the
+  worker starts with it), and when the file changes. The server watches the
+  file's directory, which also sees a ConfigMap's `..data` symlink swap, and
+  re-reads it about 1 s after the last change. The watch starts before the
+  first read, and the file is read again once startup has finished, so a
+  change made while the server starts is not lost.
+- **Only differences are written.** An entry equal to the stored config writes
+  nothing and sends no `configChanged`, so restarts are quiet.
+- **Audit.** Each change writes a `plugin.config.updated` activity with actor
+  `system` / `plugin-config-file` and `details.source = "plugin-config-file"`,
+  the plugin key, the company id, `sha256` (SHA-256 of the entry's config as
+  JSON with sorted keys) and `fileSha256`, so a change can be traced to the
+  commit that made it.
+- **Failures never stop the server and never clear a config.** A file that
+  cannot be read, is not JSON or has the wrong shape is ignored as a whole and
+  the last good file stays in effect. An entry for an unknown company, or one
+  that fails schema or secret validation, is logged with the plugin key,
+  company and reason, stored in `plugin_config.last_error` when a row exists,
+  and the stored config stays; the other entries still apply. An entry for a
+  plugin that is not installed is applied when the plugin is installed.
+- **Read-only when managed.** For a (plugin, company) pair in the file,
+  `POST /api/plugins/:pluginId/config` returns 409 and
+  `GET /api/plugins/:pluginId/config` returns `managedBy: "file"`; the plugin
+  settings page shows the form read-only. A managed pair whose entry has not
+  been stored yet (it failed validation) is still read-only: `GET` returns
+  `managedBy: "file"` with `id: null` and an empty `configJson`. Until the
+  file has been read successfully once, every pair is treated as managed.
+  Pairs not in the file behave as before.
+- **Background jobs see the change at once.** Every config write, from the
+  file or the API, refreshes the companies the plugin's worker may act on
+  from proactive (no-invocation) calls such as `ctx.config.get(companyId)` in
+  a job, whether or not the worker is running at that moment; a worker that
+  is starting gets the newer set.
+- **Removing an entry leaves the config.** Deleting a pair from the file stops
+  managing it; its stored config stays as it was and becomes editable again.
+  Deleting a line must never be a way to remove a policy. To change a config,
+  change the entry.
+- **No secrets in the file.** It is usually a ConfigMap. Put secrets in
+  company secrets and reference them with the plugin's secret-ref fields
+  (`{ "type": "secret_ref", "secretId": "..." }`), which are validated as
+  above.
 
 #### 25.4.5 Frontend Cache Invalidation
 

@@ -426,6 +426,58 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(fs.readFile(path.join(root, "WIKI.md"), "utf8")).resolves.toBe("# Wiki\n");
   });
 
+  it("refuses a worker-chosen local-folder root that holds an operator secret", async () => {
+    // APP-37 B2: the worker picks params.path and the host then reads files under
+    // it for the worker, so a root over the approvals key would leak it through RPC.
+    const { companyId } = await seedCompanyAndAgent();
+    const keyDir = await makeLocalRoot();
+    const keyFile = path.join(keyDir, "approvals-app.pem");
+    await fs.writeFile(keyFile, "-----BEGIN PRIVATE KEY-----\nfixture\n");
+    const previous = process.env.PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE;
+    process.env.PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE = keyFile;
+    try {
+      const pluginId = randomUUID();
+      const manifest = {
+        id: "paperclip.local-folders",
+        apiVersion: 1 as const,
+        version: "0.1.0",
+        displayName: "Local Folders",
+        description: "Local folder fixture",
+        author: "Paperclip",
+        categories: ["automation" as const],
+        capabilities: ["local.folders" as const],
+        entrypoints: { worker: "./dist/worker.js" },
+        localFolders: [{ folderKey: "content-root", displayName: "Content root", access: "read" as const }],
+      };
+      await db.insert(plugins).values({
+        id: pluginId,
+        pluginKey: manifest.id,
+        packageName: "@paperclip/plugin-local-folders",
+        version: "0.1.0",
+        manifestJson: manifest,
+        status: "ready",
+      });
+      const services = buildHostServices(db, pluginId, manifest.id, createEventBusStub(), undefined, { manifest });
+
+      for (const root of [keyDir, path.dirname(keyDir)]) {
+        await expect(services.localFolders.configure({
+          companyId,
+          folderKey: "content-root",
+          path: root,
+          access: "read",
+        })).rejects.toThrow("protected host path");
+      }
+      await expect(services.localFolders.readText({
+        companyId,
+        folderKey: "content-root",
+        relativePath: "approvals-app.pem",
+      })).rejects.toThrow("Local folder is not configured or readable");
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE;
+      else process.env.PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE = previous;
+    }
+  });
+
   it("rejects worker local-folder access for undeclared manifest keys", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const pluginId = randomUUID();

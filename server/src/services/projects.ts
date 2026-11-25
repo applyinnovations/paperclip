@@ -44,6 +44,7 @@ import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig }
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { recordProjectLifecycleEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { hasUnsettledProjectCharges } from "../modules/execution-admission/index.js";
+import { normalizeProjectPolicyIssueDefaults } from "./project-default-execution-policy.js";
 
 type ProjectTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -658,6 +659,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     const { goalIds: inputGoalIds, ...projectData } = data;
     const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
     if (ids && ids.length > 0) await assertGoalsBelongToCompany(db, companyId, ids);
+    projectData.executionWorkspacePolicy = await normalizeProjectPolicyIssueDefaults(db, companyId, projectData.executionWorkspacePolicy);
 
     // Note: color is intentionally NOT auto-assigned. New projects default to
     // `color = null` (neutral gray) unless an explicit color is supplied. See PAP-68.
@@ -998,6 +1000,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
       if (ids && ids.length > 0) {
         await assertGoalsBelongToCompany(db, existingProject.companyId, ids);
       }
+      projectData.executionWorkspacePolicy = await normalizeProjectPolicyIssueDefaults(db, existingProject.companyId, projectData.executionWorkspacePolicy);
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);

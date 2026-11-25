@@ -14,6 +14,32 @@ import {
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
+  it("ignores login phrases inside stream-json tool output (APP-199)", () => {
+    // An agent grepping this codebase prints the literal stranded-notice text.
+    // The run was then OOM-killed, so no result event was ever parsed.
+    const toolResult = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: 'stranded-notice.ts:51:  claude_auth_required: "Error: not logged in to Claude",' }] },
+    });
+    const truncated = '{"type":"user","message":{"content":[{"type":"tool_result","content":"Please run /login';
+    expect(
+      detectClaudeLoginRequired({ parsed: null, stdout: `${toolResult}\n${truncated}`, stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("still classifies the CLI's own plain-text login prompt on stdout", () => {
+    expect(
+      detectClaudeLoginRequired({ parsed: null, stdout: "Not logged in · Please run /login", stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("still classifies a not-logged-in result event", () => {
+    const result = { type: "result", is_error: true, subtype: "success", result: "Not logged in · Please run /login" };
+    expect(
+      detectClaudeLoginRequired({ parsed: result, stdout: JSON.stringify(result), stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
   it("classifies Claude's invalid API key login prompt as auth required", () => {
     expect(
       detectClaudeLoginRequired({

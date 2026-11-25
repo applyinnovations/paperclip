@@ -61,6 +61,7 @@ import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
 import {
   assertConfiguredLocalFolder,
+  assertPluginLocalFolderRootAllowed,
   assertWritableConfiguredLocalFolder,
   getStoredLocalFolders,
   deletePluginLocalFolderFile,
@@ -1636,6 +1637,9 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const declaration = getLocalFolderDeclaration(params.folderKey);
+        // The worker chooses this path, and the host then reads files under it
+        // for the worker: refuse roots over operator secrets (APP-37).
+        assertPluginLocalFolderRootAllowed(params.path);
         const existing = await registry.getCompanySettings(pluginId, companyId);
         const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
         await preparePluginLocalFolder({

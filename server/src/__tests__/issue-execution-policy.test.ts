@@ -400,6 +400,7 @@ describe("issue execution policy transitions", () => {
             completedStageIds: [reviewStageId],
             lastDecisionId: null,
             lastDecisionOutcome: null,
+            completionRequested: true,
           },
         },
         policy,
@@ -1296,6 +1297,222 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("review approval does not close unfinished delivery (APP-306)", () => {
+    function pendingReviewIssue(
+      policy: IssueExecutionPolicy,
+      stateOverrides: Partial<IssueExecutionState> = {},
+    ) {
+      return {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0].id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          ...stateOverrides,
+        } as IssueExecutionState,
+      };
+    }
+
+    function executorHandoff(policy: IssueExecutionPolicy, requestedStatus: "in_review" | "done") {
+      return applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "PR is up; merge, rollout and verification still to do",
+      });
+    }
+
+    function approve(issue: ReturnType<typeof pendingReviewIssue>, policy: IssueExecutionPolicy) {
+      return applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Approved",
+      });
+    }
+
+    it("records whether the executor handed off for review or marked the work complete", () => {
+      const policy = reviewOnlyPolicy();
+      expect(executorHandoff(policy, "in_review").patch.executionState).toMatchObject({
+        status: "pending",
+        completionRequested: false,
+      });
+      expect(executorHandoff(policy, "done").patch.executionState).toMatchObject({
+        status: "pending",
+        completionRequested: true,
+      });
+    });
+
+    it("an approved review stage returns the issue to its executor and keeps it open", () => {
+      const policy = reviewOnlyPolicy();
+      const handoff = executorHandoff(policy, "in_review");
+      const issue = {
+        ...pendingReviewIssue(policy),
+        executionState: handoff.patch.executionState as IssueExecutionState,
+      };
+
+      const result = approve(issue, policy);
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.workflowControlledAssignment).toBe(true);
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionOutcome: "approved",
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      });
+      expect(result.decision).toMatchObject({ stageType: "review", outcome: "approved", body: "Approved" });
+    });
+
+    it("hands back when the stored state predates the completion flag", () => {
+      const policy = reviewOnlyPolicy();
+      const result = approve(pendingReviewIssue(policy), policy);
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    });
+
+    it("restores a user executor", () => {
+      const policy = reviewOnlyPolicy();
+      const result = approve(
+        pendingReviewIssue(policy, { returnAssignee: { type: "user", userId: boardUserId } }),
+        policy,
+      );
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.assigneeUserId).toBe(boardUserId);
+    });
+
+    it("after the hand-back, the executor can close the issue without restarting review", () => {
+      const policy = reviewOnlyPolicy();
+      const approved = approve(pendingReviewIssue(policy, { completionRequested: false }), policy);
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: approved.patch.executionState as IssueExecutionState,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Merged, rolled out and verified in production",
+      });
+
+      expect(result.patch).toEqual({});
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("final stage after an explicit executor completion still closes the issue", () => {
+      const policy = reviewOnlyPolicy();
+      const handoff = executorHandoff(policy, "done");
+      const issue = {
+        ...pendingReviewIssue(policy),
+        executionState: handoff.patch.executionState as IssueExecutionState,
+      };
+
+      const result = approve(issue, policy);
+
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.executionState).toMatchObject({ status: "completed", completionRequested: true });
+      expect(result.decision).toMatchObject({ outcome: "approved" });
+    });
+
+    it("a remaining approval stage still gates the issue, and its approval hands back", () => {
+      const policy = twoStagePolicy();
+      const reviewApproved = approve(pendingReviewIssue(policy, { completionRequested: false }), policy);
+
+      expect(reviewApproved.patch.status).toBe("in_review");
+      expect(reviewApproved.patch.assigneeUserId).toBe(ctoUserId);
+      expect(reviewApproved.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "approval",
+        completionRequested: false,
+      });
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: reviewApproved.patch.executionState as IssueExecutionState,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId },
+        commentBody: "Approved",
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.executionState).toMatchObject({ status: "completed" });
+    });
+
+    it("changes requested still returns to the executor, and the resubmission decides completion", () => {
+      const policy = reviewOnlyPolicy();
+      const changes = applyIssueExecutionPolicyTransition({
+        issue: pendingReviewIssue(policy, { completionRequested: false }),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Fix the edge case",
+      });
+      expect(changes.patch.status).toBe("in_progress");
+      expect(changes.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(changes.patch.executionState).toMatchObject({ status: "changes_requested" });
+
+      const resubmitted = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: changes.patch.executionState as IssueExecutionState,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Fixed; delivery complete",
+      });
+      expect(resubmitted.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "review",
+        completionRequested: true,
+      });
+    });
+  });
+
   describe("final stage completion terminates the policy (#7893)", () => {
     function threeStagePolicy() {
       return makePolicy([
@@ -1331,6 +1548,7 @@ describe("issue execution policy transitions", () => {
             completedStageIds: staleStageIds,
             lastDecisionId: null,
             lastDecisionOutcome: "approved",
+            completionRequested: true,
           },
         },
         policy,

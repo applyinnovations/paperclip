@@ -22,6 +22,7 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
  */
 
 import { fork, type ChildProcess } from "node:child_process";
+import { planPluginWorkerSandbox, type PluginWorkerSandboxPlan } from "./plugin-worker-sandbox.js";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
@@ -470,6 +471,14 @@ export interface WorkerStartOptions {
    */
   proactiveCompanyScopes?: readonly string[];
   /**
+   * `proactiveScopeGeneration(pluginId)` as the caller read it before it
+   * computed `proactiveCompanyScopes`. When the manager has received a newer
+   * set through `setProactiveCompanyScopes` since then (a config written
+   * between the caller's read and this start), that newer set is used instead,
+   * so a stale startup read never replaces it. Omitted: the given set is used.
+   */
+  proactiveCompanyScopesGeneration?: number;
+  /**
    * Callback for stream notifications from the worker (streams.open/emit/close).
    * The host wires this to the PluginStreamBus to fan out events to SSE clients.
    */
@@ -869,9 +878,20 @@ export interface PluginWorkerManager {
 
   /**
    * Authorize the companies a plugin's worker may act on from proactive
-   * (non-invocation) context. No-op if the worker is not registered.
+   * (non-invocation) context. Applies to a registered worker at once; the set
+   * is also kept for the plugin, so a worker that is not registered yet (or is
+   * starting from an older read, see `proactiveCompanyScopesGeneration`)
+   * starts with it.
    */
   setProactiveCompanyScopes(pluginId: string, companyIds: readonly string[]): void;
+
+  /**
+   * A counter that increases with every `setProactiveCompanyScopes` call for
+   * the plugin (0 when there has been none). Read it before reading the
+   * plugin's configured companies and pass it as
+   * `WorkerStartOptions.proactiveCompanyScopesGeneration`.
+   */
+  proactiveScopeGeneration(pluginId: string): number;
 
   /**
    * Stop all managed workers. Called during server shutdown.
@@ -3063,7 +3083,7 @@ export function createPluginWorkerHandle(
   // Process lifecycle
   // -----------------------------------------------------------------------
 
-  function spawnProcess(): ChildProcess {
+  function spawnProcess(sandbox: PluginWorkerSandboxPlan): ChildProcess {
     // Security: Do NOT spread process.env into the worker. Plugins should only
     // receive a minimal, controlled environment to prevent leaking host
     // secrets (like DATABASE_URL, internal API keys, etc.).
@@ -3076,9 +3096,17 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
+    // Filesystem sandbox (Node permission model): the worker reads only its own
+    // module closure and writes only its private tmp dir, so it cannot read
+    // operator secret files such as GitHub App private keys. See
+    // plugin-worker-sandbox.ts and PLUGIN_SPEC.md §12.6.
+    // Every plan carries the complete execArgv, including --disable-sigusr1.
+    const execArgv = sandbox.execArgv;
+    if (sandbox.mode === "enforced") Object.assign(workerEnv, sandbox.env);
+
     const child = fork(options.entrypointPath, [], {
       stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
+      execArgv,
       env: workerEnv,
       // Don't let the child keep the parent alive
       detached: false,
@@ -3356,12 +3384,27 @@ export function createPluginWorkerHandle(
       throw new Error(`Worker for plugin "${pluginId}" is already ${status}`);
     }
 
+    // Plan the sandbox before changing status: a worker whose allowlist would
+    // cover an operator secret file must not start at all.
+    const sandbox = planPluginWorkerSandbox({
+      pluginId,
+      entrypointPath: options.entrypointPath,
+      manifest: options.manifest,
+      execArgv: options.execArgv,
+    });
+    if (sandbox.mode === "disabled") {
+      log.warn(
+        { reason: sandbox.reason, capability: sandbox.capability },
+        "plugin worker running without the filesystem sandbox",
+      );
+    }
+
     intentionalStop = false;
     retirementPending = false;
     setStatus("starting");
     stderrExcerpt = "";
 
-    const child = spawnProcess();
+    const child = spawnProcess(sandbox);
     childProcess = child;
     attachStdioHandlers(child);
     startedAt = Date.now();
@@ -4054,6 +4097,11 @@ export function createPluginWorkerManager(
   let activeInspections = 0;
   /** Per-plugin startup locks to prevent concurrent spawn races. */
   const startupLocks = new Map<string, Promise<PluginWorkerHandle>>();
+  // Latest proactive company scopes per plugin, kept whether or not a worker
+  // is registered, so a set written while a worker is stopped or starting is
+  // not lost (PAPERCLIP_PLUGIN_CONFIG_FILE, APP-262).
+  const latestProactiveScopes = new Map<string, { generation: number; companyIds: readonly string[] }>();
+  let proactiveScopeCounter = 0;
   // The one shared, process-scoped aggregate route-slot controller. The manager
   // injects it into every worker handle, so the duplex route ceiling counts every
   // concurrent route across the process, not one agent's setting.
@@ -4115,11 +4163,21 @@ export function createPluginWorkerManager(
         );
       }
 
+      // A scope set received after the caller read its configured companies
+      // is newer than options.proactiveCompanyScopes: start with that one.
+      const latestScopes = latestProactiveScopes.get(pluginId);
+      const proactiveCompanyScopes =
+        latestScopes &&
+        options.proactiveCompanyScopesGeneration !== undefined &&
+        latestScopes.generation > options.proactiveCompanyScopesGeneration
+          ? latestScopes.companyIds
+          : options.proactiveCompanyScopes;
       const handle = createPluginWorkerHandle(pluginId, {
         // Inject the shared process-scoped route-slot controller, unless the
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
+        proactiveCompanyScopes,
       }, () => pruneStartupWorker(handle));
       idleWorkerManifests.set(handle, pluginIdleManifestGeneration(options.manifest));
       if (existing) retainStartupWorker(existing);
@@ -4198,7 +4256,12 @@ export function createPluginWorkerManager(
     },
 
     setProactiveCompanyScopes(pluginId: string, companyIds: readonly string[]): void {
+      latestProactiveScopes.set(pluginId, { generation: ++proactiveScopeCounter, companyIds: [...companyIds] });
       workers.get(pluginId)?.setProactiveCompanyScopes(companyIds);
+    },
+
+    proactiveScopeGeneration(pluginId: string): number {
+      return latestProactiveScopes.get(pluginId)?.generation ?? 0;
     },
 
     async stopAll(): Promise<void> {

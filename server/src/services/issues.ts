@@ -213,6 +213,7 @@ import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
+import { applyProjectDefaultExecutionPolicy } from "./project-default-execution-policy.js";
 import { assertQualityReviewPolicyMutation, assertQualityReviewPolicyReuse, assertRequiredQualityReviewComplete, requiredQualityReview } from "./required-quality-review.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -2036,6 +2037,11 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
    * under the privacy-tree lock differs, the create is rejected, not written.
    */
   expectedParentId?: string | null;
+  /**
+   * The caller asked for no execution stages (`executionPolicy: null`), so the
+   * project's default stages are not added.
+   */
+  skipProjectDefaultExecutionStages?: boolean;
   workspaceSelection?: TaskWorkspaceSelection;
   workspaceSelectionSource?: "explicit" | "channel";
   workspaceSelectionActor?: AuthorizationActor;
@@ -10212,6 +10218,7 @@ export function issueService(db: Db) {
         onDeduplicated,
         parentDepthPolicy = "flatten",
         expectedParentId,
+        skipProjectDefaultExecutionStages,
         ...issueData
       } = data;
       // The parent the caller asked for. It still drives provenance, privacy and
@@ -10698,11 +10705,23 @@ export function issueService(db: Db) {
 
         if (issueData.projectId) {
           const selectedProject = await tx
-            .select({ visibility: projects.visibility })
+            .select({ visibility: projects.visibility, executionWorkspacePolicy: projects.executionWorkspacePolicy })
             .from(projects)
             .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
             .then((rows) => rows[0] ?? null);
           if (!selectedProject) throw notFound("Project not found");
+          // The project's default stages (e.g. review) apply unless the issue
+          // brings stages of its own.
+          // Read from the stored policy, not the gated one: these defaults
+          // apply whether or not isolated workspaces are enabled.
+          const projectIssueDefaults =
+            parseProjectExecutionWorkspacePolicy(selectedProject.executionWorkspacePolicy)?.defaultIssueExecutionPolicy;
+          if (projectIssueDefaults && !skipProjectDefaultExecutionStages) {
+            issueData.executionPolicy = applyProjectDefaultExecutionPolicy(
+              issueData.executionPolicy,
+              projectIssueDefaults,
+            ) as Record<string, unknown> | null;
+          }
           if (selectedProject.visibility === "private") {
             visibility = "private";
             if (!privacyRootIssueId) {

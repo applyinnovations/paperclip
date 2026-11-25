@@ -398,6 +398,7 @@ export {
   createProjectWorkspaceSchema,
   updateProjectWorkspaceSchema,
   projectExecutionWorkspacePolicySchema,
+  projectDefaultExecutionPolicySchema,
   projectWorkspaceRuntimeConfigSchema,
   type CreateProject,
   type UpdateProject,
@@ -405,6 +406,7 @@ export {
   type CreateProjectWorkspace,
   type UpdateProjectWorkspace,
   type ProjectExecutionWorkspacePolicy,
+  type ProjectDefaultExecutionPolicyInput,
 } from "./project.js";
 
 export {
