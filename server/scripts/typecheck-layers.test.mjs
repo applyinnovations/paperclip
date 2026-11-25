@@ -854,7 +854,10 @@ describe("lowMemoryTscArgs", () => {
     expect(lowMemoryTscArgs({}, 6 * GiB)).toEqual(["--singleThreaded"]);
     expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "" }, 6 * GiB)).toEqual(["--singleThreaded"]);
     expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "0" }, 6 * GiB)).toEqual([]);
-    expect(lowMemoryTscArgs({}, 8 * GiB)).toEqual([]);
+    expect(lowMemoryTscArgs({}, 8 * GiB)).toEqual(["--singleThreaded"]);
+    expect(lowMemoryTscArgs({ PAPERCLIP_TYPECHECK_LOW_MEMORY: "0" }, 8 * GiB)).toEqual([]);
+    expect(lowMemoryTscArgs({}, 16 * GiB)).toEqual([]);
+    expect(lowMemoryTscArgs({}, 24 * GiB)).toEqual([]);
     expect(lowMemoryTscArgs({}, 64 * GiB)).toEqual([]);
   });
 });

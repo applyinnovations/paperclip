@@ -1420,8 +1420,12 @@ cores. It also takes about twice as long.
 
 It checks one package at a time and uses one thread for the server layers and the
 UI. `scripts/run-tsc.mjs` also uses one thread on its own when the process's
-cgroup memory limit is below 8 GiB, such as in an agent sandbox; set
-`PAPERCLIP_TYPECHECK_LOW_MEMORY=0` to keep the default checkers there. Do not add `GOMEMLIMIT` to this path. It saves at most 300 MiB here, and it
+cgroup memory limit is below 16 GiB, such as in an agent sandbox (8 GiB); set
+`PAPERCLIP_TYPECHECK_LOW_MEMORY=0` to keep the default checkers there. In an
+8 GiB sandbox with one thread, `pnpm --filter @paperclipai/server typecheck`
+peaks at about 3.7 GiB. The default checkers' peak has not been measured to
+completion: their first layer passes 3.4 GiB, so the threshold stays above the
+sandbox limit and below CI's 24 GiB. Do not add `GOMEMLIMIT` to this path. It saves at most 300 MiB here, and it
 slows `tsc` by up to 20 times when the live heap goes above the limit.
 `pnpm build` still checks the whole server program and needs more than 8 GiB. The
 Docker image sets `PAPERCLIP_TSC_EMIT_ONLY=1` for that build, which emits
