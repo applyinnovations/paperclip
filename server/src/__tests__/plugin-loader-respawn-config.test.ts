@@ -6,6 +6,10 @@
  * resumes with no manual step. A loader-driven start is not replayed twice:
  * its own step 5b delivery covers it.
  *
+ * A save takes the same per-plugin delivery lock as the replay and both read
+ * the row inside it, so whichever delivers last sends the newest row; the
+ * race tests drive the real save path (applyPluginConfig) against the replay.
+ *
  * Same fixture-package + mocked-registry setup as
  * plugin-loader-before-worker-start.test.ts; one test runs a real worker
  * process through the real worker manager and SIGKILLs it.
@@ -20,6 +24,8 @@ import type { Db } from "@paperclipai/db";
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   listConfigs: vi.fn(),
+  getConfig: vi.fn(),
+  upsertConfig: vi.fn(),
   update: vi.fn(),
   updateStatus: vi.fn(),
 }));
@@ -28,6 +34,12 @@ vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mockRegistry,
 }));
 
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ syncSecretRefsForTarget: async () => undefined, getById: async () => null }),
+}));
+
+import { logger } from "../middleware/logger.js";
+import { applyPluginConfig } from "../services/plugin-config-apply.js";
 import { pluginLoader, type PluginRuntimeServices } from "../services/plugin-loader.js";
 import { createPluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -50,8 +62,8 @@ type ConfigRow = { companyId: string; configJson: Record<string, unknown> };
 type Delivery = { companyId: string; config: Record<string, unknown> };
 
 /** Lets fire-and-forget replay work settle. */
-async function flush(): Promise<void> {
-  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+async function flush(turns = 20): Promise<void> {
+  for (let i = 0; i < turns; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -147,7 +159,35 @@ describe("pluginLoader stored config replay to respawned workers", () => {
       { companyId: "company-b", configJson: { channel: "b-1" } },
     ];
     mockRegistry.listConfigs.mockImplementation(async () => storedRows.map((row) => ({ ...row })));
+    mockRegistry.getConfig.mockImplementation(async (_pluginId: string, companyId: string) => {
+      const row = storedRows.find((r) => r.companyId === companyId);
+      return row ? { ...row } : null;
+    });
+    mockRegistry.upsertConfig.mockImplementation(
+      async (_pluginId: string, companyId: string, input: { configJson: Record<string, unknown> }) => {
+        const row = { companyId, configJson: input.configJson };
+        storedRows = [...storedRows.filter((r) => r.companyId !== companyId), row]
+          .sort((x, y) => x.companyId.localeCompare(y.companyId));
+        return { ...row };
+      },
+    );
   });
+
+  /** An operator save through the real save path (write the row, then deliver). */
+  function save(workerManager: unknown, companyId: string, configJson: Record<string, unknown>) {
+    return applyPluginConfig({} as Db, { workerManager: workerManager as never }, {
+      plugin: { id: PLUGIN_ID, pluginKey: manifest.id, manifestJson: {} },
+      companyId,
+      configJson,
+    });
+  }
+
+  /** The deferred-promise pattern: a delivery that waits until released. */
+  function gate() {
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => { release = resolve; });
+    return { opened, release };
+  }
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
@@ -259,28 +299,111 @@ describe("pluginLoader stored config replay to respawned workers", () => {
     await loader.shutdownAll();
   });
 
-  it("re-delivers a save that lands while the replay is in flight", async () => {
+  it("ends on the newest saved config when a save lands after every replay read (final-pass race)", async () => {
     const fake = fakeWorkerManager();
     const loader = makeLoader(fake.manager);
     await loader.loadSingle(PLUGIN_ID);
     fake.deliveries.length = 0;
-    // The save writes the row (and delivers it itself) after the replay read
-    // the old row but before the replay's own delivery lands.
-    fake.setDeliver(async (params) => {
-      if (params.companyId === "company-a" && params.config.channel === "a-1") {
-        storedRows = [
-          { companyId: "company-a", configJson: { channel: "a-2" } },
-          { companyId: "company-b", configJson: { channel: "b-1" } },
-        ];
+    // Each time the replay reads the rows, a save writes a newer company-a
+    // config (and delivers it) before the replay delivers what it read. A
+    // bounded re-read leaves the last read's older value applied.
+    // (The save's own proactive-scope read must not start another save.)
+    const saves: Promise<unknown>[] = [];
+    let savesInFlight = 0;
+    let version = 1;
+    const read = mockRegistry.listConfigs.getMockImplementation()!;
+    mockRegistry.listConfigs.mockImplementation(async (pluginId: string) => {
+      const rows = await read(pluginId);
+      if (savesInFlight === 0 && version < 6) {
+        version += 1;
+        savesInFlight += 1;
+        saves.push(save(fake.manager, "company-a", { channel: `a-${version}` })
+          .finally(() => { savesInFlight -= 1; }));
+        // Long enough for a save that is not ordered against the replay to
+        // write and deliver before the replay delivers what it read.
+        await flush(200);
       }
-      return {};
+      return rows;
     });
     fake.crashAndRespawn();
+    // Every read waits 200 turns; let the replay and all saves finish.
+    await flush(2_000);
+    await Promise.all(saves);
     await flush();
-    const lastForA = fake.deliveries.filter((d) => d.companyId === "company-a").at(-1);
-    expect(lastForA).toEqual({ companyId: "company-a", config: { channel: "a-2" } });
-    expect(fake.deliveries.filter((d) => d.companyId === "company-b")).toHaveLength(1);
+    const stored = storedRows.find((r) => r.companyId === "company-a")!.configJson;
+    const forA = fake.deliveries.filter((d) => d.companyId === "company-a");
+    expect(forA.at(-1)).toEqual({ companyId: "company-a", config: stored });
     await loader.shutdownAll();
+  });
+
+  it("ends on the newest row when a replay starts while an older save's delivery is in flight", async () => {
+    const fake = fakeWorkerManager();
+    const loader = makeLoader(fake.manager);
+    await loader.loadSingle(PLUGIN_ID);
+    fake.deliveries.length = 0;
+    const saveDelivery = gate();
+    let held = false;
+    fake.setDeliver(async () => {
+      if (!held) { held = true; await saveDelivery.opened; }
+      return {};
+    });
+    const saving = save(fake.manager, "company-a", { channel: "a-2" });
+    await flush();
+    // A second save writes a-3 while the first delivery is in flight, and the
+    // worker respawns before either finishes.
+    const second = save(fake.manager, "company-a", { channel: "a-3" });
+    fake.crashAndRespawn();
+    await flush();
+    saveDelivery.release();
+    await Promise.all([saving, second]);
+    await flush();
+    const forA = fake.deliveries.filter((d) => d.companyId === "company-a");
+    expect(forA.at(-1)).toEqual({ companyId: "company-a", config: { channel: "a-3" } });
+    await loader.shutdownAll();
+  });
+
+  it("delivers a config saved while the worker is starting, not the rows read before start", async () => {
+    const fake = fakeWorkerManager();
+    const start = fake.manager.startWorker.getMockImplementation()!;
+    fake.manager.startWorker.mockImplementation(async (pluginId: string) => {
+      const handle = await start(pluginId);
+      // Saved after step 4b read the rows, once the worker is running.
+      await save(fake.manager, "company-a", { channel: "a-2" });
+      return handle;
+    });
+    const loader = makeLoader(fake.manager);
+    await loader.loadSingle(PLUGIN_ID);
+    await flush();
+    const forA = fake.deliveries.filter((d) => d.companyId === "company-a");
+    expect(forA.at(-1)).toEqual({ companyId: "company-a", config: { channel: "a-2" } });
+    await loader.shutdownAll();
+  });
+
+  it("never logs a failed delivery's error message, which can carry config secrets", async () => {
+    const lines: unknown[] = [];
+    const record = (...args: unknown[]) => { lines.push(args); };
+    const recorder = { debug: record, info: record, warn: record, error: record, trace: record, fatal: record } as Record<string, unknown>;
+    recorder.child = () => recorder;
+    const childSpy = vi.spyOn(logger, "child").mockReturnValue(recorder as never);
+    try {
+      const fake = fakeWorkerManager();
+      const loader = makeLoader(fake.manager);
+      await loader.loadSingle(PLUGIN_ID);
+      const secret = "xoxb-SECRET-token-value";
+      fake.setDeliver(async () => {
+        throw Object.assign(new Error(`invalid token ${secret}`), { code: -32000 });
+      });
+      fake.crashAndRespawn();
+      await flush();
+      const warned = lines.filter((args) =>
+        String((args as unknown[])[1]).includes("respawn config delivery failed for company"));
+      expect(warned).toHaveLength(2);
+      expect((warned[0] as unknown[])[0]).toMatchObject({ companyId: "company-a", code: -32000, errorName: "Error" });
+      expect(JSON.stringify(lines)).not.toContain(secret);
+      await loader.shutdownAll();
+    } finally {
+      childSpy.mockRestore();
+    }
   });
 
   it("stops a stale replay when a newer respawn starts", async () => {

@@ -54,6 +54,7 @@ import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 import { managedPluginWorkerEnvGrant } from "./managed-plugin-worker-env.js";
+import { configDeliveryErrorFields, withPluginConfigDeliveryLock } from "./plugin-config-delivery.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1508,18 +1509,18 @@ export function pluginLoader(
   const pluginKeysById = new Map<string, string>();
   /**
    * Respawn deliveries per plugin. A newer `ready` (another respawn) bumps the
-   * value, and an older delivery still in flight stops at its next step so it
-   * cannot overwrite what the newer one delivers.
+   * value, and an older delivery still queued or in flight stops at its next
+   * step so it cannot overwrite what the newer one delivers.
    */
   const respawnDeliveryGeneration = new Map<string, number>();
-  /** Re-read passes a respawn delivery makes to catch saves that raced it. */
-  const RESPAWN_CONFIG_DELIVERY_MAX_PASSES = 3;
 
   /**
    * Deliver one company's stored config to the plugin's running worker through
-   * the same `configChanged` path an operator config-save uses (routes/plugins.ts).
-   * Never throws: a failure for one company must not stop delivery to the
-   * others. Logs identify the plugin and company only, never config values.
+   * the same `configChanged` path an operator config-save uses
+   * (plugin-config-apply.ts). Call it inside `withPluginConfigDeliveryLock`
+   * with a row read inside that lock. Never throws: a failure for one company
+   * must not stop delivery to the others. Logs identify the plugin, company
+   * and error name/code only, never config values or error messages.
    */
   async function deliverStoredConfig(
     workerManager: PluginWorkerManager,
@@ -1534,16 +1535,9 @@ export function pluginLoader(
         companyId: row.companyId,
       });
     } catch (configErr) {
-      const code = (configErr as { code?: number } | null)?.code;
-      const details = {
-        pluginId,
-        pluginKey,
-        companyId: row.companyId,
-        trigger,
-        code,
-        err: configErr instanceof Error ? configErr.message : String(configErr),
-      };
-      if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
+      const errorFields = configDeliveryErrorFields(configErr);
+      const details = { pluginId, pluginKey, companyId: row.companyId, trigger, ...errorFields };
+      if (errorFields.code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
         // A single-tenant worker fails closed rather than collapse onto a
         // second company's config — surface that at warn so the
         // misconfiguration (multiple distinct companies configured for a
@@ -1554,7 +1548,7 @@ export function pluginLoader(
             ? "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies"
             : "plugin-loader: respawn config delivery rejected — single-tenant plugin configured for multiple companies",
         );
-      } else if (trigger === "respawn" && code !== PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED) {
+      } else if (trigger === "respawn" && errorFields.code !== PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED) {
         // The worker came back but did not get this company's config: its
         // company setup stays inert until the next save or reload.
         log.warn(details, "plugin-loader: respawn config delivery failed for company");
@@ -1571,11 +1565,10 @@ export function pluginLoader(
    * loader) comes back with an empty bootstrap config. Replay every configured
    * company's current stored config to it, as step 5b does for a loader start.
    *
-   * Rows are read fresh, so config saved since the first load or while the
-   * worker was down is what the worker gets. A save that lands between the
-   * read and the delivery could be overwritten by the older value, so after
-   * delivering, the rows are read again and any company whose config changed
-   * is delivered again (bounded passes).
+   * The rows are read inside the plugin's config-delivery lock, which a save
+   * also takes after writing its row (plugin-config-apply.ts). Whichever of
+   * the two runs last reads the newest row, so a save racing the replay can
+   * never be overwritten by an older value.
    */
   async function deliverStoredConfigAfterRespawn(
     workerManager: PluginWorkerManager,
@@ -1590,36 +1583,29 @@ export function pluginLoader(
       workerManager.getWorker(pluginId) !== handle ||
       !workerManager.isRunning(pluginId);
     const pluginKey = pluginKeysById.get(pluginId);
-    const delivered = new Map<string, string>();
 
-    for (let pass = 0; pass < RESPAWN_CONFIG_DELIVERY_MAX_PASSES; pass++) {
+    await withPluginConfigDeliveryLock(pluginId, async () => {
+      if (superseded()) return;
       let rows: StoredConfigRow[];
       try {
         rows = await registry.listConfigs(pluginId);
       } catch (listErr) {
         log.warn(
-          { pluginId, pluginKey, err: listErr instanceof Error ? listErr.message : String(listErr) },
+          { pluginId, pluginKey, ...configDeliveryErrorFields(listErr) },
           "plugin-loader: could not list stored configs for respawned worker",
         );
         return;
       }
-      const changed = rows.filter(
-        (row) => delivered.get(row.companyId) !== JSON.stringify(row.configJson ?? {}),
+      if (rows.length === 0) return;
+      log.info(
+        { pluginId, pluginKey, companies: rows.length },
+        "plugin-loader: delivering stored config to respawned worker",
       );
-      if (changed.length === 0) return;
-      if (pass === 0) {
-        log.info(
-          { pluginId, pluginKey, companies: rows.length },
-          "plugin-loader: delivering stored config to respawned worker",
-        );
-      }
-      for (const row of changed) {
+      for (const row of rows) {
         if (superseded()) return;
         await deliverStoredConfig(workerManager, pluginId, pluginKey, row, "respawn");
-        delivered.set(row.companyId, JSON.stringify(row.configJson ?? {}));
       }
-      if (superseded()) return;
-    }
+    });
   }
 
   // One listener for the life of the loader (not per start), so restarts never
@@ -1629,7 +1615,7 @@ export function pluginLoader(
     if (loaderStartingWorkers.has(pluginId)) return;
     void deliverStoredConfigAfterRespawn(runtimeServices.workerManager, pluginId).catch((err) => {
       log.warn(
-        { pluginId, err: err instanceof Error ? err.message : String(err) },
+        { pluginId, ...configDeliveryErrorFields(err) },
         "plugin-loader: respawn config delivery failed",
       );
     });
@@ -2488,11 +2474,7 @@ export function pluginLoader(
         configRows = await registry.listConfigs(pluginId);
       } catch (listErr) {
         log.debug(
-          {
-            pluginId,
-            pluginKey,
-            err: listErr instanceof Error ? listErr.message : String(listErr),
-          },
+          { pluginId, pluginKey, ...configDeliveryErrorFields(listErr) },
           "plugin-loader: could not list stored configs before worker start",
         );
       }
@@ -2563,14 +2545,25 @@ export function pluginLoader(
       // runtime ctx.config.get(companyId) model. onConfigChanged is idempotent
       // for well-behaved plugins, so replaying an unchanged config is safe.
       //
-      // Reuses the `configRows` loaded in step 4b (which also seeded the
-      // worker's proactive company scopes before startup); no second listConfigs
-      // round-trip is needed here.
+      // The rows are read again inside the plugin's config-delivery lock (a
+      // save takes the same lock after writing its row), so a save that lands
+      // while the worker starts can't be overwritten by the step 4b read.
       // Later worker processes (automatic crash recovery) get the same replay
-      // from the worker-ready listener, with freshly read rows.
-      for (const row of configRows) {
-        await deliverStoredConfig(workerManager, pluginId, pluginKey, row, "startup");
-      }
+      // from the worker-ready listener.
+      await withPluginConfigDeliveryLock(pluginId, async () => {
+        let deliveryRows = configRows;
+        try {
+          deliveryRows = await registry.listConfigs(pluginId);
+        } catch (listErr) {
+          log.warn(
+            { pluginId, pluginKey, ...configDeliveryErrorFields(listErr) },
+            "plugin-loader: could not re-read stored configs for startup delivery; using the rows read before start",
+          );
+        }
+        for (const row of deliveryRows) {
+          await deliverStoredConfig(workerManager, pluginId, pluginKey, row, "startup");
+        }
+      });
 
       // ------------------------------------------------------------------
       // 6. Sync job declarations and register with scheduler

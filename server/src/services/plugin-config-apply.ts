@@ -10,6 +10,7 @@ import type { Db } from "@paperclipai/db";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { unprocessable } from "../errors.js";
 import { validateInstanceConfig } from "./plugin-config-validator.js";
+import { withPluginConfigDeliveryLock } from "./plugin-config-delivery.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { extractSecretRefBindingsFromConfig } from "./plugin-secrets-handler.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -134,27 +135,46 @@ export async function applyPluginConfig(
   }
 
   // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
-  // If the worker implements onConfigChanged, send the new config via RPC.
-  // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
-  // up the new config on re-initialize. If no worker is running, skip: it
-  // reads the stored config when it starts.
-  if (workerManager?.isRunning(plugin.id)) {
-    try {
-      await workerManager.call(plugin.id, "configChanged", { config: configJson, companyId });
-    } catch (rpcErr) {
-      if (
-        rpcErr instanceof JsonRpcCallError &&
-        rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
-      ) {
-        // Worker doesn't handle live config — restart it.
-        try {
-          await deps.restartWorker?.(plugin.id);
-        } catch {
-          // Restart failure is non-fatal: the config is persisted.
-        }
+  // If the worker implements onConfigChanged, send the config via RPC. If it
+  // doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks up the
+  // config on re-initialize. If no worker is running, skip: it reads the
+  // stored config when it starts.
+  //
+  // The delivery runs in the plugin's config-delivery lock and sends the row
+  // read inside it, not this call's input. The loader's startup delivery and
+  // crash-respawn replay read their rows in the same lock, so whichever
+  // delivery runs last sends the newest row (APP-329).
+  if (workerManager) {
+    const needsRestart = await withPluginConfigDeliveryLock(plugin.id, async () => {
+      if (!workerManager.isRunning(plugin.id)) return false;
+      let latest: Record<string, unknown> | null = row.configJson as Record<string, unknown>;
+      try {
+        const current = await registry.getConfig(plugin.id, companyId);
+        latest = current ? ((current.configJson ?? {}) as Record<string, unknown>) : null;
+      } catch {
+        // Fall back to the row this call just wrote.
       }
-      // Other RPC errors (timeout, unavailable) are non-fatal — config is
-      // already persisted and will take effect on next worker restart.
+      // Removed since this save: nothing to deliver.
+      if (!latest) return false;
+      try {
+        await workerManager.call(plugin.id, "configChanged", { config: latest, companyId });
+        return false;
+      } catch (rpcErr) {
+        // Other RPC errors (timeout, unavailable) are non-fatal: the config
+        // is persisted and takes effect on the next worker start.
+        return (
+          rpcErr instanceof JsonRpcCallError &&
+          rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
+        );
+      }
+    });
+    // Outside the lock: the restarted worker's startup delivery takes it.
+    if (needsRestart) {
+      try {
+        await deps.restartWorker?.(plugin.id);
+      } catch {
+        // Restart failure is non-fatal: the config is persisted.
+      }
     }
   }
 
