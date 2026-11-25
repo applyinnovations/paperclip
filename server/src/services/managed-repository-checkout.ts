@@ -11,6 +11,7 @@ import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFa
 import { isWorkspaceGitScanError, WorkspaceGitScanError } from "./workspace-git-operation-scheduler.js";
 import { measureRunPhase, recordRepositoryObjectCacheDetail } from "./execution-preparation-timing.js";
 import { resolveRepositoryObjectCache, readRepositoryObjectCache, publishRepositoryObjectCache } from "./repository-object-cache.js";
+import { isGitNotARepositoryFailure } from "./git-not-repository.js";
 
 const execFile = promisify(execFileCallback);
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -259,10 +260,7 @@ export async function ensureManagedRepositoriesIgnored(cwd: string, options: { p
     });
     excludePath = path.resolve(cwd, result.stdout.trim());
   } catch (error) {
-    const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
-    if (options.plainTaskDirectory && failure.code === 128 && failure.signal == null &&
-        failure.stderr === "fatal: not a git repository (or any of the parent directories): .git\n" &&
-        !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR) return;
+    if (options.plainTaskDirectory && isGitNotARepositoryFailure(error)) return;
     throw error;
   }
   const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");

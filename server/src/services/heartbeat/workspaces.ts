@@ -88,6 +88,7 @@ import {
 } from "../execution-workspace-policy.js";
 import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
 import { assertLowTrustWorkspaceIsolation } from "../low-trust-runtime-containment.js";
+import { isGitNotARepositoryFailure } from "../git-not-repository.js";
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 import {
   createEffectiveRunConfigFingerprints,
@@ -850,14 +851,10 @@ async function probeGitWorktreeBase(cwd: string) {
     });
     return { isCheckout: Boolean(readNonEmptyString(result.stdout)), notRepository: false };
   } catch (error) {
-    const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
     // Git's absence result is only a candidate: damaged metadata can produce
     // the same message. Verify its absence too. Missing Git, permission errors,
     // corruption and I/O failures must remain reportable in Sentry.
-    const notRepository = failure.code === 128 && failure.signal == null &&
-      typeof failure.stderr === "string" &&
-      /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) &&
-      !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR &&
+    const notRepository = isGitNotARepositoryFailure(error) &&
       await hasNoGitMetadataInWorkspaceAncestors(cwd);
     return { isCheckout: false, notRepository };
   }

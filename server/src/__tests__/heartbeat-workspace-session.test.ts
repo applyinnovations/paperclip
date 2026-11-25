@@ -618,6 +618,29 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
     } finally { await fs.rm(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    ["parent directories", "fatal: not a git repository (or any of the parent directories): .git"],
+    ["mount point", "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."],
+  ])("marks a non-Git local path as a configuration conflict when Git reports the %s message", async (_name, stderr) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-mount-"));
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-probe-bin-"));
+    try {
+      await fs.writeFile(path.join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' '${stderr.replace("\n", "' '")}' >&2\nexit 128\n`, { mode: 0o755 });
+      vi.stubEnv("PATH", bin);
+      await expect(assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd))).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: { workspaceValidation: {
+          reason: "git_worktree_base_not_git_checkout",
+          configurationReason: "local_path_requires_git_checkout",
+        } },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(bin, { recursive: true, force: true });
+    }
+  });
+
   it.each(["legacy", "repository", "fallback", "materialization", "session", "unbound"])(
     "does not mark ambiguous non-Git workspace evidence as a configuration-only failure: %s", async (kind) => {
       const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ambiguous-workspace-"));

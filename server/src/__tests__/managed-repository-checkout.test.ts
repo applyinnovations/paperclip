@@ -33,6 +33,19 @@ describe("atomic managed repository publication", () => {
     await ensureManagedRepositoriesIgnored(source);
     expect(await readFile(path.join(source, ".git", "info", "exclude"), "utf8")).toContain("/.paperclip-repositories/");
   });
+  it.each([
+    ["parent directories", "fatal: not a git repository (or any of the parent directories): .git"],
+    ["mount point", "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."],
+  ])("allows a declared plain task directory when Git reports the %s message", async (_name, stderr) => {
+    const { root, target } = await fixture();
+    await mkdir(path.join(target, ".git"), { recursive: true });
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' '${stderr.replace("\n", "' '")}' >&2\nexit 128\n`, { mode: 0o755 });
+    vi.stubEnv("PATH", bin);
+    await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).resolves.toBeUndefined();
+    await expect(ensureManagedRepositoriesIgnored(target)).rejects.toThrow("not a git repository");
+  });
   it("allows a declared plain task directory with inert Git metadata without changing its files", async () => {
     const { target } = await fixture();
     await mkdir(path.join(target, ".git", "info"), { recursive: true });
