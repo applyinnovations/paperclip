@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { isGitNotRepositoryStderr } from "../services/heartbeat/workspaces.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -603,6 +604,17 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
       anchor: { localPathOnlyWorkspace: true, baseCwdFallback: false, materializationFailures: [] },
     };
   }
+
+  it("recognizes both wordings of git's not-a-repository result", () => {
+    expect(isGitNotRepositoryStderr("fatal: not a git repository (or any of the parent directories): .git\n")).toBe(true);
+    expect(isGitNotRepositoryStderr(
+      "fatal: not a git repository (or any parent up to mount point /)\n" +
+      "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    )).toBe(true);
+    expect(isGitNotRepositoryStderr("fatal: not a git repository (or any parent up to mount point /tmp)\n")).toBe(false);
+    expect(isGitNotRepositoryStderr("fatal: not a git repository: '/repo/.git'\n")).toBe(false);
+    expect(isGitNotRepositoryStderr(undefined)).toBe(false);
+  });
 
   it("marks a proven non-Git local path as an owner configuration conflict without changing the failure", async () => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-policy-"));
