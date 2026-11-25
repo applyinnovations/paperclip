@@ -1,3 +1,4 @@
+import type { PluginEnvironmentSyncHostIo } from "./environment-sync-io.js";
 import type { PluginWorkspaceParams, PluginWorkspaceResult } from "./workspace-provider.js";
 import type { PluginEnvironmentTaskParams, PluginEnvironmentTaskResult } from "./environment-tasks.js";
 import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
@@ -472,6 +473,16 @@ export interface PluginDefinition {
    */
   onEnvironmentSyncIn?(
     params: PluginEnvironmentSyncInParams,
+    /**
+     * Host-mediated I/O for this call's host sources. Use
+     * `io.readSource({ operationIndex, fileIndex })` instead of opening
+     * `sourcePath`; a sandboxed worker cannot open host paths. Valid only until
+     * this hook returns. The SDK worker always passes it (with
+     * `io.available === false` when the host issued no handle); it is optional
+     * here only so code that calls the hook directly, such as a test, compiles.
+     * An implementation may declare it required.
+     */
+    io?: PluginEnvironmentSyncHostIo,
   ): Promise<PluginEnvironmentSyncResult>;
 
   /**
@@ -482,6 +493,13 @@ export interface PluginDefinition {
    */
   onEnvironmentSyncOut?(
     params: PluginEnvironmentSyncOutParams,
+    /**
+     * Host-mediated I/O for this call's host targets. Use
+     * `io.writeTarget({ operationIndex, fileIndex }, entries)` instead of
+     * writing `targetPath`. Valid only until this hook returns. Always passed
+     * by the SDK worker; see `onEnvironmentSyncIn`.
+     */
+    io?: PluginEnvironmentSyncHostIo,
   ): Promise<PluginEnvironmentSyncResult>;
 
   /** Called to start an interactive setup sandbox and return redacted connection metadata. */

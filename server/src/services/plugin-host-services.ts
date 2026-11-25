@@ -1,3 +1,4 @@
+import { createEnvironmentSyncHostService } from "./plugin-environment-sync-io.js";
 import { projectGitAuthorizationService } from "./project-git-authorization.js";
 import { createLiveEventDelivery } from "../realtime/live-event-delivery.js";
 import { createLiveRunEventRedactor } from "./live-run-event-redaction.js";
@@ -1957,6 +1958,10 @@ export function buildHostServices(
         }
       },
     },
+
+    // Host-mediated sync I/O, bound per request to the call that issued the
+    // handle. The SDK gate already requires `environment.drivers.register`.
+    environmentSync: createEnvironmentSyncHostService(pluginId),
 
     tracer: {
       async record(params, context) {

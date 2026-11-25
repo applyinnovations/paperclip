@@ -6,6 +6,7 @@ import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/s
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 import { environmentCreationCleanupErrorData } from "./environment-creation-cleanup.js";
 import { environmentSyncErrorData, withEnvironmentSyncErrorCapture } from "./environment-sync-error.js";
+import { createEnvironmentSyncHostIo } from "./environment-sync-io.js";
 import { environmentRunnerIngressErrorData } from "./environment-runner-ingress-error.js";
 import { environmentStopErrorData } from "./environment-stop-error.js";
 import { environmentResumeErrorData } from "./environment-resume-error.js";
@@ -2230,18 +2231,26 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return plugin.definition.onEnvironmentRunnerIngressEndpoint(params);
   }
 
+  // Host-mediated sync I/O. Requests go out from inside the hook's async
+  // context, so they echo the call's host-issued invocation id.
+  function createSyncHostIoForCall(handle: string | undefined) {
+    return createEnvironmentSyncHostIo(handle, (method, ioParams) => callHost(method, ioParams));
+  }
+
   async function handleEnvironmentSyncIn(params: PluginEnvironmentSyncInParams) {
     if (!plugin.definition.onEnvironmentSyncIn) {
       throw methodNotImplemented("environmentSyncIn");
     }
-    return plugin.definition.onEnvironmentSyncIn(params);
+    const { hostIo, ...hookParams } = params;
+    return plugin.definition.onEnvironmentSyncIn(hookParams, createSyncHostIoForCall(hostIo?.handle));
   }
 
   async function handleEnvironmentSyncOut(params: PluginEnvironmentSyncOutParams) {
     if (!plugin.definition.onEnvironmentSyncOut) {
       throw methodNotImplemented("environmentSyncOut");
     }
-    return plugin.definition.onEnvironmentSyncOut(params);
+    const { hostIo, ...hookParams } = params;
+    return plugin.definition.onEnvironmentSyncOut(hookParams, createSyncHostIoForCall(hostIo?.handle));
   }
 
   async function handleEnvironmentStartInteractiveSetup(params: PluginEnvironmentStartInteractiveSetupParams) {

@@ -166,6 +166,111 @@ NOT widen them (for example by following a sandbox-planted symlink out of the
 intended root on an outbound write). Confinement is a host-side complete-mediation
 guard and is never delegated below the trust boundary.
 
+## Host-mediated sync I/O
+
+A mapping's host path is a path on the Paperclip host. A sandboxed plugin worker
+cannot open it, and no static filesystem grant can be confined to per-run
+workspaces. So the host does the host-side half of every mapping for the plugin.
+Each hook receives a second argument, `io`:
+
+```ts
+import type { PluginEnvironmentSyncHostIo } from "@paperclipai/plugin-sdk";
+
+async onEnvironmentSyncIn(params, io: PluginEnvironmentSyncHostIo) {
+  for (const [operationIndex, operation] of params.operations.entries()) {
+    for (const [fileIndex, mapping] of operation.files.entries()) {
+      for await (const entry of io.readSource({ operationIndex, fileIndex })) {
+        // entry: { type: "directory" | "file" | "symlink", path, mode, mtimeMs }
+        // file entries carry `size` and `content` (AsyncIterable<Uint8Array>);
+        // symlink entries carry `linkname`. Send them to mapping.targetPath.
+      }
+    }
+  }
+  /* ... */
+}
+
+async onEnvironmentSyncOut(params, io) {
+  // entries: an (async) iterable of { type, path, mode, mtimeMs, ... } read
+  // from mapping.sourcePath in the sandbox; file entries carry `content`.
+  await io.writeTarget({ operationIndex: 0, fileIndex: 0 }, entries);
+  /* ... */
+}
+```
+
+- **Address mappings, never paths.** The plugin passes the index of a mapping in
+  the current call. The host serves only the mappings it put into the call. It
+  mints a handle per call, binds it to the plugin, the company and the call, and
+  invalidates it when the call returns.
+- **Entries.** `path` is POSIX and relative to the mapping root. A
+  `kind: "file"` mapping has exactly one `file` entry, whose `path` is `""`. A
+  `kind: "directory"` mapping never has an entry for its root. On read,
+  directories come before their children and siblings are sorted by name. Read a
+  file entry's `content` before advancing the iterator; unread bytes are skipped.
+- **Read semantics (sync-in).** `readSource` applies the mapping's `exclude`
+  with tar's `--exclude` semantics and always excludes `._*`. It preserves
+  symlinks, or dereferences them when `followSymlinks` is set. Sockets are
+  skipped, as tar skips them.
+- **Write semantics (sync-out).** `writeTarget` applies the stream with the
+  contract above. A `kind: "file"` mapping is staged in the target's directory
+  and atomically renamed onto it. The mapping's `mode` applies, and there is no
+  world-readable window because the staged file is created `0600`. A
+  `kind: "directory"` mapping is destroy-then-replace. The host drops entries
+  matched by `exclude` (and `._*`, unless `preserveSourceEntries` is set). It
+  applies each entry's mode under the host umask, or exactly when
+  `preserveSourceEntries` is set, in which case setuid, setgid and sticky bits
+  are refused. Modification times are kept. The whole stream is staged in a
+  fresh `0700` directory inside the target and swapped in only when the stream
+  is accepted, so **a refused stream changes nothing at the target**.
+- **Bounded memory.** Bytes move in 256 KiB chunks over the existing worker RPC.
+  One request carries at most about 1 MiB. Neither side buffers a whole tree or
+  file.
+- **Availability.** `io.available` is `false` when the host issued no handle for
+  the call. That happens with an older host, or when the caller declared no host
+  roots. Every method then fails with code `unavailable`. During migration a
+  provider that can still reach the host filesystem may keep its own transfer in
+  that case. A sandboxed worker cannot, and nothing retries a refusal outside
+  the sandbox.
+
+### Confinement (fail closed)
+
+- **Roots.** The host code that builds a call's mappings declares its host roots
+  (`hostRoots`). These are the run's realized execution workspace, or a runtime
+  or staging directory the host created for the run, and they are the same roots
+  the orchestrator already confines the mappings to. Every mapping's host path
+  must be absolute, free of `..`, and inside one of them, lexically and by
+  realpath. The server refuses a root that is, contains, or sits inside a
+  protected path: `collectProtectedSecretPaths()`, the secrets master key and
+  directory, the database directory, `/etc`, `/proc`, `/run` and `/sys`, and host
+  code. It also refuses a shared parent of several workspaces or runs: `/`, the
+  home and tmp directories, the Paperclip home and instance roots, the instance
+  `workspaces` and `projects` trees, and a company or project directory inside
+  `projects`.
+- **Sync-in** reads never leave the mapping's source root. With
+  `followSymlinks`, a link whose target resolves outside the source root (or
+  does not resolve) is an error, not a skipped entry. Hardlinks are read as
+  regular files. FIFOs and devices are refused.
+- **Sync-out** writes refuse the following with code `unsafe_member`: absolute
+  names, `..` or `.` components, an entry below a symlink or a file, duplicate
+  names, and symlinks whose target is absolute or escapes the target root. This
+  is the same member and link policy the Kubernetes provider applies to
+  sandbox-authored tarballs (`findArchiveMemberEscape`). Hardlinks, devices and
+  other special entries are refused with `unsupported_entry`. The host never
+  writes through a link: files are created `O_EXCL | O_NOFOLLOW` in the staging
+  directory, and symlinks are created last.
+- **Errors.** Every refusal reaches the plugin as a `PluginSyncIoError` with a
+  `syncIoCode`: `unavailable`, `invalid_handle`, `invalid_mapping`,
+  `wrong_direction`, `confinement`, `protected_path`, `unsafe_member`,
+  `unsupported_entry`, `limit`, `protocol` or `io`. A stale handle, another
+  plugin's handle and another company's handle all give `invalid_handle`.
+
+### Testing a provider
+
+`createEnvironmentTestHarness` from `@paperclipai/plugin-sdk/testing` runs the
+same host engine as the server. Give the driver `onSyncIn` / `onSyncOut` and
+call `harness.syncIn(params, { hostRoots: [workspaceDir] })`. Omit `hostRoots`
+to test the `io.available === false` path. `syncHostRootPolicy` stands in for
+the server's root policy.
+
 ## Resource bounds
 
 The base64 fallback enforces transfer caps so a runaway payload cannot exhaust

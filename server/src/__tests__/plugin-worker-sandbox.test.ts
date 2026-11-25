@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { ENVIRONMENT_SYNC_IO_METHODS, type PluginSyncOperation, type WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 
 vi.mock("../middleware/logger.js", () => {
   const mockLogger: Record<string, unknown> = {
@@ -17,6 +18,7 @@ vi.mock("../middleware/logger.js", () => {
 });
 
 import { createPluginWorkerHandle } from "../services/plugin-worker-manager.js";
+import { beginEnvironmentSyncHostIo, createEnvironmentSyncHostService } from "../services/plugin-environment-sync-io.js";
 import {
   collectProtectedSecretPaths,
   planPluginWorkerSandbox,
@@ -186,6 +188,58 @@ describe("plugin worker filesystem sandbox (real worker process)", () => {
       expect(await probe(handle, { op: "read", file: path.join(folder, "readme.md") })).toBe("ERR_ACCESS_DENIED");
     } finally {
       await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("syncs a run workspace through host-mediated sync I/O while direct fs access to it is denied", async () => {
+    // A per-run workspace outside the worker's allowlist, served only through the host.
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sync-workspace-"));
+    fs.mkdirSync(path.join(workspace, "src/nested"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "src/README.md"), "hello from the workspace");
+    fs.writeFileSync(path.join(workspace, "src/nested/main.ts"), "export const answer = 42;\n");
+    fs.mkdirSync(path.join(workspace, "restore"));
+    const service = createEnvironmentSyncHostService("test.sandbox");
+    const hostHandlers = Object.fromEntries(ENVIRONMENT_SYNC_IO_METHODS.map((method) => [
+      method,
+      (params: unknown, context?: WorkerHostCallContext) => service.dispatch(method, params, context),
+    ]));
+    const handle = probeHandle("test.sandbox", hostHandlers);
+    const syncParams = (operations: PluginSyncOperation[], hostIo: string, config: Record<string, unknown>) => ({
+      driverKey: "probe", companyId: "company-1", environmentId: "env-1", config,
+      lease: { providerLeaseId: "lease-1" }, operations, hostIo: { handle: hostIo },
+    });
+    try {
+      await handle.start();
+      const inbound: PluginSyncOperation[] = [{ operationId: "in", files: [
+        { sourcePath: path.join(workspace, "src"), targetPath: "/sandbox/src", kind: "directory" },
+      ] }];
+      const inSession = beginEnvironmentSyncHostIo({ pluginId: "test.sandbox", companyId: "company-1", direction: "in",
+        operations: inbound, hostRoots: [workspace] })!;
+      try {
+        await expect(handle.call("environmentSyncIn",
+          syncParams(inbound, inSession.handle, { directRead: path.join(workspace, "src/README.md") }) as never))
+          .resolves.toMatchObject({ operations: [{ operationId: "in", filesTransferred: 2 }] });
+      } finally { await inSession.end(); }
+      expect(JSON.parse(await probe(handle, { op: "lastSync" }))).toEqual({ files: 2, direct: "ERR_ACCESS_DENIED" });
+
+      const outbound: PluginSyncOperation[] = [{ operationId: "out", files: [
+        { sourcePath: "/sandbox/src", targetPath: path.join(workspace, "restore"), kind: "directory" },
+      ] }];
+      const outSession = beginEnvironmentSyncHostIo({ pluginId: "test.sandbox", companyId: "company-1", direction: "out",
+        operations: outbound, hostRoots: [workspace] })!;
+      try {
+        await handle.call("environmentSyncOut",
+          syncParams(outbound, outSession.handle, { directWrite: path.join(workspace, "restore/direct.txt") }) as never);
+      } finally { await outSession.end(); }
+      expect(JSON.parse(await probe(handle, { op: "lastSync" }))).toEqual({ files: 3, direct: "ERR_ACCESS_DENIED" });
+      expect(fs.readFileSync(path.join(workspace, "restore/README.md"), "utf8")).toBe("hello from the workspace");
+      expect(fs.readFileSync(path.join(workspace, "restore/nested/main.ts"), "utf8")).toBe("export const answer = 42;\n");
+      expect(fs.readFileSync(path.join(workspace, "restore/from-sandbox.txt"), "utf8")).toBe("made in the sandbox");
+      expect(fs.existsSync(path.join(workspace, "restore/direct.txt"))).toBe(false);
+      expect(handle.status).toBe("running");
+    } finally {
+      await handle.stop().catch(() => undefined);
+      fs.rmSync(workspace, { recursive: true, force: true });
     }
   });
 

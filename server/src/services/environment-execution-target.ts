@@ -637,6 +637,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
                       lease: input.lease!,
                       operations,
                       ...(options?.minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs: options.minimumTimeoutMs }),
+                      ...(options?.hostRoots === undefined ? {} : { hostRoots: options.hostRoots }),
                     }),
                   syncOut: (operations, options) =>
                     input.environmentRuntime!.syncOut({
@@ -644,6 +645,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
                       lease: input.lease!,
                       operations,
                       ...(options?.minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs: options.minimumTimeoutMs }),
+                      ...(options?.hostRoots === undefined ? {} : { hostRoots: options.hostRoots }),
                     }),
                 }
               : {}),

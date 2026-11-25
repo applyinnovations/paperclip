@@ -1,6 +1,7 @@
 import { JsonRpcCallError, environmentResumeErrorData } from "@paperclipai/plugin-sdk";
 import { collectRunFailureDiagnostics } from "../services/run-failure-diagnostics.js";
 import { PluginWorkerUnavailableError } from "../services/plugin-worker-unavailable-error.js";
+import { activeEnvironmentSyncHostIoSessions, createEnvironmentSyncHostService } from "../services/plugin-environment-sync-io.js";
 import { createSandboxOrphanCleanupSpool } from "../services/sandbox-orphan-cleanup-spool.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
@@ -924,6 +925,45 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(call.mock.calls[1]?.[2]).not.toHaveProperty("minimumTimeoutMs");
     expect(seeded.environment.config.timeoutMs).toBe(timeoutMs);
     expect((await environmentService(db).getById(seeded.environment.id))?.config.timeoutMs).toBe(timeoutMs);
+  });
+
+  it("issues a host sync I/O handle only for declared host roots and invalidates it when the call returns", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-sync-io-run-"));
+    try {
+      await writeFile(path.join(root, "input.txt"), "payload");
+      const service = createEnvironmentSyncHostService(seeded.pluginId);
+      const context = { invocationScope: { companyId: seeded.companyId } };
+      let handle: string | undefined;
+      const call = vi.fn(async (_pluginId: string, _method: string, params: { hostIo?: { handle: string } }) => {
+        handle = params.hostIo?.handle;
+        if (handle) {
+          // Live during the call, for this plugin and company only.
+          await expect(service.dispatch("environmentSync.openSource", { handle, operationIndex: 0, fileIndex: 0 }, context))
+            .resolves.toHaveProperty("streamId");
+          await expect(createEnvironmentSyncHostService("another-plugin")
+            .dispatch("environmentSync.openSource", { handle, operationIndex: 0, fileIndex: 0 }, context))
+            .rejects.toMatchObject({ syncIoCode: "invalid_handle" });
+        }
+        return { operations: [] };
+      });
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: vi.fn(() => true), call,
+        getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+      } as unknown as PluginWorkerManager });
+      const operations = [{ operationId: "op", files: [{ sourcePath: path.join(root, "input.txt"), targetPath: "/remote/input.txt", kind: "file" as const }] }];
+
+      await runtime.syncIn({ environment: seeded.environment, lease: seeded.reusableLease, operations });
+      expect(handle).toBeUndefined();
+
+      await runtime.syncIn({ environment: seeded.environment, lease: seeded.reusableLease, operations, hostRoots: [root] });
+      expect(handle).toEqual(expect.any(String));
+      expect(activeEnvironmentSyncHostIoSessions()).toBe(0);
+      await expect(service.dispatch("environmentSync.openSource", { handle, operationIndex: 0, fileIndex: 0 }, context))
+        .rejects.toMatchObject({ syncIoCode: "invalid_handle" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each(["syncIn", "syncOut"] as const)("rejects invalid %s deadlines before a provider call", async method => {

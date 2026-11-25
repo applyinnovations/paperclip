@@ -1,3 +1,4 @@
+import { beginEnvironmentSyncHostIo } from "./plugin-environment-sync-io.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
@@ -622,6 +623,14 @@ export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInp
 export interface EnvironmentDriverSyncInput extends EnvironmentDriverLeaseInput {
   operations: PluginSyncOperation[];
   minimumTimeoutMs?: number;
+  /**
+   * Host roots for host-mediated sync I/O, declared by the host code that built
+   * the mappings: the run's realized execution workspace, or a runtime or
+   * staging directory the host created for the run. Every mapping's host path
+   * (source for syncIn, target for syncOut) must sit inside one. When absent the
+   * plugin gets no host I/O for the call and keeps its own transfer path.
+   */
+  hostRoots?: readonly string[];
 }
 
 export interface EnvironmentDriverOpenDuplexChannelInput extends EnvironmentDriverLeaseInput {
@@ -1589,22 +1598,36 @@ function createSandboxEnvironmentDriver(
       ? resolvePluginSandboxRpcTimeoutMs(sanitizedConfig)
       : Math.max(resolvePluginSandboxRpcTimeoutMs(sanitizedConfig) ?? 0,
         resolvePluginSandboxRpcTimeoutMs({ ...sanitizedConfig, timeoutMs: input.minimumTimeoutMs }) ?? 0);
-    return await pluginWorkerManager.call(pluginId, method, {
-      driverKey: providerKey,
+    // Host-mediated sync I/O: a per-call handle bound to this plugin, company
+    // and call, serving only this call's mappings inside the declared roots.
+    const hostIo = beginEnvironmentSyncHostIo({
+      pluginId,
       companyId: input.lease.companyId,
-      environmentId: input.environment.id,
-      issueId: input.lease.issueId,
-      config: sanitizedConfig,
-      lease: {
-        providerLeaseId: input.lease.providerLeaseId,
-        metadata: input.lease.metadata ?? undefined,
-        expiresAt: input.lease.expiresAt?.toISOString() ?? null,
-      },
+      direction: method === "environmentSyncIn" ? "in" : "out",
       operations: input.operations,
-      ...(input.minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs: input.minimumTimeoutMs }),
-    }, rpcTimeoutMs).catch((error: unknown) => {
-      throw method === "environmentSyncOut" ? preserveEnvironmentSyncOutErrorDiagnostic(error) : error;
+      hostRoots: input.hostRoots,
     });
+    try {
+      return await pluginWorkerManager.call(pluginId, method, {
+        driverKey: providerKey,
+        companyId: input.lease.companyId,
+        environmentId: input.environment.id,
+        issueId: input.lease.issueId,
+        config: sanitizedConfig,
+        lease: {
+          providerLeaseId: input.lease.providerLeaseId,
+          metadata: input.lease.metadata ?? undefined,
+          expiresAt: input.lease.expiresAt?.toISOString() ?? null,
+        },
+        operations: input.operations,
+        ...(input.minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs: input.minimumTimeoutMs }),
+        ...(hostIo ? { hostIo: { handle: hostIo.handle } } : {}),
+      }, rpcTimeoutMs).catch((error: unknown) => {
+        throw method === "environmentSyncOut" ? preserveEnvironmentSyncOutErrorDiagnostic(error) : error;
+      });
+    } finally {
+      await hostIo?.end();
+    }
   }
 
   return {

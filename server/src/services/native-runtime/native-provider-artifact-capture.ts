@@ -98,9 +98,10 @@ export async function captureRemoteNativeProviderArtifacts<T>(
           ]);
           input.signal.throwIfAborted();
           input.context?.assertOpen();
+          // `root` is this capture's own temp dir: the only host root it declares.
           await input.runner.syncOut!([
             { operationId: `provider-artifacts-${randomUUID()}`, files },
-          ]);
+          ], { hostRoots: [root] });
         } finally {
           // The export copy is scratch under the excluded runtime dir. A failed
           // removal must not replace the transfer outcome; it is logged instead.

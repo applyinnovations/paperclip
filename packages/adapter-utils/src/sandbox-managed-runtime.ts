@@ -456,6 +456,13 @@ export const MAX_SANDBOX_SYNC_TIMEOUT_MS = 30 * 60_000;
 
 export interface SandboxSyncOptions {
   minimumTimeoutMs?: number;
+  /**
+   * Host-side roots of this call's mappings (the source roots for `syncIn`, the
+   * target roots for `syncOut`), as confined by {@link assertSyncOperationsConfined}.
+   * A native provider gets host-mediated sync I/O only inside these roots, so
+   * pass only the run's workspace or directories created for this run.
+   */
+  hostRoots?: readonly string[];
 }
 
 /**
@@ -1021,7 +1028,7 @@ export async function exportSandboxWorkspaceSnapshot(input: {
   assertSyncOperationsConfined(operations, { sourceRoots: [input.remoteDir], targetRoots: [input.stagingDir] });
   if (!input.client.syncOut) throw Object.assign(new Error("Validated workspace export is unavailable for this provider"),
     { code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
-  await input.client.syncOut(operations);
+  await input.client.syncOut(operations, { hostRoots: [input.stagingDir] });
   await confineFullWorkspaceExport(input.stagingDir, true);
 }
 
@@ -1584,7 +1591,7 @@ export async function prepareSandboxManagedRuntime(input: {
         params.progressLabel,
         { sink: input.onRuntimeProgress, phase: params.statusPhase },
       );
-      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations));
+      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations, { hostRoots: params.sourceRoots }));
       // Prefer the transport's own byte total. It is the real count for a
       // provider that has no host tarball to stat (a referenced project rides
       // a `directory` mapping). Fall back to the caller-supplied count when
@@ -2142,7 +2149,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         sourceRoots: [runtimeRootDir],
                         targetRoots: [tempDir],
                       });
-                      const syncResult = await input.client.syncOut!(operations);
+                      const syncResult = await input.client.syncOut!(operations, { hostRoots: [tempDir] });
                       const transferredBytes = sumSyncResultBytes(syncResult);
                       await gitExport.finish(transferredBytes, transferredBytes);
                     } else {
@@ -2216,7 +2223,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       { sourcePath: helper, targetPath: remoteHelper, kind: "file" },
                     ] }];
                     assertSyncOperationsConfined(inbound, { sourceRoots: [tempDir], targetRoots: [runtimeRootDir] });
-                    await input.client.syncIn!(inbound);
+                    await input.client.syncIn!(inbound, { hostRoots: [tempDir] });
                     try {
                       let captured = false;
                       try {
@@ -2234,7 +2241,7 @@ export async function prepareSandboxManagedRuntime(input: {
                           { sourcePath: remoteOutput, targetPath: output, kind: "directory", preserveSourceEntries: true },
                         ] }];
                         assertSyncOperationsConfined(outbound, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
-                        await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
+                        await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound, { hostRoots: [tempDir] }));
                         checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
                         await fs.rename(path.join(output, "payload"), extractedDir);
                         const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
@@ -2275,7 +2282,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     "workspace",
                     { sink: input.onRuntimeProgress, phase: "restore" },
                   );
-                  const syncResult = await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(operations));
+                  const syncResult = await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(operations, { hostRoots: [extractedDir] }));
                   const transferredBytes = sumSyncResultBytes(syncResult);
                   await workspaceRestore.finish(transferredBytes, transferredBytes);
                 } else if (!checkpointSnapshot) {

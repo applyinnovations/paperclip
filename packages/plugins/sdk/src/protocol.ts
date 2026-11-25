@@ -1,3 +1,4 @@
+import type { EnvironmentSyncIoMethods } from "./environment-sync-io.js";
 import type { PluginWorkspaceParams, PluginWorkspaceResult } from "./workspace-provider.js";
 import type { PluginEnvironmentTaskParams, PluginEnvironmentTaskResult } from "./environment-tasks.js";
 import type { PluginAgentRuntimeState, PluginAgentRuntimeIdentity } from "./types.js";
@@ -907,16 +908,29 @@ export interface PluginSyncOperation {
   postUploadCommands?: PluginPostUploadCommand[];
 }
 
+/**
+ * Host-issued sync I/O grant for one sync call. The SDK consumes it and passes
+ * the plugin a `PluginEnvironmentSyncHostIo` instead; plugins never read it.
+ */
+export interface PluginEnvironmentSyncHostIoGrant {
+  /** Opaque per-call handle; invalid once the call returns. */
+  handle: string;
+}
+
 export interface PluginEnvironmentSyncInParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
   operations: PluginSyncOperation[];
   minimumTimeoutMs?: number;
+  /** Host-issued; see {@link PluginEnvironmentSyncHostIoGrant}. Stripped before the plugin hook runs. */
+  hostIo?: PluginEnvironmentSyncHostIoGrant;
 }
 
 export interface PluginEnvironmentSyncOutParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
   operations: PluginSyncOperation[];
   minimumTimeoutMs?: number;
+  /** Host-issued; see {@link PluginEnvironmentSyncHostIoGrant}. Stripped before the plugin hook runs. */
+  hostIo?: PluginEnvironmentSyncHostIoGrant;
 }
 
 /** Per-operation transfer accounting returned by a sync hook, for observability. */
@@ -1606,7 +1620,7 @@ export interface PluginSpanRecord {
   children?: PluginSpanRecord[];
 }
 
-export interface WorkerToHostMethods {
+export interface WorkerToHostMethods extends EnvironmentSyncIoMethods {
   // Config
   "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
 

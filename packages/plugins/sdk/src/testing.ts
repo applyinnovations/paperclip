@@ -1,3 +1,5 @@
+import { createEnvironmentSyncHostIo, type PluginEnvironmentSyncHostIo } from "./environment-sync-io.js";
+import { createSyncHostIoRegistry, type SyncHostIoRegistry, type SyncHostIoRegistryOptions } from "./environment-sync-io-host.js";
 import { randomUUID } from "node:crypto";
 import { createIssueThreadInteractionSchema, parseReviewedSha, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import type {
@@ -73,6 +75,9 @@ import type {
   PluginEnvironmentCancelInteractiveSetupResult,
   PluginEnvironmentDeleteTemplateParams,
   PluginEnvironmentDeleteTemplateResult,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
+  PluginEnvironmentSyncResult,
   PluginPerformActionActorContext,
   PluginPerformActionContext,
 } from "./protocol.js";
@@ -180,7 +185,9 @@ export interface EnvironmentEventRecord {
     | "getInteractiveSetup"
     | "captureTemplate"
     | "cancelInteractiveSetup"
-    | "deleteTemplate";
+    | "deleteTemplate"
+    | "syncIn"
+    | "syncOut";
   driverKey: string;
   environmentId: string;
   timestamp: string;
@@ -209,7 +216,25 @@ export interface EnvironmentTestHarnessOptions extends TestHarnessOptions {
     onCaptureTemplate?: (params: PluginEnvironmentCaptureTemplateParams) => Promise<PluginEnvironmentCaptureTemplateResult>;
     onCancelInteractiveSetup?: (params: PluginEnvironmentCancelInteractiveSetupParams) => Promise<PluginEnvironmentCancelInteractiveSetupResult>;
     onDeleteTemplate?: (params: PluginEnvironmentDeleteTemplateParams) => Promise<PluginEnvironmentDeleteTemplateResult>;
+    onSyncIn?: (params: PluginEnvironmentSyncInParams, io: PluginEnvironmentSyncHostIo) => Promise<PluginEnvironmentSyncResult>;
+    onSyncOut?: (params: PluginEnvironmentSyncOutParams, io: PluginEnvironmentSyncHostIo) => Promise<PluginEnvironmentSyncResult>;
   };
+  /**
+   * Host policy for the fake host's sync I/O roots (the server additionally
+   * refuses protected paths and shared parents). Defaults to accepting any
+   * existing directory.
+   */
+  syncHostRootPolicy?: SyncHostIoRegistryOptions["checkRoot"];
+}
+
+/** Per-call options for {@link EnvironmentTestHarness.syncIn} / `syncOut`. */
+export interface EnvironmentSyncCallOptions {
+  /**
+   * Host roots the fake host serves for this call, as the server's caller
+   * would declare them. Omit to simulate a call with no host I/O
+   * (`io.available === false`).
+   */
+  hostRoots?: string[];
 }
 
 /** Extended test harness with environment driver simulation. */
@@ -246,6 +271,16 @@ export interface EnvironmentTestHarness extends TestHarness {
   cancelInteractiveSetup(params: PluginEnvironmentCancelInteractiveSetupParams): Promise<PluginEnvironmentCancelInteractiveSetupResult>;
   /** Invoke the environment driver's optional template delete hook. */
   deleteTemplate(params: PluginEnvironmentDeleteTemplateParams): Promise<PluginEnvironmentDeleteTemplateResult>;
+  /**
+   * Invoke the driver's `onSyncIn` hook with a host-mediated sync I/O API
+   * served by the real host engine over this call's `hostRoots`. Requests go
+   * through a JSON round trip, as on the worker RPC.
+   */
+  syncIn(params: PluginEnvironmentSyncInParams, options?: EnvironmentSyncCallOptions): Promise<PluginEnvironmentSyncResult>;
+  /** Invoke the driver's `onSyncOut` hook; see {@link syncIn}. */
+  syncOut(params: PluginEnvironmentSyncOutParams, options?: EnvironmentSyncCallOptions): Promise<PluginEnvironmentSyncResult>;
+  /** The fake host's sync I/O registry, for stale- and foreign-handle tests. */
+  syncHostIo: SyncHostIoRegistry;
 }
 
 // ---------------------------------------------------------------------------
@@ -2812,9 +2847,46 @@ export function createEnvironmentTestHarness(options: EnvironmentTestHarnessOpti
     }
   }
 
+  const syncHostIo = createSyncHostIoRegistry({ checkRoot: options.syncHostRootPolicy });
+  const harnessPluginId = options.manifest.id;
+
+  async function callSyncHook<P extends PluginEnvironmentSyncInParams | PluginEnvironmentSyncOutParams>(
+    type: "syncIn" | "syncOut",
+    hook: ((params: P, io: PluginEnvironmentSyncHostIo) => Promise<PluginEnvironmentSyncResult>) | undefined,
+    params: P,
+    callOptions: EnvironmentSyncCallOptions | undefined,
+  ): Promise<PluginEnvironmentSyncResult> {
+    const session = callOptions?.hostRoots
+      ? syncHostIo.begin({
+        pluginId: harnessPluginId,
+        companyId: params.companyId,
+        direction: type === "syncIn" ? "in" : "out",
+        operations: params.operations,
+        hostRoots: callOptions.hostRoots,
+      })
+      : null;
+    const io = createEnvironmentSyncHostIo(session?.handle, async (method, ioParams) => {
+      const wireParams = JSON.parse(JSON.stringify(ioParams)) as unknown;
+      const result = await syncHostIo.dispatch(method, wireParams, { pluginId: harnessPluginId, companyId: params.companyId });
+      return JSON.parse(JSON.stringify(result ?? null));
+    });
+    try {
+      return await callHook(type, hook ? (p: P) => hook(p, io) : undefined, params, type === "syncIn" ? "onSyncIn" : "onSyncOut");
+    } finally {
+      await session?.end();
+    }
+  }
+
   const envHarness: EnvironmentTestHarness = {
     ...base,
     environmentEvents,
+    syncHostIo,
+    async syncIn(params, callOptions) {
+      return callSyncHook("syncIn", driver.onSyncIn, params, callOptions);
+    },
+    async syncOut(params, callOptions) {
+      return callSyncHook("syncOut", driver.onSyncOut, params, callOptions);
+    },
     async validateConfig(params) {
       return callHook("validateConfig", driver.onValidateConfig, params, "onValidateConfig");
     },
