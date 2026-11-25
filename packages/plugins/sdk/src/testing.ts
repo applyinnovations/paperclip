@@ -966,7 +966,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     githubApp: {
-      // The harness has no operator GitHub Apps: tokens resolve null and deliveries fail closed.
+      // The harness has no operator GitHub Apps: tokens and redelivery resolve null and deliveries fail closed.
       async getInstallationToken() {
         requireCapability(manifest, capabilitySet, "github.app.token");
         return null;
@@ -977,6 +977,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
       async getApprovalsToken() {
         requireCapability(manifest, capabilitySet, "github.approvals.token");
+        return null;
+      },
+      async redeliverFailedDeliveries() {
+        requireCapability(manifest, capabilitySet, "github.app.webhooks.redeliver");
         return null;
       },
     },

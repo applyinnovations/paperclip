@@ -25,7 +25,13 @@ export async function githubBotRequest<T>(
   fetchImpl: typeof fetch,
   token: string | null,
   path: string,
-  options: { method?: string; body?: unknown; accept?: string } = {},
+  options: {
+    method?: string;
+    body?: unknown;
+    accept?: string;
+    /** Called with the headers of the successful response, e.g. to read a `Link` header. */
+    onHeaders?: (headers: Headers) => void;
+  } = {},
 ): Promise<T> {
   const deadline = Date.now() + GITHUB_INLINE_RETRY_WINDOW_MS;
   const safeToRetry = (options.method ?? "GET") === "GET" ||
@@ -46,7 +52,7 @@ async function githubBotRequestOnce<T>(
   fetchImpl: typeof fetch,
   token: string | null,
   path: string,
-  options: { method?: string; body?: unknown; accept?: string },
+  options: { method?: string; body?: unknown; accept?: string; onHeaders?: (headers: Headers) => void },
   timeoutMs: number,
 ): Promise<T> {
   if (
@@ -107,6 +113,7 @@ async function githubBotRequestOnce<T>(
       githubProviderRetry(response, secondaryRateLimit),
     );
   }
+  options.onHeaders?.(response.headers);
   if (response.status === 204) return undefined as T;
   const reader = response.body?.getReader();
   if (!reader) throw unprocessable("GitHub returned an empty response", { code: "github_bot_invalid_response", retryable: true });

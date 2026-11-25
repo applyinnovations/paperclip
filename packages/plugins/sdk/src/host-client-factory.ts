@@ -158,7 +158,10 @@ export interface HostServices {
     ): Promise<string>;
   };
 
-  /** Provides `githubApp.getInstallationToken`, `githubApp.verifyWebhook` and `githubApp.getApprovalsToken`. */
+  /**
+   * Provides `githubApp.getInstallationToken`, `githubApp.verifyWebhook`, `githubApp.getApprovalsToken`
+   * and `githubApp.redeliverFailedDeliveries`.
+   */
   githubApp: {
     getInstallationToken(
       params: { companyId: string },
@@ -171,6 +174,10 @@ export interface HostServices {
       params: { repository: string; companyId: string },
       context?: WorkerHostCallContext,
     ): Promise<WorkerToHostMethods["githubApp.getApprovalsToken"][1]>;
+    redeliverFailedDeliveries(
+      params: { since: string; companyId: string },
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["githubApp.redeliverFailedDeliveries"][1]>;
   };
 
   /** Provides `activity.log`. */
@@ -440,6 +447,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "githubApp.getInstallationToken": "github.app.token",
   "githubApp.verifyWebhook": "github.app.webhooks.verify",
   "githubApp.getApprovalsToken": "github.approvals.token",
+  "githubApp.redeliverFailedDeliveries": "github.app.webhooks.redeliver",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -832,6 +840,14 @@ export function createHostClientHandlers(
         throw new Error("githubApp.getApprovalsToken requires a repository");
       }
       return services.githubApp.getApprovalsToken({ repository: params.repository, companyId }, context);
+    }),
+    // Redelivery is for the invocation company's App only.
+    "githubApp.redeliverFailedDeliveries": gated("githubApp.redeliverFailedDeliveries", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("githubApp.redeliverFailedDeliveries", params, context);
+      if (typeof params?.since !== "string" || !Number.isFinite(Date.parse(params.since))) {
+        throw new Error("githubApp.redeliverFailedDeliveries requires since as an ISO time");
+      }
+      return services.githubApp.redeliverFailedDeliveries({ since: params.since, companyId }, context);
     }),
 
     // Activity

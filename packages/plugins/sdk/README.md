@@ -461,6 +461,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `secrets.read-ref` |
 | | `github.app.token` |
 | | `github.app.webhooks.verify` |
+| | `github.app.webhooks.redeliver` |
 | | `environment.drivers.register` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |

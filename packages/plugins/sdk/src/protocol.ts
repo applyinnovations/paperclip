@@ -85,6 +85,7 @@ import type {
   PluginGitHubAppInstallationToken,
   PluginGitHubAppWebhookVerification,
   PluginGitHubApprovalsToken,
+  PluginGitHubAppRedeliveryResult,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1763,6 +1764,10 @@ export interface WorkerToHostMethods {
   "githubApp.getApprovalsToken": [
     params: { repository: string; companyId?: string },
     result: PluginGitHubApprovalsToken | null,
+  ];
+  "githubApp.redeliverFailedDeliveries": [
+    params: { since: string; companyId?: string },
+    result: PluginGitHubAppRedeliveryResult | null,
   ];
 
   // Activity

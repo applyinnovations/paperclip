@@ -222,7 +222,7 @@ Paperclip. It is not available yet. When it is:
    **Check suite**, **Check run** and **Status**. The final list is set by the
    plugin.
 
-The plugin never reads App private keys or webhook secrets. Plugins use two
+The plugin never reads App private keys or webhook secrets. Plugins use these
 host services, each behind its own capability:
 
 - `ctx.githubApp.getInstallationToken()` (`github.app.token`) returns a
@@ -235,6 +235,15 @@ host services, each behind its own capability:
   the App's company only when the signature is valid and the delivery is for
   the configured installation. The plugin must deduplicate on
   `X-GitHub-Delivery`, because a valid signature does not prevent replay.
+- `ctx.githubApp.redeliverFailedDeliveries({ since })`
+  (`github.app.webhooks.redeliver`) has the host sign the company App's JWT and
+  ask GitHub to redeliver every delivery since `since` (capped to GitHub's
+  three-day retention) that has no successful attempt, for example on plugin
+  startup after downtime. GitHub does not retry failed deliveries on its own.
+  The plugin receives only delivery GUIDs and counts, never payloads or the
+  JWT. Redeliveries arrive through the normal webhook route under their
+  original `X-GitHub-Delivery`. It returns `null` when the company has no App,
+  and is refused for an App shared by several companies.
 
 ## Identity resolution
 

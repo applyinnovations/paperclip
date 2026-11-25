@@ -1008,6 +1008,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `secrets.read-ref`
 - `github.app.token` — `ctx.githubApp.getInstallationToken()`: a short-lived installation token for the invocation company's operator-owned GitHub App. Never the private key; never another company's token
 - `github.app.webhooks.verify` — `ctx.githubApp.verifyWebhook()`: the host checks a GitHub App webhook signature and returns the App's company. The plugin never reads the webhook secret
+- `github.app.webhooks.redeliver` — `ctx.githubApp.redeliverFailedDeliveries()`: the host signs the invocation company's App JWT and asks GitHub to redeliver that App's failed webhook deliveries since a given time. Returns delivery GUIDs and counts only; never payloads or the JWT
 - `environment.drivers.register`
 
 ### Agent Tools
