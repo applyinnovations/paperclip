@@ -20,7 +20,9 @@ const URL_IN_TEXT_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 
 // drizzle-orm `DrizzleQueryError`: "Failed query: <sql>\nparams: <values>".
 // The SQL is the plugin's own statement; the params are the values it bound.
-const DRIZZLE_PARAMS_RE = /^(params:)[^\n]*/gm;
+// A bound text value can itself contain newlines, so everything from the
+// `params:` line to the end of the message is redacted, not just that line.
+const DRIZZLE_PARAMS_RE = /^(params:)[\s\S]*/m;
 
 export function redactPluginHostErrorMessage(message: string): string {
   const withoutUrlSecrets = message.replace(URL_IN_TEXT_RE, (url) => stripSecretBearingUrlParts(url));

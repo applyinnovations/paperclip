@@ -46,7 +46,9 @@ const URL_PASSWORD = "hunter2-url-password";
 const URL_QUERY_TOKEN = "query-token-5f3a9c";
 const BOUND_PARAM = "bound-param-secret-77";
 const HEADER_TOKEN = "sk-live-header-token-42";
-const LEAKS = [RAW_TOKEN, URL_PASSWORD, URL_QUERY_TOKEN, BOUND_PARAM, HEADER_TOKEN];
+// Second line of a bound text value that contains a newline.
+const MULTILINE_PARAM = "multiLineCredential77";
+const LEAKS = [RAW_TOKEN, URL_PASSWORD, URL_QUERY_TOKEN, BOUND_PARAM, HEADER_TOKEN, MULTILINE_PARAM];
 
 function createEventBusStub() {
   return {
@@ -79,6 +81,14 @@ describe("redactPluginHostErrorMessage", () => {
     expect(redacted).toContain("https://api.example.com/v1/items");
     expect(redacted).toContain('Failed query: insert into "plugin_x"."t"');
     expect(redacted).toContain("params: [REDACTED]");
+  });
+
+  it("redacts every line of a multi-line bound param", () => {
+    const redacted = redactPluginHostErrorMessage(
+      `Failed query: insert into t (v) values ($1)\nparams: first line\n${MULTILINE_PARAM},${BOUND_PARAM}`,
+    );
+    expectNoLeaks(redacted);
+    expect(redacted).toBe("Failed query: insert into t (v) values ($1)\nparams: [REDACTED]");
   });
 
   it("strips bearer credentials", () => {
@@ -123,6 +133,12 @@ describe("host handler errors", () => {
               `Failed query: select 1\nparams: ${BOUND_PARAM}`,
           );
         }) as never,
+        // drizzle failure whose bound text value spans several lines.
+        "issues.get": (async () => {
+          throw new Error(
+            `Failed query: insert into t (v) values ($1)\nparams: first line\n${MULTILINE_PARAM}`,
+          );
+        }) as never,
       },
     });
 
@@ -159,6 +175,7 @@ describe("host handler errors", () => {
         }),
       );
       await capture(callHost("companies.get", { companyId: "company-1" }));
+      await capture(callHost("issues.get", { companyId: "company-1", issueId: "issue-1" }));
     } finally {
       await handle.stop().catch(() => undefined);
     }
@@ -169,11 +186,12 @@ describe("host handler errors", () => {
       expect.stringContaining("Invalid URL passed to http.fetch"),
       expect.stringContaining("Invalid request headers passed to http.fetch"),
       expect.stringContaining("params: [REDACTED]"),
+      expect.stringContaining("params: [REDACTED]"),
     ]);
     expectNoLeaks(JSON.stringify(errors));
 
     const hostErrorLines = vi.mocked(logger.error).mock.calls.filter((call) => call[1] === "host handler error");
-    expect(hostErrorLines).toHaveLength(5);
+    expect(hostErrorLines).toHaveLength(6);
     expectNoLeaks(loggedText());
   });
 });
