@@ -89,6 +89,7 @@ if $fhs_ci; then
     -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP
     HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
+  step test-env "${as_test_user[@]}" node .xlab/test_env_guard.mjs
 fi
 # Pull requests run the test files they add or change. Import-graph selection
 # (vitest --changed) still picks most of the suite for any server change, and
