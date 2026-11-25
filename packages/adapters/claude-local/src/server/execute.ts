@@ -3,6 +3,7 @@ import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -25,8 +26,10 @@ import {
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
+  runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
   adapterExecutionTargetCommandEnv,
+  type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -96,6 +99,15 @@ import {
   minimumClaudeCliVersionForModel,
 } from "./cli-capabilities.js";
 import { prepareCompatibleClaudeCommand } from "./sandbox-cli-version.js";
+import {
+  CLAUDE_SANDBOX_TRANSCRIPT_ASSET_KEY,
+  buildClaudeTranscriptRestoreCommand,
+  copyBackClaudeTranscriptFromSandbox,
+  describeClaudeTranscriptSkip,
+  isClaudeTranscriptSessionId,
+  stageClaudeTranscriptForSandbox,
+  type ClaudeTranscriptStageResult,
+} from "./sandbox-session-transcript.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -627,6 +639,71 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const claudeConfigSeedDir = useManagedRemoteClaudeConfig
     ? config.managedAiConnection ? sharedClaudeConfigDir : await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
     : null;
+  // Sandbox leases are disposable, so the Claude transcript (which lives under
+  // the lease's `.paperclip-runtime`) is carried by hand: staged here from the
+  // host's Claude config dir, uploaded as a runtime asset, and copied back by
+  // the asset's restore hook at teardown. Every step fails open.
+  const carrySandboxTranscript = executionTargetIsSandbox && useManagedRemoteClaudeConfig;
+  const transcriptStoreConfigDir = resolveSharedClaudeConfigDir(process.env);
+  let transcriptStage: ClaudeTranscriptStageResult | null = null;
+  let transcriptStagingDir: string | null = null;
+  let transcriptRemote: { configDir: string; cwd: string; target: AdapterExecutionTarget | null | undefined } | null = null;
+  let transcriptCopyBackSessionId: string | null = null;
+  if (carrySandboxTranscript) {
+    transcriptStagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-transcript-"));
+    const savedSessionParams = parseObject(runtime.sessionParams);
+    const savedSessionId = asString(savedSessionParams.sessionId, runtime.sessionId ?? "");
+    const savedRemoteExecution = parseObject(savedSessionParams.remoteExecution);
+    const savedRemoteCwd = asString(savedRemoteExecution.remoteCwd, "");
+    const savedLeaseId = asString(savedRemoteExecution.leaseId, "");
+    // Only stage (and so upload) the transcript into a lease of the same
+    // sandbox environment, provider and remote cwd it was saved from. The
+    // sandbox workspace is realized at the target's remote cwd (no
+    // `workspaceRemoteDir` override is passed below), so this is the identity
+    // the resume check compares after prepare. Anything else must not receive
+    // the earlier transcript's bytes, even though `--resume` would be refused.
+    if (
+      isClaudeTranscriptSessionId(savedSessionId) &&
+      savedRemoteCwd.length > 0 &&
+      savedLeaseId !== (executionTarget?.leaseId ?? "") &&
+      adapterExecutionTargetSessionMatches(savedRemoteExecution, executionTarget, { ignoreSandboxLeaseId: true })
+    ) {
+      transcriptStage = await stageClaudeTranscriptForSandbox({
+        storeConfigDir: transcriptStoreConfigDir,
+        remoteCwd: savedRemoteCwd,
+        sessionId: savedSessionId,
+        stagingDir: transcriptStagingDir,
+      });
+    }
+  }
+  const copyBackSandboxTranscript = async () => {
+    const remote = transcriptRemote;
+    const sessionIdToCarry = transcriptCopyBackSessionId;
+    if (!remote || !sessionIdToCarry) return;
+    const result = await copyBackClaudeTranscriptFromSandbox({
+      remoteClaudeConfigDir: remote.configDir,
+      remoteCwd: remote.cwd,
+      sessionId: sessionIdToCarry,
+      storeConfigDir: transcriptStoreConfigDir,
+      runShell: (command) =>
+        runAdapterExecutionTargetShellCommand(runId, remote.target, command, {
+          cwd,
+          env: {},
+          timeoutSec: 30,
+          onLog: async () => {},
+        }),
+    });
+    const line = result.copied
+      ? `[paperclip] Saved Claude session "${sessionIdToCarry}" transcript (${result.bytes} bytes) for the next sandbox lease.\n`
+      : `[paperclip] Claude session "${sessionIdToCarry}" transcript was not saved for the next sandbox lease: ${describeClaudeTranscriptSkip(result)}. The next run starts a fresh session.\n`;
+    await onLog("stdout", line).catch(() => undefined);
+  };
+  const removeTranscriptStagingDir = async () => {
+    // The upload is done; the restore hook reads from the lease, not this dir.
+    if (transcriptStagingDir) {
+      await fs.rm(transcriptStagingDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  };
   const preparedExecutionTargetRuntime = executionTargetIsRemote
     ? await (async () => {
         await onLog(
@@ -661,9 +738,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 followSymlinks: true,
               }]
               : []),
+            ...(transcriptStagingDir
+              ? [{
+                key: CLAUDE_SANDBOX_TRANSCRIPT_ASSET_KEY,
+                localDir: transcriptStagingDir,
+                // Used only as the teardown hook. The copy-back reads with its own
+                // size-bounded chunks rather than the unbounded `readFile` it is
+                // offered, and never rejects: a failed copy-back must not fail
+                // the workspace restore.
+                restore: async () => await copyBackSandboxTranscript(),
+              }]
+              : []),
           ],
         });
-      })()
+      })().finally(removeTranscriptStagingDir)
     : null;
   if (preparedExecutionTargetRuntime?.workspaceRemoteDir) {
     effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir;
@@ -742,6 +830,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       loggedEnv.CLAUDE_CODE_SHELL_PREFIX = remoteToolShellPrefixPath;
     }
   }
+  if (carrySandboxTranscript && remoteClaudeConfigDir) {
+    transcriptRemote = { configDir: remoteClaudeConfigDir, cwd: effectiveExecutionCwd, target: runtimeExecutionTarget };
+  }
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
@@ -789,6 +880,53 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
   });
   const hasMatchingExecutionTarget = adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+  // A session saved on an earlier lease of the same sandbox environment can
+  // resume once its transcript has been restored into this lease.
+  const sessionMatchesEarlierLease =
+    !hasMatchingExecutionTarget &&
+    transcriptRemote !== null &&
+    adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget, { ignoreSandboxLeaseId: true });
+  let transcriptRestored = false;
+  let transcriptNotCarriedReason: string | null = null;
+  if (
+    sessionMatchesEarlierLease &&
+    transcriptRemote &&
+    runtimeSessionId.length > 0 &&
+    isValidUuid &&
+    hasMatchingPromptBundle &&
+    hasMatchingSessionCwd
+  ) {
+    if (transcriptStage?.staged) {
+      const remote = transcriptRemote;
+      try {
+        const restore = await runAdapterExecutionTargetShellCommand(
+          runId,
+          remote.target,
+          buildClaudeTranscriptRestoreCommand({
+            remoteAssetDir:
+              preparedExecutionTargetRuntime?.assetDirs[CLAUDE_SANDBOX_TRANSCRIPT_ASSET_KEY] ??
+              path.posix.join(remoteClaudeRuntimeRoot ?? path.posix.dirname(remote.configDir), CLAUDE_SANDBOX_TRANSCRIPT_ASSET_KEY),
+            remoteClaudeConfigDir: remote.configDir,
+            remoteCwd: remote.cwd,
+            sessionId: runtimeSessionId,
+          }),
+          { cwd, env: {}, timeoutSec: 60, onLog: async () => {} },
+        );
+        transcriptRestored = restore.exitCode === 0 && !restore.timedOut;
+        if (!transcriptRestored) {
+          transcriptNotCarriedReason = restore.timedOut
+            ? "restoring the transcript timed out"
+            : `restoring the transcript exited with code ${restore.exitCode ?? "null"}`;
+        }
+      } catch (error) {
+        transcriptNotCarriedReason = `restoring the transcript failed (${error instanceof Error ? error.message : String(error)})`;
+      }
+    } else {
+      transcriptNotCarriedReason = describeClaudeTranscriptSkip(
+        transcriptStage ?? { reason: "missing" },
+      );
+    }
+  }
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
@@ -796,7 +934,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Each CLI invocation loads --mcp-config, including --resume invocations.
     // Refreshing tools does not invalidate the saved conversation.
     hasMatchingSessionCwd &&
-    hasMatchingExecutionTarget;
+    (hasMatchingExecutionTarget || transcriptRestored);
   const sessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
@@ -804,7 +942,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" is not a valid UUID and will not be passed to --resume.\n`,
     );
   }
-  if (
+  if (transcriptRestored) {
+    await onLog(
+      "stdout",
+      `[paperclip] Restored Claude session "${runtimeSessionId}" transcript from an earlier sandbox lease; resuming in "${effectiveExecutionCwd}".\n`,
+    );
+  } else if (transcriptNotCarriedReason) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved on an earlier sandbox lease and could not be carried over: ${transcriptNotCarriedReason}. Starting a fresh session.\n`,
+    );
+  } else if (
     runtimeSessionId &&
     isValidUuid &&
     !hasMatchingExecutionTarget
@@ -1310,6 +1458,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
+  // Names the session whose transcript the teardown copies back.
+  const carryTranscriptOf = (result: AdapterExecutionResult): AdapterExecutionResult => {
+    transcriptCopyBackSessionId =
+      result.clearSession || typeof result.sessionId !== "string" ? null : result.sessionId;
+    return result;
+  };
+
   try {
     const minimumCliVersion = passesConfiguredModel && claudeCommandLooksLike(command, "claude")
       ? minimumClaudeCliVersionForModel(model)
@@ -1432,10 +1587,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
       const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      return carryTranscriptOf(toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }));
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    return carryTranscriptOf(toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId }));
   } finally {
     try {
       await providerStop.collectBeforeRestore();
