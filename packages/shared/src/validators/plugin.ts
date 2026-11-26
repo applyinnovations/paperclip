@@ -766,6 +766,7 @@ export type PluginObjectReferenceProviderDeclarationInput = z.infer<
  * | `capabilities`           | enum[]     | at least one; values from PLUGIN_CAPABILITIES|
  * | `entrypoints.worker`     | string     | min 1 char                                   |
  * | `entrypoints.ui`         | string?    | required when `ui.slots` is declared         |
+ * | `sandbox.fsRead`         | string[]?  | ≤16 absolute normalised paths, no globs      |
  *
  * Cross-field rules enforced via `superRefine`:
  * - `entrypoints.ui` required when `ui.slots` declared
@@ -782,6 +783,36 @@ export type PluginObjectReferenceProviderDeclarationInput = z.infer<
  * @see PLUGIN_SPEC.md §10.1 — Manifest shape
  * @see {@link PaperclipPluginManifestV1} — the inferred TypeScript type
  */
+/**
+ * A manifest-declared sandbox read grant (PLUGIN_SPEC.md §12.6, "Read grants").
+ * Must be an absolute, normalised POSIX path: no `.`/`..` segments, no empty
+ * segments (`//`), no trailing slash (other than `/` itself) and no glob
+ * characters. The host decides whether to honour it; see
+ * `server/src/services/plugin-worker-sandbox.ts`.
+ */
+export const PLUGIN_SANDBOX_FS_READ_MAX_ENTRIES = 16;
+
+function sandboxFsReadPathProblem(value: string): string | null {
+  if (!value.startsWith("/")) return "must be an absolute path";
+  if (/[\0\\*?[\]{}]/.test(value)) return "must not contain glob characters, backslashes or NUL";
+  if (value === "/") return null;
+  if (value.endsWith("/")) return "must not end with a slash";
+  const segments = value.slice(1).split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    return "must be normalised (no empty, '.' or '..' segments)";
+  }
+  return null;
+}
+
+export const pluginSandboxFsReadPathSchema = z.string().min(1).max(4096).superRefine((value, ctx) => {
+  const problem = sandboxFsReadPathProblem(value);
+  if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `sandbox.fsRead entry ${problem}: ${JSON.stringify(value)}` });
+});
+
+export const pluginSandboxDeclarationSchema = z.object({
+  fsRead: z.array(pluginSandboxFsReadPathSchema).max(PLUGIN_SANDBOX_FS_READ_MAX_ENTRIES).optional(),
+}).strict();
+
 export const pluginManifestV1Schema = z.object({
   id: z.string().min(1).regex(
     /^[a-z0-9][a-z0-9._-]*$/,
@@ -838,6 +869,7 @@ export const pluginManifestV1Schema = z.object({
   localFolders: z.array(pluginLocalFolderDeclarationSchema).optional(),
   objectReferences: z.array(pluginObjectReferenceProviderDeclarationSchema).optional(),
   launchers: z.array(pluginLauncherDeclarationSchema).optional(),
+  sandbox: pluginSandboxDeclarationSchema.optional(),
   ui: z.object({
     slots: z.array(pluginUiSlotDeclarationSchema).min(1).optional(),
     launchers: z.array(pluginLauncherDeclarationSchema).optional(),

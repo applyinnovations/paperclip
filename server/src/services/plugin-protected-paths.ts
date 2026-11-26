@@ -49,12 +49,78 @@ export function resolveServerInstallRoot(startDir = path.dirname(fileURLToPath(i
   }
 }
 
+const MAX_SYMLINK_HOPS = 40;
+
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * Resolve `p` to its canonical path by walking up to the nearest existing
+ * ancestor, calling `fs.realpathSync` on that ancestor, and re-appending the
+ * remaining missing path segments. Dangling symlinks encountered while walking
+ * up are also followed relative to their canonical parent directory.
+ *
+ * Throws on filesystem errors other than `ENOENT`/`ENOTDIR` (for example
+ * `EACCES` or `ELOOP`) so security callers can fail closed.
+ */
+export function resolveCanonicalPath(p: string): string {
+  let current = path.resolve(p);
+  let hops = 0;
+
+  for (;;) {
+    const trailing: string[] = [];
+    let probe = current;
+    let followedSymlink = false;
+
+    for (;;) {
+      try {
+        const realAncestor = fs.realpathSync(probe);
+        return trailing.length > 0 ? path.join(realAncestor, ...trailing.reverse()) : realAncestor;
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+
+      let isSymlink = false;
+      try {
+        isSymlink = fs.lstatSync(probe).isSymbolicLink();
+      } catch (lstatError) {
+        if (!isMissingPathError(lstatError)) throw lstatError;
+      }
+
+      if (isSymlink) {
+        hops += 1;
+        if (hops > MAX_SYMLINK_HOPS) {
+          const loopError = new Error(`Too many levels of symbolic links while resolving ${p}`) as NodeJS.ErrnoException;
+          loopError.code = "ELOOP";
+          throw loopError;
+        }
+        const linkDir = fs.realpathSync(path.dirname(probe));
+        const target = fs.readlinkSync(probe);
+        const resolvedTarget = path.resolve(linkDir, target);
+        current = trailing.length > 0 ? path.join(resolvedTarget, ...trailing.reverse()) : resolvedTarget;
+        followedSymlink = true;
+        break;
+      }
+
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        return trailing.length > 0 ? path.join(probe, ...trailing.reverse()) : probe;
+      }
+      trailing.push(path.basename(probe));
+      probe = parent;
+    }
+
+    if (!followedSymlink) return current;
+  }
+}
+
 export function realpathOrResolve(p: string): string {
-  const resolved = path.resolve(p);
   try {
-    return fs.realpathSync(resolved);
+    return resolveCanonicalPath(p);
   } catch {
-    return resolved;
+    return path.resolve(p);
   }
 }
 

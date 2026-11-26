@@ -771,8 +771,21 @@ export interface PaperclipPluginManifestV1 {
    * Prefer `ui.launchers` for new manifests.
    */
   launchers?: PluginLauncherDeclaration[];
+  /**
+   * Worker filesystem sandbox declarations (PLUGIN_SPEC.md §12.6, "Read grants").
+   * `fsRead` lists absolute paths the worker may additionally read. The host
+   * honours it only for plugins installed from a trusted plugin root and never
+   * for a path at, above, or beside an operator secret file.
+   */
+  sandbox?: PluginSandboxDeclaration;
   /** UI bundle declarations. Requires `entrypoints.ui` when populated. */
   ui?: PluginUiDeclaration;
+}
+
+/** See {@link PaperclipPluginManifestV1.sandbox}. */
+export interface PluginSandboxDeclaration {
+  /** Read-only grants: absolute, normalised paths; at most 16. */
+  fsRead?: string[];
 }
 
 // ---------------------------------------------------------------------------
