@@ -18,6 +18,19 @@ export function monitorPoliciesEqual(
   );
 }
 
+/** True for an `executionPolicy` request body that only sets or clears `monitor`. */
+export function isMonitorOnlyExecutionPolicyBody(
+  body: unknown,
+): body is { monitor: unknown } {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    Object.keys(body).length === 1 &&
+    Object.prototype.hasOwnProperty.call(body, "monitor")
+  );
+}
+
 export function applyActorMonitorScheduledBy(
   policy: NormalizedExecutionPolicy | null,
   actorType: "agent" | "user",

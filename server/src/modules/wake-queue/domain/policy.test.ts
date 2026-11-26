@@ -435,6 +435,15 @@ describe("decideReleaseRecovery", () => {
       expected: { kind: "released" },
     },
     {
+      name: "released: the participant's own recovery run ended without a decision but left a monitor (APP-448)",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: { applies: true, isExecutionReviewParticipantRecoveryRun: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, hasPersistedMonitor: true },
+      },
+      expected: { kind: "released" },
+    },
+    {
       name: "blocked_recovery_in_place: review-participant recovery applies on a stranded-issue-recovery origin",
       facts: {
         ...baseReleaseRecoveryFacts,

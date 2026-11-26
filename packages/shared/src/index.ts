@@ -1997,6 +1997,7 @@ export {
   issueExecutionPolicySchema,
   requiredQualityReviewSchema,
   issueExecutionMonitorPolicySchema,
+  issueExecutionMonitorOnlyPolicyUpdateSchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,

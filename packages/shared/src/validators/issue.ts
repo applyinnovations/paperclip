@@ -447,6 +447,11 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 });
 
+/** Issue update body that only schedules or clears the execution-policy monitor. */
+export const issueExecutionMonitorOnlyPolicyUpdateSchema = z.object({
+  monitor: issueExecutionMonitorPolicySchema.nullable(),
+}).strict();
+
 export const requiredQualityReviewSchema = z.object({
   version: z.literal(1),
   deliverables: z.array(z.object({
@@ -976,6 +981,15 @@ export const updateIssueSchema = objectWithoutDefaults(
     expectedStatusVersion: z.number().int().nonnegative().optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
+    /**
+     * A body of only `{ monitor }` sets or clears the wait and keeps the rest
+     * of the stored policy, including any pending review stage. Any other
+     * body replaces the policy.
+     */
+    executionPolicy: z
+      .union([issueExecutionMonitorOnlyPolicyUpdateSchema, issueExecutionPolicySchema])
+      .optional()
+      .nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
