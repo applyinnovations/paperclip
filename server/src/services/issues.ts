@@ -10716,7 +10716,9 @@ export function issueService(db: Db) {
           // apply whether or not isolated workspaces are enabled.
           const projectIssueDefaults =
             parseProjectExecutionWorkspacePolicy(selectedProject.executionWorkspacePolicy)?.defaultIssueExecutionPolicy;
-          if (projectIssueDefaults && !skipProjectDefaultExecutionStages) {
+          const canSkipProjectDefaultStages =
+            Boolean(skipProjectDefaultExecutionStages) && !issueData.createdByAgentId;
+          if (projectIssueDefaults && !canSkipProjectDefaultStages) {
             issueData.executionPolicy = applyProjectDefaultExecutionPolicy(
               issueData.executionPolicy,
               projectIssueDefaults,
@@ -10794,17 +10796,67 @@ export function issueService(db: Db) {
         if (values.status === "cancelled") {
           values.cancelledAt = new Date();
         }
-        Object.assign(
-          values,
-          buildInitialIssueMonitorFields({
-            policy: normalizeIssueExecutionPolicy(
-              issueData.executionPolicy ?? null,
-            ),
-            status: values.status ?? "backlog",
-            assigneeAgentId: values.assigneeAgentId ?? null,
-            assigneeUserId: values.assigneeUserId ?? null,
-          }),
+        const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(
+          issueData.executionPolicy ?? null,
         );
+        if (
+          values.status === "in_review" &&
+          normalizedExecutionPolicy &&
+          normalizedExecutionPolicy.stages.length > 0 &&
+          values.executionState == null
+        ) {
+          const initialAssignee = values.assigneeAgentId
+            ? { type: "agent" as const, agentId: values.assigneeAgentId, userId: null }
+            : values.assigneeUserId
+              ? { type: "user" as const, agentId: null, userId: values.assigneeUserId }
+              : null;
+          const firstStage = normalizedExecutionPolicy.stages[0];
+          const assigneeIsOnlyStageParticipant =
+            Boolean(initialAssignee) &&
+            firstStage.participants.length > 0 &&
+            firstStage.participants.every((participant) =>
+              participant.type === initialAssignee!.type &&
+              (participant.type === "agent"
+                ? participant.agentId === initialAssignee!.agentId
+                : participant.userId === initialAssignee!.userId),
+            );
+          const transition = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "todo",
+              assigneeAgentId: assigneeIsOnlyStageParticipant ? null : (values.assigneeAgentId ?? null),
+              assigneeUserId: assigneeIsOnlyStageParticipant ? null : (values.assigneeUserId ?? null),
+              responsibleUserId: values.responsibleUserId ?? null,
+              createdByUserId: values.createdByUserId ?? null,
+              executionPolicy: normalizedExecutionPolicy,
+              executionState: null,
+            },
+            policy: normalizedExecutionPolicy,
+            previousPolicy: null,
+            requestedStatus: "in_review",
+            requestedAssigneePatch: assigneeIsOnlyStageParticipant
+              ? {
+                  assigneeAgentId: values.assigneeAgentId ?? null,
+                  assigneeUserId: values.assigneeUserId ?? null,
+                }
+              : {},
+            actor: {
+              agentId: values.createdByAgentId ?? null,
+              userId: values.createdByUserId ?? null,
+            },
+            monitorExplicitlyUpdated: Boolean(normalizedExecutionPolicy.monitor),
+          });
+          Object.assign(values, transition.patch);
+        } else {
+          Object.assign(
+            values,
+            buildInitialIssueMonitorFields({
+              policy: normalizedExecutionPolicy,
+              status: values.status ?? "backlog",
+              assigneeAgentId: values.assigneeAgentId ?? null,
+              assigneeUserId: values.assigneeUserId ?? null,
+            }),
+          );
+        }
 
         if (values.parentId || values.executionWorkspaceId || values.status === "done" || values.status === "cancelled") {
           await notifyTerminalWorkspaceWork(tx, values.executionWorkspaceId ? `workspace:${values.executionWorkspaceId}`

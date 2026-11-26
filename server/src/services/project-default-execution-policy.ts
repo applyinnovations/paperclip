@@ -28,11 +28,31 @@ function withoutIds(stages: ReadonlyArray<StageInput>) {
  */
 export function normalizeProjectDefaultExecutionPolicy(input: unknown): ProjectDefaultExecutionPolicy | null {
   if (input == null) return null;
-  const stages = (input as { stages?: unknown }).stages;
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw unprocessable("Invalid default execution policy: expected an object");
+  }
+  const raw = input as Record<string, unknown>;
+  const stages = raw.stages;
   if (!Array.isArray(stages)) throw unprocessable("Invalid default execution policy: stages must be an array");
-  const policy = normalizeIssueExecutionPolicy({ stages: withoutIds(stages as StageInput[]) });
+  const { stages: _stages, ...rest } = raw;
+  const policy = normalizeIssueExecutionPolicy({ ...rest, stages: withoutIds(stages as StageInput[]) });
   if (!policy || policy.stages.length === 0) return null;
-  return { stages: policy.stages };
+  return {
+    stages: policy.stages,
+    ...(raw.mode !== undefined ? { mode: policy.mode } : {}),
+    ...(raw.commentRequired !== undefined ? { commentRequired: policy.commentRequired } : {}),
+    ...(raw.requiredQualityReview !== undefined && policy.requiredQualityReview
+      ? { requiredQualityReview: policy.requiredQualityReview }
+      : {}),
+    ...(raw.monitor !== undefined && policy.monitor ? { monitor: policy.monitor } : {}),
+    ...(raw.reviewPreset !== undefined && policy.reviewPreset ? { reviewPreset: policy.reviewPreset } : {}),
+    ...(raw.authorizationPolicy !== undefined && policy.authorizationPolicy
+      ? { authorizationPolicy: policy.authorizationPolicy }
+      : {}),
+    ...(raw.maxReviewRounds !== undefined && policy.maxReviewRounds != null
+      ? { maxReviewRounds: policy.maxReviewRounds }
+      : {}),
+  };
 }
 
 /** Every agent a project default names must belong to the project's company. */
@@ -87,10 +107,17 @@ export function applyProjectDefaultExecutionPolicy(
 ): IssueExecutionPolicy | null {
   const policy = normalizeIssueExecutionPolicy(issuePolicy ?? null);
   if (!projectDefault?.stages?.length || (policy?.stages.length ?? 0) > 0) return policy;
-  const defaults = normalizeIssueExecutionPolicy({ stages: withoutIds(projectDefault.stages) });
+  const { stages: defaultStages, ...defaultRest } = projectDefault;
+  const defaults = normalizeIssueExecutionPolicy({
+    ...defaultRest,
+    stages: withoutIds(defaultStages),
+  });
   if (!defaults || defaults.stages.length === 0) return policy;
   return {
-    ...(policy ?? { mode: "normal", commentRequired: true }),
+    ...defaults,
+    ...(policy ?? {}),
+    mode: policy ? policy.mode : defaults.mode,
+    commentRequired: true,
     stages: defaults.stages,
   };
 }

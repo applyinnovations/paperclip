@@ -8,6 +8,8 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdForUpdate: vi.fn(),
   findOpenAncestorCreatedByAgent: vi.fn(async () => null),
   assertCheckoutOwner: vi.fn(),
+  count: vi.fn(async () => 1),
+  create: vi.fn(),
   update: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
@@ -15,6 +17,9 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+}));
+const mockProjectService = vi.hoisted(() => ({
+  getById: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -150,7 +155,7 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
-    projectService: () => ({}),
+    projectService: () => mockProjectService,
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
@@ -242,6 +247,24 @@ describe("issue execution policy routes", () => {
           permissions: null,
         }]).then(onFulfilled, onRejected),
     }));
+    mockIssueService.create.mockResolvedValue({
+      id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      companyId: "company-1",
+      identifier: "PAP-1003",
+      title: "Created issue",
+      status: "todo",
+      projectId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdAt: new Date(),
+    });
+    mockProjectService.getById.mockResolvedValue({
+      id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      companyId: "company-1",
+      name: "Gated project",
+      visibility: "open",
+      executionWorkspacePolicy: null,
+    });
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -257,6 +280,7 @@ describe("issue execution policy routes", () => {
         ? true
         : input.actor?.type === "agent" && [
             "company_scope:read",
+            "project:read",
             "issue:read",
             "issue:mutate",
             "runtime:manage",
@@ -1391,9 +1415,32 @@ describe("issue execution policy routes", () => {
   });
 
   it.each([
-    ["an explicit null policy opts out of", { executionPolicy: null }, true],
-    ["an omitted policy keeps", {}, false],
-  ])("%s the project's default stages on child creation", async (_label, policyField, skip) => {
+    ["a board user's explicit null policy opts out of", undefined, { executionPolicy: null }, true],
+    ["a board user's omitted policy keeps", undefined, {}, false],
+    [
+      "a non-board agent's explicit null policy still keeps",
+      {
+        type: "agent" as const,
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      },
+      { executionPolicy: null },
+      false,
+    ],
+    [
+      "a non-board agent's omitted policy keeps",
+      {
+        type: "agent" as const,
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      },
+      {},
+      false,
+    ],
+  ])("%s the project's default stages on child creation", async (_label, actor, policyField, skip) => {
+    if (actor) mockAccessService.hasPermission.mockResolvedValue(true);
     mockIssueService.getById.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -1407,12 +1454,86 @@ describe("issue execution policy routes", () => {
       executionState: null,
     });
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(actor))
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/children")
       .send({ title: "Release", ...policyField });
 
-    expect(res.status).toBe(201);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockIssueService.createChild.mock.calls[0]?.[1]).toMatchObject({ skipProjectDefaultExecutionStages: skip });
+  });
+
+  it.each([
+    ["a board user's explicit null policy opts out of", undefined, { executionPolicy: null }, true],
+    ["a board user's omitted policy keeps", undefined, {}, false],
+    [
+      "a non-board agent's explicit null policy still keeps",
+      {
+        type: "agent" as const,
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: null,
+      },
+      { executionPolicy: null },
+      false,
+    ],
+    [
+      "a non-board agent's omitted policy keeps",
+      {
+        type: "agent" as const,
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: null,
+      },
+      {},
+      false,
+    ],
+  ])("%s the project's default stages on issue creation", async (_label, actor, policyField, skip) => {
+    if (actor) mockAccessService.hasPermission.mockResolvedValue(true);
+    const res = await request(await createApp(actor))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Project task",
+        projectId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        ...policyField,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create.mock.calls[0]?.[1]).toMatchObject({
+      projectId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      skipProjectDefaultExecutionStages: skip,
+    });
+  });
+
+  it("honors a board user's custom executionPolicy on issue creation", async () => {
+    const customPolicy = {
+      stages: [
+        {
+          type: "approval" as const,
+          participants: [{ type: "agent" as const, agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    };
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Board custom policy task",
+        projectId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        executionPolicy: customPolicy,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create.mock.calls[0]?.[1]).toMatchObject({
+      skipProjectDefaultExecutionStages: false,
+      executionPolicy: expect.objectContaining({
+        stages: [
+          expect.objectContaining({
+            type: "approval",
+            participants: [expect.objectContaining({ agentId: "44444444-4444-4444-8444-444444444444" })],
+          }),
+        ],
+      }),
+    });
   });
 
   it("rejects child monitor scheduling by a non-assignee agent even with task assignment permission", async () => {
