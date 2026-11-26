@@ -260,8 +260,11 @@ row, never from the request body. A ref the remote rejected is stored as
 `failed` and never counts. A push that sends no update records nothing. The
 report never changes the exit status of `git push`.
 
-Each `before -> after` transition of a ref is one update
-(`github_ref_updates`). Run reports are stored in `github_push_attempts`.
+Each `before -> after` transition of a ref is one update record and each run's
+report is one attempt record, stored company-scoped under the terminal
+`github_push_provenance` provider key in `external_objects` (no foreign keys to
+runs, so pruning a run cannot erase what it pushed, and `isTerminal: true` with
+`nextRefreshAt: null` so background refresh never touches them).
 `listBranchUpdates` works out each update's state when it is read:
 
 | State | Meaning |

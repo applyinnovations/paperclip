@@ -1,16 +1,22 @@
 import { createHmac, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, githubPushAttempts, githubRefUpdates, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, externalObjects, heartbeatRuns, issues } from "@paperclipai/db";
 import { createHostClientHandlers } from "../../../packages/plugins/sdk/src/host-client-factory.js";
 import { runtimeConnectionIntentRoutes } from "../routes/connection-intents.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { errorHandler } from "../middleware/index.js";
 import { createGitHubAppWebhookVerifier } from "../services/github-app-webhooks.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
-import { canonicalGitHubRepository, canonicalGitRef } from "../services/github-push-provenance.js";
+import {
+  PUSH_PROVENANCE_ATTEMPT_TYPE,
+  PUSH_PROVENANCE_PROVIDER_KEY,
+  PUSH_PROVENANCE_REF_UPDATE_TYPE,
+  canonicalGitHubRepository,
+  canonicalGitRef,
+} from "../services/github-push-provenance.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const SECRET = "push-webhook-secret";
@@ -186,7 +192,16 @@ const support = await getEmbeddedPostgresTestSupport();
     const { updates } = await readAll(companyA, ref);
     expect(updates).toHaveLength(1);
     expect(updates[0]).toMatchObject({ state: "confirmed", runId: pusher.runId, pushers: [{ runId: pusher.runId, outcome: "succeeded" }] });
-    expect(await db.select().from(githubRefUpdates).where(eq(githubRefUpdates.ref, ref))).toHaveLength(1);
+    const storedUpdates = await db
+      .select()
+      .from(externalObjects)
+      .where(and(
+        eq(externalObjects.providerKey, PUSH_PROVENANCE_PROVIDER_KEY),
+        eq(externalObjects.objectType, PUSH_PROVENANCE_REF_UPDATE_TYPE),
+        eq(externalObjects.displayKey, `acme/widgets\t${ref}`),
+      ));
+    expect(storedUpdates).toHaveLength(1);
+    expect(storedUpdates[0]).toMatchObject({ isTerminal: true, nextRefreshAt: null });
   });
 
   it("never counts failed or no-op pushes, keeps force-pushed history, and marks competing claims ambiguous", async () => {
@@ -196,8 +211,15 @@ const support = await getEmbeddedPostgresTestSupport();
     // Rejected by the remote: recorded as failed and never listed as an update.
     expect((await push(first, ref, sha("f0"), sha("f-rejected"), "ng")).status).toBe(200);
     expect((await readAll(companyA, ref)).updates).toEqual([]);
-    expect(await db.select().from(githubPushAttempts).where(eq(githubPushAttempts.runId, first.runId)))
-      .toMatchObject([{ outcome: "failed" }]);
+    expect(await db
+      .select()
+      .from(externalObjects)
+      .where(and(
+        eq(externalObjects.providerKey, PUSH_PROVENANCE_PROVIDER_KEY),
+        eq(externalObjects.objectType, PUSH_PROVENANCE_ATTEMPT_TYPE),
+        eq(externalObjects.remoteVersion, first.runId),
+      )))
+      .toMatchObject([{ statusKey: "failed", isTerminal: true, nextRefreshAt: null, data: { outcome: "failed" } }]);
     // GitHub moving the ref anyway does not credit the failed attempt.
     await evidence(companyA, ref, sha("f0"), sha("f-rejected"));
     expect((await readAll(companyA, ref)).updates).toMatchObject([{ state: "unattributed", pushers: [] }]);
@@ -247,8 +269,22 @@ const support = await getEmbeddedPostgresTestSupport();
     const { updates } = await readAll(companyA, ref);
     expect(updates).toMatchObject([{ state: "confirmed", runId: pusher.runId }]);
     const rows = JSON.stringify([
-      await db.select().from(githubRefUpdates).where(eq(githubRefUpdates.ref, ref)),
-      await db.select().from(githubPushAttempts).where(eq(githubPushAttempts.runId, pusher.runId)),
+      await db
+        .select()
+        .from(externalObjects)
+        .where(and(
+          eq(externalObjects.providerKey, PUSH_PROVENANCE_PROVIDER_KEY),
+          eq(externalObjects.objectType, PUSH_PROVENANCE_REF_UPDATE_TYPE),
+          eq(externalObjects.displayKey, `acme/widgets\t${ref}`),
+        )),
+      await db
+        .select()
+        .from(externalObjects)
+        .where(and(
+          eq(externalObjects.providerKey, PUSH_PROVENANCE_PROVIDER_KEY),
+          eq(externalObjects.objectType, PUSH_PROVENANCE_ATTEMPT_TYPE),
+          eq(externalObjects.remoteVersion, pusher.runId),
+        )),
       updates,
     ]);
     expect(rows).not.toMatch(/secret|x-access-token|https:/);
