@@ -350,3 +350,75 @@ describe("onEnvironmentReleaseLease termination receipt", () => {
     })).rejects.toThrow("forbidden");
   });
 });
+
+describe("onEnvironmentInspectLease", () => {
+  it("reports destroyed when both the Sandbox CR and its backing pod return 404", async () => {
+    h.clients = {
+      custom: { getNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },
+      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
+      batch: {},
+    };
+
+    await expect(plugin.definition.onEnvironmentInspectLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    })).resolves.toEqual({ providerLeaseId: "pc-abc", state: "destroyed" });
+  });
+
+  it("reports active while the Sandbox CR still exists", async () => {
+    h.clients = {
+      custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")) },
+      core: {},
+      batch: {},
+    };
+
+    await expect(plugin.definition.onEnvironmentInspectLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    })).resolves.toEqual({ providerLeaseId: "pc-abc", state: "active" });
+  });
+
+  it("reports active when the Sandbox CR is gone but the backing pod still exists", async () => {
+    h.clients = {
+      custom: { getNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },
+      core: { readNamespacedPod: vi.fn().mockResolvedValue({ status: { phase: "Running" } }) },
+      batch: {},
+    };
+
+    await expect(plugin.definition.onEnvironmentInspectLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    })).resolves.toEqual({ providerLeaseId: "pc-abc", state: "active" });
+  });
+
+  it("propagates non-404 API errors instead of claiming destruction", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockRejectedValue(Object.assign(new Error("forbidden"), { code: 403 })),
+      },
+      core: {},
+      batch: {},
+    };
+
+    await expect(plugin.definition.onEnvironmentInspectLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    })).rejects.toThrow("forbidden");
+  });
+});

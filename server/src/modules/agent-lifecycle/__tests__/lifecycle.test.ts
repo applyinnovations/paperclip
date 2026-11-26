@@ -499,6 +499,50 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleState).toBe("terminated");
   });
 
+  it.each(["claude_local", "codex_local"] as const)(
+    "unblocks pausing and resume when a %s agent has a settled pre-lease cancelled run",
+    async adapterType => {
+      const agent = await hire();
+      await db.update(agents).set({ adapterType, lifecycleState: "ready", lifecycleOperation: null, status: "idle" }).where(eq(agents.id, agent.id));
+      const now = new Date();
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: agent.id,
+        status: "cancelled",
+        invocationSource: "assignment",
+        runtimeMode: "legacy",
+        executionStage: "settled",
+        errorCode: "workspace_busy",
+        startedAt: now,
+        finishedAt: now,
+        processPid: null,
+        processGroupId: null,
+        runnerProfileJson: { adapterDispatch: { adapterType } },
+        resultJson: {
+          executionRecovery: { kind: "workspace_wait", providerWorkStarted: false },
+          cancellation: {
+            source: "control_plane",
+            expected: true,
+            initiator: { type: "system" },
+            reason: "Waiting for the shared project workspace",
+            recordedAt: now.toISOString(),
+          },
+        },
+      });
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+
+      const driver = createLifecycleDriver(db, {} as never);
+      const work = worker(driver.runHost);
+      await createAgentLifecycle(db).pauseAgent(agent.id);
+      await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("paused");
+
+      await createAgentLifecycle(db).resumeAgent(agent.id);
+      await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("ready");
+    },
+  );
+
   it("does not cancel a reporting agent when its manager pauses", async () => {
     const parent = await hire();
     const [child] = await db.insert(agents).values({ companyId, name: "Report", reportsTo: parent.id,

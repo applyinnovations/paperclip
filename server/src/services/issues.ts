@@ -18,7 +18,10 @@ import { notifyNativeRunProjection } from "./native-run-projection-notifications
 import { notifyNativeResultCommit } from "./native-result-commit-notifications.js";
 import { notifyNativeWorkspaceFinalization } from "./native-workspace-finalization-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
-import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { notifyUnsafeWorkspaceExportRecovery, notifyUnsafeWorkspaceExportRunChange } from "./unsafe-workspace-export-notifications.js";
+import { notifyCancelledWorkspacePreservation } from "./cancelled-workspace-preservation-notifications.js";
+import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
+import { notifyExternalAgentSettlement } from "../modules/external-agents/index.js";
 import { notifyChatResponseAvailability } from "./chat-response-availability.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
@@ -11788,8 +11791,12 @@ export function issueService(db: Db) {
           await cancelCaseHandoffsForIssue(tx, { companyId: receiptExisting.companyId, issueId: id,
             reason: `Task was marked ${issueData.status}`, agentTransfersOnly: issueData.status === "done", publications: activityPublications });
         }
-        if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
-          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+        const statusChangedInUpdate =
+          patch.status !== undefined && patch.status !== receiptExisting.status;
+        const assigneeChangedInUpdate =
+          (issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+          (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId);
+        if (assigneeChangedInUpdate) {
           await cancelCaseHandoffsForIssue(tx, { companyId: receiptExisting.companyId, issueId: id,
             reason: "Task assignment changed", exceptId: caseHandoffId, publications: activityPublications });
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
@@ -11812,6 +11819,93 @@ export function issueService(db: Db) {
               sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
                 ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',
                 ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${id}`));
+        }
+        // Never leave a never-started queued run (especially `issue_reopened_via_comment`)
+        // stranded after a status transition or reassignment: a stale queued run
+        // would re-lock `executionRunId` and defer every future wakeup.
+        if (statusChangedInUpdate || assigneeChangedInUpdate) {
+          const resolvedNextAssigneeAgentId =
+            issueData.assigneeAgentId !== undefined
+              ? issueData.assigneeAgentId
+              : receiptExisting.assigneeAgentId;
+          const queuedRuns: Array<typeof heartbeatRuns.$inferSelect> = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, receiptExisting.companyId),
+              eq(heartbeatRuns.status, "queued"),
+              receiptExisting.executionRunId
+                ? or(
+                    eq(heartbeatRuns.id, receiptExisting.executionRunId),
+                    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${id}`,
+                  )
+                : sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${id}`,
+            ));
+          for (const queuedRun of queuedRuns) {
+            const manualHold = await nativeManualAdmissionHoldsExecution(
+              tx as unknown as Db,
+              { companyId: receiptExisting.companyId, runId: queuedRun.id, issueId: id },
+            );
+            if (manualHold) continue;
+            const differentAssignee =
+              assigneeChangedInUpdate &&
+              (resolvedNextAssigneeAgentId === null || queuedRun.agentId !== resolvedNextAssigneeAgentId);
+            const wakeReason =
+              queuedRun.contextSnapshot &&
+              typeof queuedRun.contextSnapshot === "object" &&
+              typeof (queuedRun.contextSnapshot as Record<string, unknown>).wakeReason === "string"
+                ? ((queuedRun.contextSnapshot as Record<string, unknown>).wakeReason as string)
+                : null;
+            const supersededReopenedComment = wakeReason === "issue_reopened_via_comment";
+            if (!differentAssignee && !supersededReopenedComment) continue;
+            await notifyInstructionCollection(tx, { companyId: queuedRun.companyId, runId: queuedRun.id });
+            await notifyExternalAgentSettlement(tx, { companyId: queuedRun.companyId, runId: queuedRun.id });
+            await notifyCancelledWorkspacePreservation(tx, { companyId: queuedRun.companyId, runId: queuedRun.id });
+            await notifyUnsafeWorkspaceExportRunChange(tx, queuedRun);
+            await notifyChatRunMilestones(tx, { companyId: queuedRun.companyId, issueId: id });
+            const cancelNow = new Date();
+            const cancelError = differentAssignee
+              ? "Execution lock released after issue reassigned to a different agent"
+              : "Queued reopened-via-comment wake superseded by issue transition";
+            const cancelErrorCode = differentAssignee
+              ? "lock_released_on_reassignment"
+              : "issue_status_changed";
+            const cancelledRows = await tx
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: cancelNow,
+                error: cancelError,
+                errorCode: cancelErrorCode,
+                updatedAt: cancelNow,
+              })
+              .where(and(
+                eq(heartbeatRuns.id, queuedRun.id),
+                eq(heartbeatRuns.status, "queued"),
+              ))
+              .returning({ id: heartbeatRuns.id });
+            if (cancelledRows.length > 0) {
+              if (queuedRun.wakeupRequestId) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: cancelNow,
+                    error: cancelError,
+                    updatedAt: cancelNow,
+                  })
+                  .where(and(
+                    eq(agentWakeupRequests.id, queuedRun.wakeupRequestId),
+                    notInArray(agentWakeupRequests.status, ["completed", "failed", "cancelled", "skipped"]),
+                  ));
+              }
+              if (receiptExisting.executionRunId === queuedRun.id) {
+                patch.executionRunId = null;
+                patch.executionAgentNameKey = null;
+                patch.executionLockedAt = null;
+              }
+            }
+          }
         }
         // Reasserting Blocked or changing its blockers is a fresh decision even
         // when the status string stays the same. Invalidate recovery's prior

@@ -3792,71 +3792,94 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             activeExecutionRun = null;
           }
 
-          // A queued/scheduled run holding the lock for an agent that is
-          // no longer the issue's assignee is stale by design — the issue
-          // has been re-routed (e.g. blocked → in_review with a different
-          // assignee). Cancel it and release the lock; otherwise the new
-          // assignee's wake gets parked in `deferred_issue_execution`
-          // forever, because the original queued holder will never run
-          // (the issue's status / target now belongs to someone else).
+          // A queued/scheduled run holding the lock for an agent that is no
+          // longer the issue's assignee — or a never-started `issue_reopened_via_comment`
+          // wake superseded by a status transition or review/assignment wake —
+          // is stale by design. Cancel it and release the lock; otherwise the
+          // new assignee/reviewer's wake gets parked in `deferred_issue_execution`
+          // forever because the original queued holder will never run.
           //
-          // Race guard: pin the cancel UPDATE to the exact non-running
-          // status we read above. A worker could transition the holder
-          // from `queued` → `running` between the SELECT and this UPDATE;
-          // the status predicate ensures we never clobber a freshly-
-          // claimed running run. If zero rows matched, leave
-          // `activeExecutionRun` populated so the defer path runs
-          // normally against the now-running holder.
-          if (
-            activeExecutionRun &&
-            !manualExecutionHold &&
-            activeExecutionRun.status !== "running" &&
-            issue.assigneeAgentId &&
-            activeExecutionRun.agentId !== issue.assigneeAgentId
-          ) {
-            await notifyInstructionCollection(tx, { companyId: activeExecutionRun.companyId, runId: activeExecutionRun.id });
-            await notifyExternalAgentSettlement(tx, { companyId: activeExecutionRun.companyId, runId: activeExecutionRun.id });
-            await notifyCancelledWorkspacePreservation(tx, { companyId: activeExecutionRun.companyId, runId: activeExecutionRun.id });
-            await notifyUnsafeWorkspaceExportRunChange(tx, activeExecutionRun);
-            await notifyChatRunMilestones(tx, { companyId: activeExecutionRun.companyId, issueId: issue.id });
+          // Race guard: pin the cancel UPDATE to the exact non-running status
+          // we read above so a concurrent worker claim (`queued` -> `running`)
+          // is never clobbered.
+          const cancelSupersededQueuedHolder = async (
+            candidate: typeof heartbeatRuns.$inferSelect,
+            candidateManualHold: boolean,
+          ): Promise<boolean> => {
+            if (candidateManualHold || candidate.status !== "queued") {
+              return false;
+            }
+            const differentOwner =
+              candidate.agentId !== issue.assigneeAgentId ||
+              candidate.agentId !== agentId;
+            const candidateWakeReason = readNonEmptyString(
+              parseObject(candidate.contextSnapshot).wakeReason,
+            );
+            const supersededReopenedCommentWake =
+              candidateWakeReason === "issue_reopened_via_comment" &&
+              (["in_review", "done", "cancelled", "blocked"].includes(issue.status) ||
+                (reason !== "issue_reopened_via_comment" && reason !== "issue_commented"));
+            if (!differentOwner && !supersededReopenedCommentWake) {
+              return false;
+            }
+            await notifyInstructionCollection(tx, { companyId: candidate.companyId, runId: candidate.id });
+            await notifyExternalAgentSettlement(tx, { companyId: candidate.companyId, runId: candidate.id });
+            await notifyCancelledWorkspacePreservation(tx, { companyId: candidate.companyId, runId: candidate.id });
+            await notifyUnsafeWorkspaceExportRunChange(tx, candidate);
+            await notifyChatRunMilestones(tx, { companyId: candidate.companyId, issueId: issue.id });
+            const errorMessage = differentOwner
+              ? "Execution lock released after issue reassigned to a different agent"
+              : "Queued reopened-via-comment wake superseded by issue transition";
+            const errorCode = differentOwner
+              ? "lock_released_on_reassignment"
+              : "issue_status_changed";
             const cancelled = await tx
               .update(heartbeatRuns)
               .set({
                 status: "cancelled",
                 finishedAt: new Date(),
-                error:
-                  "Execution lock released after issue reassigned to a different agent",
-                errorCode: "lock_released_on_reassignment",
+                error: errorMessage,
+                errorCode,
                 updatedAt: new Date(),
               })
               .where(
                 and(
-                  eq(heartbeatRuns.id, activeExecutionRun.id),
-                  eq(heartbeatRuns.status, activeExecutionRun.status),
+                  eq(heartbeatRuns.id, candidate.id),
+                  eq(heartbeatRuns.status, candidate.status),
                 ),
               )
               .returning();
-            if (cancelled.length > 0) {
-              cancelledRunsToEmit.push(cancelled[0]);
-              if (activeExecutionRun.wakeupRequestId) {
-                await tx
-                  .update(agentWakeupRequests)
-                  .set({
-                    status: "cancelled",
-                    finishedAt: new Date(),
-                    error:
-                      "Execution lock released after issue reassigned to a different agent",
-                    updatedAt: new Date(),
-                  })
-                  .where(
-                    eq(
-                      agentWakeupRequests.id,
-                      activeExecutionRun.wakeupRequestId,
-                    ),
-                  );
-              }
-              activeExecutionRun = null;
+            if (cancelled.length === 0) {
+              return false;
             }
+            cancelledRunsToEmit.push(cancelled[0]);
+            if (candidate.wakeupRequestId) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "cancelled",
+                  finishedAt: new Date(),
+                  error: errorMessage,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  eq(
+                    agentWakeupRequests.id,
+                    candidate.wakeupRequestId,
+                  ),
+                );
+            }
+            return true;
+          };
+
+          if (
+            activeExecutionRun &&
+            (await cancelSupersededQueuedHolder(
+              activeExecutionRun,
+              Boolean(manualExecutionHold),
+            ))
+          ) {
+            activeExecutionRun = null;
           }
 
           if (!activeExecutionRun && issue.executionRunId) {
@@ -3874,7 +3897,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           if (!activeExecutionRun) {
-            const legacyRun = await tx
+            const legacyCandidates = await tx
               .select()
               .from(heartbeatRuns)
               .where(
@@ -3889,33 +3912,38 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .orderBy(
                 sql`case when ${heartbeatRuns.status} = 'running' then 0 else 1 end`,
                 asc(heartbeatRuns.createdAt),
-              )
-              .limit(1)
-              .then((rows) => rows[0] ?? null);
+              );
 
-            if (legacyRun) {
+            for (const legacyRun of legacyCandidates) {
               if (await cancelStaleScheduledRetry(legacyRun)) {
-                activeExecutionRun = null;
-              } else {
-                activeExecutionRun = legacyRun;
-                const legacyAgent = await tx
-                  .select({ name: agents.name })
-                  .from(agents)
-                  .where(eq(agents.id, legacyRun.agentId))
-                  .then((rows) => rows[0] ?? null);
-                await notifyStatusCardIssueChange(tx, issue.companyId);
-                await tx
-                  .update(issues)
-                  .set({
-                    executionRunId: legacyRun.id,
-                    executionAgentNameKey: normalizeAgentNameKey(
-                      legacyAgent?.name,
-                    ),
-                    executionLockedAt: new Date(),
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(issues.id, issue.id));
+                continue;
               }
+              const legacyManualHold = await nativeManualAdmissionHoldsExecution(
+                tx as unknown as Db,
+                { companyId: issue.companyId, runId: legacyRun.id, issueId: issue.id },
+              );
+              if (await cancelSupersededQueuedHolder(legacyRun, Boolean(legacyManualHold))) {
+                continue;
+              }
+              activeExecutionRun = legacyRun;
+              const legacyAgent = await tx
+                .select({ name: agents.name })
+                .from(agents)
+                .where(eq(agents.id, legacyRun.agentId))
+                .then((rows) => rows[0] ?? null);
+              await notifyStatusCardIssueChange(tx, issue.companyId);
+              await tx
+                .update(issues)
+                .set({
+                  executionRunId: legacyRun.id,
+                  executionAgentNameKey: normalizeAgentNameKey(
+                    legacyAgent?.name,
+                  ),
+                  executionLockedAt: new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(eq(issues.id, issue.id));
+              break;
             }
           }
 

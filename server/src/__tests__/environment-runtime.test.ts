@@ -1126,6 +1126,63 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  it("settles stop-only pending_cleanup when a provider without environmentStopLease confirms the sandbox is already destroyed via environmentInspectLease", async () => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    const lease = seeded.reusableLease;
+    await db.update(environmentLeases).set({
+      leasePolicy: "ephemeral",
+      metadata: { ...lease.metadata, reuseLease: false },
+    }).where(eq(environmentLeases.id, lease.id));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+
+    let sandboxState: "active" | "destroyed" = "destroyed";
+    const call = vi.fn(async (_id: string, method: string) => {
+      if (method === "environmentInspectLease") {
+        return { providerLeaseId: lease.providerLeaseId, state: sandboxState };
+      }
+      throw new Error(`Unexpected destructive or unsupported method: ${method}`);
+    });
+    const runtime = () => environmentRuntimeService(db, {
+      pluginWorkerManager: {
+        isRunning: () => true,
+        call,
+        // Simulates Kubernetes: no environmentStopLease, read-only environmentInspectLease supported.
+        getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease", "environmentInspectLease"] }),
+      } as unknown as PluginWorkerManager,
+    });
+
+    // While still active, stop-only cleanup stays pending without calling destroy.
+    sandboxState = "active";
+    await runtime().releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain");
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentInspectLease", expect.objectContaining({
+      providerLeaseId: lease.providerLeaseId,
+    }), expect.any(Number));
+    expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+
+    // Once the sandbox is confirmed gone, the sweep settles the lease cleanly without looping.
+    sandboxState = "destroyed";
+    await heartbeatService(db, { environmentRuntime: runtime() }).sweepPendingCleanupLeases({ backoffMs: 0 });
+    const settled = await environmentService(db).getLeaseById(lease.id);
+    expect(settled).toMatchObject({
+      status: "released",
+      cleanupStatus: "success",
+      failureReason: "workspace_source_unavailable",
+      metadata: {
+        remoteExecutionTermination: {
+          state: "destroyed",
+          providerLeaseId: lease.providerLeaseId,
+        },
+      },
+    });
+    expect(settled?.metadata?.sandboxStopAndRetain).toBeUndefined();
+    expect(settled?.metadata?.sandboxStopAndRetainReceipt).toBeUndefined();
+    expect(call.mock.calls.every(entry => entry[1] === "environmentInspectLease")).toBe(true);
+  });
+
   it("renews the stop-only cleanup claim while the provider stop is still running", async () => {
     const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
     const lease = seeded.reusableLease;

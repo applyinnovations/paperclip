@@ -2398,6 +2398,22 @@ function createSandboxEnvironmentDriver(
         if (exportResume) {
           const pluginId = pluginProvider.resolved.plugin.id;
           if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
+            if (input.lease.providerLeaseId && pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentInspectLease")) {
+              await assertExportResumeOwnership();
+              const observed = await pluginWorkerManager.call(pluginId, "environmentInspectLease", {
+                driverKey: recordedProvider,
+                companyId: input.lease.companyId,
+                environmentId: input.lease.environmentId ?? "",
+                issueId: input.lease.issueId,
+                config: workerConfig,
+                providerLeaseId: input.lease.providerLeaseId,
+                leaseMetadata: input.lease.metadata ?? {},
+              }, 15_000);
+              const verified = remoteTerminationReceipt(input.lease, observed);
+              if (verified?.state === "destroyed" || verified?.state === "stopped") {
+                return observed;
+              }
+            }
             throw new Error("Workspace export recovery requires verified stop-only cleanup.");
           }
           await assertExportResumeOwnership();
@@ -2407,7 +2423,8 @@ function createSandboxEnvironmentDriver(
             config: workerConfig, providerLeaseId: input.lease.providerLeaseId,
             leaseMetadata: input.lease.metadata ?? {}, cancelActiveWork: true, resourceDisposition: "stop_and_retain",
           }, Math.min(resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000, 60_000)));
-          if (remoteTerminationReceipt(input.lease, receipt)?.state !== "stopped") {
+          const verified = remoteTerminationReceipt(input.lease, receipt);
+          if (verified?.state !== "stopped" && verified?.state !== "destroyed") {
             throw new Error("Workspace export recovery did not confirm the retained sandbox stopped.");
           }
           return receipt;
@@ -2493,7 +2510,8 @@ function createSandboxEnvironmentDriver(
         if (!pinnedPluginId) return true; // Permanent invalid intent, never a by-key fallback.
         const pinned = await resolvePluginSandboxProviderDriverById({ db, pluginId: pinnedPluginId, driverKey: recordedProvider });
         return Boolean(pinned?.plugin.status === "ready" && pluginWorkerManager.isRunning(pinned.plugin.id)
-          && pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease"));
+          && (pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease")
+            || pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentInspectLease")));
       }
       // Resolve the installed plugin without a wait. A plugin reload or a plugin
       // reinstall can remove the plugin row for a short window, so a missing

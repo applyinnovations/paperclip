@@ -190,18 +190,25 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
   if (hasNativeWorkspaceExportResume(lease)) return settleNativeWorkspaceExportResume(db, lease, options);
   const intent = readStopOnlyCleanup(lease);
   if (!intent) return null;
-  const receipt = remoteTerminationReceipt(lease, options.receipt), stopped = receipt?.state === "stopped";
+  const receipt = remoteTerminationReceipt(lease, options.receipt);
+  const stopped = receipt?.state === "stopped";
+  const destroyed = receipt?.state === "destroyed";
+  const terminated = stopped || destroyed;
   const now = new Date();
-  const removeIntent: SQL = stopped ? sql`- 'sandboxStopAndRetain'` : sql``;
+  const removeIntent: SQL = stopped
+    ? sql`- 'sandboxStopAndRetain'`
+    : destroyed
+      ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'`
+      : sql``;
   const recordedIntent = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as Record<string, unknown> | undefined;
   const legacyOrphan = stopped && recordedIntent?.recoveredOrphanedRunLease === true && !lease.metadata?.[ORPHANED_SANDBOX_RECOVERY_KEY]
     ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { recoveredOrphanedRunLease: true, ownerProof: recordedIntent.ownerProof ?? null,
       runId: lease.heartbeatRunId, recoveredAt: now.toISOString(), fromStopIntent: true } } : {};
   const [updated] = await writeEnvironmentCleanup(db, async tx => {
-    if (stopped) await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+    if (terminated) await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
     return tx.update(environmentLeases).set({
-      status: stopped ? "released" : "pending_cleanup", cleanupStatus: stopped ? "success" : "failed",
-      failureReason: stopped ? null : "sandbox_stop_pending",
+      status: terminated ? "released" : "pending_cleanup", cleanupStatus: terminated ? "success" : "failed",
+      failureReason: stopped ? null : destroyed ? "workspace_source_unavailable" : "sandbox_stop_pending",
       releasedAt: now, lastUsedAt: now, updatedAt: now,
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination' ${removeIntent}) || ${JSON.stringify({
         ...(stopped ? { remoteExecutionTermination: receipt, sandboxStopAndRetainReceipt: {
@@ -211,7 +218,7 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
           ...(intent.pluginId ? { pluginId: intent.pluginId, method: "environmentStopLease" }
             : { builtinProvider: lease.provider, method: "builtin.stopLease" }),
           confirmedAt: receipt.confirmedAt,
-        } } : {}),
+        } } : destroyed ? { remoteExecutionTermination: receipt } : {}),
         ...legacyOrphan,
         pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       })}::jsonb`,

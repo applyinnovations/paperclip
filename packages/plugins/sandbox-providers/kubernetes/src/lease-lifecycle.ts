@@ -198,6 +198,67 @@ export async function confirmLeaseResourcesGone(
   }
 }
 
+export interface InspectLeaseInput {
+  namespace: string;
+  /** Workload resource name (Sandbox CR name or Job name) == providerLeaseId. */
+  name: string;
+  backend: "sandbox-cr" | "job";
+  /** The lease's pod, when known; checked when the workload is already gone. */
+  podName: string | null;
+}
+
+/**
+ * Read-only observation of a lease's Kubernetes workload and backing pod.
+ * Returns `"destroyed"` only when both the workload and any recorded pod return
+ * 404 (so nothing of the lease can still execute). Non-404 API errors propagate.
+ */
+export async function inspectLeaseResources(
+  clients: KubeClients,
+  input: InspectLeaseInput,
+): Promise<"active" | "stopped" | "destroyed"> {
+  if (input.backend === "sandbox-cr") {
+    let workloadPresent = true;
+    try {
+      await getSandboxCrStatus(clients, input.namespace, input.name);
+    } catch (err) {
+      if (isKubeNotFoundError(err)) workloadPresent = false;
+      else throw err;
+    }
+    if (workloadPresent) return "active";
+    if (input.podName) {
+      try {
+        await clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName });
+        return "active";
+      } catch (err) {
+        if (!isKubeNotFoundError(err)) throw err;
+      }
+    }
+    return "destroyed";
+  }
+
+  let jobStatus: { phase: string } | null = null;
+  try {
+    jobStatus = await getJobStatus(clients, input.namespace, input.name);
+  } catch (err) {
+    if (!isKubeNotFoundError(err)) throw err;
+  }
+  if (!jobStatus) {
+    if (input.podName) {
+      try {
+        await clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName });
+        return "active";
+      } catch (err) {
+        if (!isKubeNotFoundError(err)) throw err;
+      }
+    }
+    return "destroyed";
+  }
+  if (jobStatus.phase === "Succeeded" || jobStatus.phase === "Failed") {
+    return "stopped";
+  }
+  return "active";
+}
+
 export interface DestroyLeaseInput {
   namespace: string;
   /** Workload resource name (Sandbox CR name or Job name) == providerLeaseId. */

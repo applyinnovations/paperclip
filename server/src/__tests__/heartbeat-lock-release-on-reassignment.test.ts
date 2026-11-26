@@ -36,6 +36,7 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -360,5 +361,184 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
         }),
       );
     });
+  });
+
+  it("supersedes a stranded queued issue_reopened_via_comment run on transition to in_review and reassignment so the reviewer wakes without deferring", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, wakeupRequestId } =
+      await seedCrossAgentScenario({ holderStatus: "queued" });
+
+    // Simulate a comment posted while the issue was blocked: issue moved to todo
+    // with a never-started queued `issue_reopened_via_comment` run for Coder.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_reopened_via_comment",
+          source: "issue.comment.reopen",
+        },
+      })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    await db
+      .update(issues)
+      .set({
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        executionRunId: holderRunId,
+      })
+      .where(eq(issues.id, issueId));
+
+    // Transition todo -> in_review and reassign to Reviewer through issueService.update.
+    const issuesSvc = issueService(db);
+    const updated = await issuesSvc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+    });
+    expect(updated).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+
+    // The stranded queued reopened-via-comment run and its wakeup request are cancelled.
+    const holderAfterUpdate = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(holderAfterUpdate).toEqual({
+      status: "cancelled",
+      errorCode: "lock_released_on_reassignment",
+    });
+    const wakeAfterUpdate = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeAfterUpdate?.status).toBe("cancelled");
+
+    // Occupy reviewer's single slot so the new wake stays inspectably queued (not immediately executed).
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+
+    const reviewerRun = await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "execution_review_requested" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(reviewerRun).not.toBeNull();
+    expect(reviewerRun?.agentId).toBe(reviewerAgentId);
+    expect(reviewerRun?.status).toBe("queued");
+
+    const deferredWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      );
+    expect(deferredWakes).toHaveLength(0);
+  });
+
+  it("cancels an already-stranded queued issue_reopened_via_comment legacy run when executionRunId is null instead of re-stamping and deferring", async () => {
+    const { companyId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "queued" });
+
+    // Pre-existing stranded state: executionRunId was already cleared to null,
+    // issue is in_review assigned to Reviewer, but Coder's queued
+    // issue_reopened_via_comment run is still sitting in heartbeat_runs.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_reopened_via_comment",
+        },
+      })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        executionRunId: null,
+        executionLockedAt: null,
+      })
+      .where(eq(issues.id, issueId));
+
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+
+    const reviewerRun = await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "execution_review_requested" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    expect(reviewerRun).not.toBeNull();
+    expect(reviewerRun?.agentId).toBe(reviewerAgentId);
+    expect(reviewerRun?.status).toBe("queued");
+
+    const holder = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(holder).toEqual({
+      status: "cancelled",
+      errorCode: "lock_released_on_reassignment",
+    });
+
+    const deferredWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      );
+    expect(deferredWakes).toHaveLength(0);
   });
 });
