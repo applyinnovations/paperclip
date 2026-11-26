@@ -5,8 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CompanyPortabilityFileEntry } from "@paperclipai/shared";
+import {
+  portabilityProjectDefaultExecutionPolicySchema,
+  type CompanyPortabilityFileEntry,
+} from "@paperclipai/shared";
 import { runnerApiResponseReservations } from "@paperclipai/db";
+import { normalizeProjectDefaultExecutionPolicy } from "../services/project-default-execution-policy.js";
 
 const runnerTarget = vi.hoisted(() => ({ driver: "local", platform: "linux", architecture: "x64" }));
 
@@ -1842,6 +1846,248 @@ describe("company portability", () => {
       defaultIssueExecutionPolicy: { stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }] }] },
     });
     expect(exported.warnings).toContainEqual(expect.stringContaining("only exported agents are portable"));
+  });
+
+  it("round-trips full project default execution policy settings across export and import", async () => {
+    const portability = companyPortabilityService({} as any);
+    const fullPolicy = {
+      mode: "normal" as const,
+      commentRequired: true,
+      maxReviewRounds: 4,
+      requiredQualityReview: {
+        version: 1 as const,
+        deliverables: [
+          { key: "spec", label: "Architecture Spec" },
+          { key: "verification", label: "Verification Report" },
+        ],
+      },
+      reviewPreset: {
+        id: "low_trust_review" as const,
+        version: 1 as const,
+        rawOutputDisposition: "quarantine" as const,
+      },
+      authorizationPolicy: {
+        trustPreset: "low_trust_review" as const,
+        assignmentPolicy: { mode: "protected" as const },
+      },
+      stages: [
+        {
+          id: "stage-review",
+          type: "review" as const,
+          approvalsNeeded: 1 as const,
+          participants: [
+            { id: "part-1", type: "agent" as const, agentId: "agent-1", userId: null },
+          ],
+        },
+      ],
+    };
+
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: null,
+        leadAgentId: null,
+        targetDate: null,
+        color: null,
+        status: "planned",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultIssueExecutionPolicy: fullPolicy,
+        },
+        workspaces: [],
+        archivedAt: null,
+      },
+    ]);
+    issueSvc.list.mockResolvedValue([]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: true, issues: false },
+    });
+
+    const exportedPolicy = exported.manifest.projects.find((project) => project.slug === "launch")
+      ?.executionWorkspacePolicy?.defaultIssueExecutionPolicy;
+    expect(exportedPolicy).toEqual({
+      mode: "normal",
+      commentRequired: true,
+      maxReviewRounds: 4,
+      requiredQualityReview: fullPolicy.requiredQualityReview,
+      reviewPreset: fullPolicy.reviewPreset,
+      authorizationPolicy: fullPolicy.authorizationPolicy,
+      stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }] }],
+    });
+    expect(portabilityProjectDefaultExecutionPolicySchema.safeParse(exportedPolicy).success).toBe(true);
+
+    const targetReviewerId = "6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b";
+    agentSvc.list.mockResolvedValue([{ id: targetReviewerId, name: "ClaudeCoder", status: "idle" }]);
+    projectSvc.list.mockResolvedValue([]);
+    projectSvc.create.mockResolvedValue({ id: "project-imported", name: "Launch", urlKey: "launch" });
+    projectSvc.create.mockClear();
+
+    const imported = await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: false, agents: false, projects: true, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      collisionStrategy: "replace",
+    }, "user-1");
+
+    expect(imported.warnings).toEqual([]);
+    expect(projectSvc.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultIssueExecutionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          maxReviewRounds: 4,
+          requiredQualityReview: fullPolicy.requiredQualityReview,
+          reviewPreset: fullPolicy.reviewPreset,
+          authorizationPolicy: fullPolicy.authorizationPolicy,
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: targetReviewerId }] }],
+        },
+      },
+    }));
+
+    const importedDefaults = projectSvc.create.mock.calls[0]?.[1]?.executionWorkspacePolicy?.defaultIssueExecutionPolicy;
+    expect(normalizeProjectDefaultExecutionPolicy(importedDefaults)).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      maxReviewRounds: 4,
+      requiredQualityReview: fullPolicy.requiredQualityReview,
+      reviewPreset: fullPolicy.reviewPreset,
+      authorizationPolicy: fullPolicy.authorizationPolicy,
+      stages: [{
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: targetReviewerId, userId: null }],
+      }],
+    });
+  });
+
+  it("omits nonportable monitor and company-scoped trustBoundary settings with warnings on export and import", async () => {
+    const portability = companyPortabilityService({} as any);
+    const sourceCompanyId = "11111111-1111-4111-8111-111111111111";
+    const sourceAgentId = "22222222-2222-4222-8222-222222222222";
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: null,
+        leadAgentId: null,
+        targetDate: null,
+        color: null,
+        status: "planned",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultIssueExecutionPolicy: {
+            mode: "auto",
+            commentRequired: true,
+            maxReviewRounds: 5,
+            monitor: {
+              nextCheckAt: "2099-01-01T00:00:00.000Z",
+              notes: "wait for ci",
+              scheduledBy: "assignee",
+            },
+            authorizationPolicy: {
+              trustPreset: "low_trust_review",
+              trustBoundary: {
+                mode: "low_trust_review",
+                companyId: sourceCompanyId,
+                allowedAgentIds: [sourceAgentId],
+                allowedToolClasses: ["read"],
+              },
+            },
+            stages: [{
+              id: "stage-1",
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: "p-1", type: "agent", agentId: "agent-1", userId: null }],
+            }],
+          },
+        },
+        workspaces: [],
+        archivedAt: null,
+      },
+    ]);
+    issueSvc.list.mockResolvedValue([]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: true, issues: false },
+    });
+
+    expect(exported.manifest.projects.find((project) => project.slug === "launch")?.executionWorkspacePolicy).toEqual({
+      enabled: true,
+      defaultIssueExecutionPolicy: {
+        mode: "auto",
+        commentRequired: true,
+        maxReviewRounds: 5,
+        authorizationPolicy: {
+          trustPreset: "low_trust_review",
+        },
+        stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }] }],
+      },
+    });
+    expect(exported.warnings).toContainEqual(expect.stringContaining("monitor was omitted from export"));
+    expect(exported.warnings).toContainEqual(expect.stringContaining("authorizationPolicy.trustBoundary was omitted from export"));
+
+    const reviewerId = "6f1c2b8e-3d4a-4e5f-9a6b-7c8d9e0f1a2b";
+    agentSvc.list.mockResolvedValue([{ id: reviewerId, name: "Code Reviewer", status: "idle" }]);
+    projectSvc.list.mockResolvedValue([]);
+    projectSvc.create.mockResolvedValue({ id: "project-imported", name: "Launch", urlKey: "launch" });
+    projectSvc.create.mockClear();
+
+    const imported = await portability.importBundle({
+      source: {
+        type: "inline",
+        rootPath: "paperclip-demo",
+        files: {
+          "COMPANY.md": ["---", 'schema: "agentcompanies/v1"', 'name: "Imported Paperclip"', "---", ""].join("\n"),
+          "projects/launch/PROJECT.md": ["---", 'name: "Launch"', "---", ""].join("\n"),
+          ".paperclip.yaml": [
+            'schema: "paperclip/v1"',
+            "projects:",
+            "  launch:",
+            "    executionWorkspacePolicy:",
+            "      enabled: true",
+            "      defaultIssueExecutionPolicy:",
+            "        mode: normal",
+            "        maxReviewRounds: 4",
+            "        monitor:",
+            '          nextCheckAt: "2099-01-01T00:00:00.000Z"',
+            "        authorizationPolicy:",
+            "          trustPreset: low_trust_review",
+            "          trustBoundary:",
+            "            mode: low_trust_review",
+            `            companyId: "${sourceCompanyId}"`,
+            "        stages:",
+            "          - type: review",
+            "            participants:",
+            "              - agentSlug: code-reviewer",
+            "",
+          ].join("\n"),
+        },
+      },
+      include: { company: false, agents: false, projects: true, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      collisionStrategy: "replace",
+    }, "user-1");
+
+    expect(projectSvc.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultIssueExecutionPolicy: {
+          mode: "normal",
+          maxReviewRounds: 4,
+          authorizationPolicy: {
+            trustPreset: "low_trust_review",
+          },
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+        },
+      },
+    }));
+    expect(imported.warnings).toContainEqual(expect.stringContaining("monitor was omitted from import"));
+    expect(imported.warnings).toContainEqual(expect.stringContaining("authorizationPolicy.trustBoundary was omitted from import"));
   });
 
   it("infers portable git metadata from a local checkout without task warning fan-out", async () => {

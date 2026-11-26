@@ -69,6 +69,7 @@ import {
   issueCommentPresentationSchema,
   normalizeAgentUrlKey,
   PERMISSION_KEYS,
+  portabilityProjectDefaultExecutionPolicySchema,
 } from "@paperclipai/shared";
 import { sha256HexOfBytes } from "@paperclipai/shared/portability-hash";
 import {
@@ -1442,9 +1443,136 @@ function stripPortableProjectExecutionWorkspaceRefs(policy: Record<string, unkno
   return isPlainRecord(cleaned) ? cleaned : null;
 }
 
+const NON_PORTABLE_TRUST_BOUNDARY_KEYS = [
+  "companyId",
+  "projectIds",
+  "rootIssueId",
+  "issueIds",
+  "allowedAgentIds",
+  "allowedSecretBindingIds",
+  "outputPromotionTarget",
+] as const;
+
+const KNOWN_PORTABLE_ISSUE_DEFAULT_KEYS = new Set([
+  "stages",
+  "mode",
+  "commentRequired",
+  "maxReviewRounds",
+  "requiredQualityReview",
+  "reviewPreset",
+  "authorizationPolicy",
+  "monitor",
+]);
+
+function extractPortableIssueDefaultSettings(
+  projectSlug: string,
+  rawDefaults: Record<string, unknown>,
+  direction: "export" | "import",
+  warnings: string[],
+): Omit<CompanyPortabilityProjectDefaultExecutionPolicy, "stages"> {
+  const settings: Omit<CompanyPortabilityProjectDefaultExecutionPolicy, "stages"> = {};
+  const shape = portabilityProjectDefaultExecutionPolicySchema.shape;
+
+  for (const key of Object.keys(rawDefaults)) {
+    if (!KNOWN_PORTABLE_ISSUE_DEFAULT_KEYS.has(key)) {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting ${key} is not supported in portable packages and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.mode !== undefined) {
+    const parsed = shape.mode.safeParse(rawDefaults.mode);
+    if (parsed.success && parsed.data !== undefined) {
+      settings.mode = parsed.data;
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting mode is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.commentRequired !== undefined) {
+    const parsed = shape.commentRequired.safeParse(rawDefaults.commentRequired);
+    if (parsed.success && parsed.data !== undefined) {
+      settings.commentRequired = parsed.data;
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting commentRequired is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.maxReviewRounds !== undefined) {
+    const parsed = shape.maxReviewRounds.safeParse(rawDefaults.maxReviewRounds);
+    if (parsed.success) {
+      if (parsed.data != null) settings.maxReviewRounds = parsed.data;
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting maxReviewRounds is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.requiredQualityReview !== undefined) {
+    const parsed = shape.requiredQualityReview.safeParse(rawDefaults.requiredQualityReview);
+    if (parsed.success && parsed.data !== undefined) {
+      settings.requiredQualityReview = parsed.data;
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting requiredQualityReview is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.reviewPreset !== undefined) {
+    const parsed = shape.reviewPreset.safeParse(rawDefaults.reviewPreset);
+    if (parsed.success && parsed.data !== undefined) {
+      settings.reviewPreset = parsed.data;
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting reviewPreset is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.authorizationPolicy !== undefined) {
+    const parsed = shape.authorizationPolicy.safeParse(rawDefaults.authorizationPolicy);
+    if (parsed.success && parsed.data !== undefined) {
+      const cloned = clonePortableRecord(parsed.data);
+      if (cloned) {
+        const boundary = isPlainRecord(cloned.trustBoundary) ? cloned.trustBoundary : null;
+        if (boundary && NON_PORTABLE_TRUST_BOUNDARY_KEYS.some((key) => boundary[key] !== undefined)) {
+          delete cloned.trustBoundary;
+          warnings.push(
+            `Project ${projectSlug} default execution policy authorizationPolicy.trustBoundary was omitted from ${direction} because company-scoped entity IDs are not portable.`,
+          );
+        }
+        if (Object.keys(cloned).length > 0) {
+          settings.authorizationPolicy = cloned as CompanyPortabilityProjectDefaultExecutionPolicy["authorizationPolicy"];
+        }
+      }
+    } else {
+      warnings.push(
+        `Project ${projectSlug} default execution policy setting authorizationPolicy is invalid and was omitted from ${direction}.`,
+      );
+    }
+  }
+
+  if (rawDefaults.monitor !== undefined && rawDefaults.monitor !== null) {
+    warnings.push(
+      `Project ${projectSlug} default execution policy monitor was omitted from ${direction} because scheduled monitor timestamps are not portable.`,
+    );
+  }
+
+  return settings;
+}
+
 /**
  * Export form of `executionWorkspacePolicy.defaultIssueExecutionPolicy`: agent
- * participants by slug. Agents outside the export and users are omitted.
+ * participants by slug plus portable policy settings. Agents outside the
+ * export, users, scheduled monitors, and company-scoped trust-boundary IDs are
+ * omitted with warnings.
  */
 function withPortableIssueDefaults(
   projectSlug: string,
@@ -1454,9 +1582,10 @@ function withPortableIssueDefaults(
 ): unknown {
   if (!isPlainRecord(policy) || !("defaultIssueExecutionPolicy" in policy)) return policy;
   const { defaultIssueExecutionPolicy, ...rest } = policy;
-  const defaults = defaultIssueExecutionPolicy as ProjectDefaultExecutionPolicy | null;
+  if (!isPlainRecord(defaultIssueExecutionPolicy)) return rest;
+  const defaults = defaultIssueExecutionPolicy as unknown as ProjectDefaultExecutionPolicy;
   const stages: CompanyPortabilityProjectDefaultExecutionPolicy["stages"] = [];
-  for (const stage of defaults?.stages ?? []) {
+  for (const stage of defaults.stages ?? []) {
     const participants: Array<{ agentSlug: string }> = [];
     for (const participant of stage.participants) {
       const agentSlug = participant.type === "agent" && participant.agentId ? agentSlugById.get(participant.agentId) : undefined;
@@ -1465,12 +1594,32 @@ function withPortableIssueDefaults(
     }
     if (participants.length > 0) stages.push({ type: stage.type, participants });
   }
-  return stages.length > 0 ? { ...rest, defaultIssueExecutionPolicy: { stages } } : rest;
+  const portableSettings = extractPortableIssueDefaultSettings(
+    projectSlug,
+    defaultIssueExecutionPolicy,
+    "export",
+    warnings,
+  );
+  if (stages.length === 0) {
+    const droppedSettings = Object.keys(portableSettings);
+    if (droppedSettings.length > 0) {
+      warnings.push(
+        `Project ${projectSlug} default execution policy settings (${droppedSettings.join(", ")}) were omitted from export because no portable stages remained.`,
+      );
+    }
+    return rest;
+  }
+  const portableDefaults: CompanyPortabilityProjectDefaultExecutionPolicy = {
+    ...portableSettings,
+    stages,
+  };
+  return { ...rest, defaultIssueExecutionPolicy: portableDefaults };
 }
 
 /**
  * Import form of `executionWorkspacePolicy.defaultIssueExecutionPolicy`: each
- * `agentSlug` becomes the agent of that slug in the importing company.
+ * `agentSlug` becomes the agent of that slug in the importing company and
+ * supported portable policy settings are preserved.
  */
 function resolvePortableIssueDefaults(
   projectSlug: string,
@@ -1480,7 +1629,8 @@ function resolvePortableIssueDefaults(
 ): Record<string, unknown> | null {
   if (!policy || !("defaultIssueExecutionPolicy" in policy)) return policy ?? null;
   const { defaultIssueExecutionPolicy, ...rest } = policy;
-  const rawStages = isPlainRecord(defaultIssueExecutionPolicy) && Array.isArray(defaultIssueExecutionPolicy.stages)
+  if (!isPlainRecord(defaultIssueExecutionPolicy)) return rest;
+  const rawStages = Array.isArray(defaultIssueExecutionPolicy.stages)
     ? (defaultIssueExecutionPolicy.stages as unknown[])
     : [];
   const stages: Array<{ type: string; participants: Array<{ type: "agent"; agentId: string }> }> = [];
@@ -1496,7 +1646,28 @@ function resolvePortableIssueDefaults(
     }
     if (type && participants.length > 0) stages.push({ type, participants });
   }
-  return stages.length > 0 ? { ...rest, defaultIssueExecutionPolicy: { stages } } : rest;
+  const portableSettings = extractPortableIssueDefaultSettings(
+    projectSlug,
+    defaultIssueExecutionPolicy,
+    "import",
+    warnings,
+  );
+  if (stages.length === 0) {
+    const droppedSettings = Object.keys(portableSettings);
+    if (droppedSettings.length > 0) {
+      warnings.push(
+        `Project ${projectSlug} default execution policy settings (${droppedSettings.join(", ")}) were omitted from import because no portable stages remained.`,
+      );
+    }
+    return rest;
+  }
+  return {
+    ...rest,
+    defaultIssueExecutionPolicy: {
+      ...portableSettings,
+      stages,
+    },
+  };
 }
 
 async function readGitOutput(cwd: string, args: string[]) {

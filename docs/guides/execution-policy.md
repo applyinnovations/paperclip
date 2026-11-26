@@ -293,8 +293,11 @@ projects:
               - agentSlug: code-reviewer
 ```
 
-Export writes the same form. User participants are not portable and are
-omitted with a warning.
+Export writes the same form and preserves portable policy settings (`mode`,
+`commentRequired`, `maxReviewRounds`, `requiredQualityReview`, `reviewPreset`,
+and portable `authorizationPolicy` fields). User participants, scheduled
+`monitor` timestamps, and company-scoped `authorizationPolicy.trustBoundary`
+entity IDs are not portable and are omitted with a warning.
 
 ### Updating execution policy on an existing issue
 
