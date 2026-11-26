@@ -148,11 +148,18 @@ export function buildClaudeAcpConfig(
     config.acpWarmHandleIdleMs ??
     DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS;
 
+  const acpEnv: Record<string, unknown> = {
+    ...env,
+    // ACP reads ANTHROPIC_MODEL at startup; keep it aligned with CLI precedence.
+    ...(model ? { ANTHROPIC_MODEL: model } : {}),
+    // Always disable claude.ai cloud MCP connectors in Paperclip-managed runs.
+    ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+  };
+
   return {
     ...config,
     model,
-    // ACP reads ANTHROPIC_MODEL at startup; keep it aligned with CLI precedence.
-    ...(model ? { env: { ...env, ANTHROPIC_MODEL: model } } : {}),
+    env: acpEnv,
     agent: "claude",
     mode,
     permissionMode,

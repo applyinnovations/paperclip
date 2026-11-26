@@ -205,6 +205,10 @@ describe("claude remote execution", () => {
     );
     expect(call?.[2]).toContain("--add-dir");
     expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`);
+    expect(call?.[2]).toContain("--mcp-config");
+    expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/mcp-config/mcp-config.json`);
+    expect(call?.[2]).toContain("--strict-mcp-config");
+    expect(call?.[3].env.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_WORKTREE_PATH).toBeUndefined();
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
@@ -653,6 +657,70 @@ describe("claude remote execution", () => {
     expect(retry).not.toContain("## Compact assignment");
     expect(retry.indexOf("comment-first")).toBeLessThan(retry.indexOf("comment-second"));
     expect(retry.split("Append the same ledger entry.")).toHaveLength(3);
+  });
+
+  it("unconditionally sets ENABLE_CLAUDEAI_MCP_SERVERS=false and passes --strict-mcp-config with both allowlisted and zero servers", async () => {
+    vi.stubEnv("ENABLE_CLAUDEAI_MCP_SERVERS", "true");
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-mcp-lockdown-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    vi.stubEnv("PAPERCLIP_HOME", path.join(rootDir, "paperclip-home"));
+
+    const invoke = async (runId: string, servers: Array<{ name: string; url: string; token: string; connectionId: string }>) => {
+      runChildProcess.mockClear();
+      await execute({
+        runId,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          model: "claude-opus-5",
+          engine: "cli",
+          command: "claude",
+          cwd: workspaceDir,
+          env: { ENABLE_CLAUDEAI_MCP_SERVERS: "true" },
+        },
+        runtimeMcp: { getServers: () => servers },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        onLog: async () => {},
+      });
+      const call = runChildProcess.mock.calls.find((candidate) =>
+        (candidate[2] as string[]).includes("--print"),
+      ) as unknown as [string, string, string[], { env: Record<string, string> }] | undefined;
+      expect(call).toBeDefined();
+      const args = call![2];
+      const mcpIdx = args.indexOf("--mcp-config");
+      expect(mcpIdx).toBeGreaterThanOrEqual(0);
+      expect(args).toContain("--strict-mcp-config");
+      expect(call![3].env.ENABLE_CLAUDEAI_MCP_SERVERS).toBe("false");
+      const { readFile } = await import("node:fs/promises");
+      return JSON.parse(await readFile(args[mcpIdx + 1]!, "utf8"));
+    };
+
+    const withServer = await invoke("run-with-mcp", [{
+      name: "grafana",
+      url: "https://paperclip.example/api/run-mcp/grafana",
+      token: "run-token",
+      connectionId: "run-mcp:grafana",
+    }]);
+    expect(withServer).toEqual({
+      mcpServers: {
+        grafana: {
+          type: "http",
+          url: "https://paperclip.example/api/run-mcp/grafana",
+          headers: { Authorization: "Bearer run-token" },
+        },
+      },
+    });
+
+    const withZero = await invoke("run-zero-mcp", []);
+    expect(withZero).toEqual({ mcpServers: {} });
   });
 
 });

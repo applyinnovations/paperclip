@@ -311,6 +311,10 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env[key] = value;
   }
 
+  // Always disable claude.ai cloud MCP connectors in Paperclip-managed runs,
+  // unconditionally overriding any inherited host environment or agent config value.
+  env.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
+
   if (isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
     env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);
   }
@@ -685,6 +689,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // Re-enforce after workspace env refresh so config.env can never re-enable
+  // claude.ai cloud MCP connectors.
+  env.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
     : null;
@@ -877,9 +884,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (attemptInstructionsFilePath && !resumeSessionId) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
-    if (runtimeMcpServers.length > 0) {
-      args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
-    }
+    // Always enforce strict MCP allowlisting so undeclared user/project/cloud
+    // MCP servers can never load — even when the agent has zero allowlisted
+    // servers (`{"mcpServers":{}}`).
+    args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     args.push("--add-dir", effectivePromptBundleAddDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;

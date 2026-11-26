@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import type { SandboxManagedRuntimeAssetProvision } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -316,21 +317,94 @@ function stripManagedMcpBlock(config: string): string {
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
 }
 
-function readCodexMcpServerNames(config: string): Set<string> {
-  const names = new Set<string>();
-  for (const match of config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([^\]\s#]+))\s*\]/gm)) {
-    const name = match[1] ?? match[2] ?? match[3];
-    if (name) names.add(name.trim());
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function parseCodexConfigToml(
+  config: string,
+): { ok: true; doc: Record<string, unknown> } | { ok: false } {
+  if (config.trim().length === 0) return { ok: true, doc: {} };
+  try {
+    const parsed = parseToml(config, { integersAsBigInt: "asNeeded" });
+    if (!isPlainRecord(parsed)) return { ok: false };
+    return { ok: true, doc: parsed };
+  } catch {
+    return { ok: false };
   }
-  return names;
+}
+
+function stringifyCodexConfigToml(doc: Record<string, unknown>): string {
+  if (Object.keys(doc).length === 0) return "";
+  return stringifyToml(doc).trim();
+}
+
+/**
+ * Strips any unmanaged `[mcp_servers.*]` tables and root `mcp_servers` keys
+ * (including escaped/quoted keys and multiline values) from a Codex
+ * `config.toml` using a spec-compliant TOML parser so Paperclip-managed runs
+ * never inherit stray host/user MCP configurations outside the explicit
+ * Paperclip allowlist.
+ *
+ * Fails closed on unparseable TOML by returning an empty document instead of
+ * passing through unverified content.
+ */
+export function stripUnmanagedCodexMcpServers(
+  config: string,
+): { content: string; removedNames: string[]; unparseable?: boolean } {
+  const parsed = parseCodexConfigToml(config);
+  if (!parsed.ok) {
+    return { content: "", removedNames: [], unparseable: true };
+  }
+  const removedNames: string[] = [];
+  if (Object.hasOwn(parsed.doc, "mcp_servers")) {
+    const mcpServers = parsed.doc.mcp_servers;
+    if (isPlainRecord(mcpServers)) {
+      for (const name of Object.keys(mcpServers)) {
+        removedNames.push(name);
+      }
+    } else {
+      removedNames.push("mcp_servers");
+    }
+    delete parsed.doc.mcp_servers;
+  }
+  return {
+    content: stringifyCodexConfigToml(parsed.doc),
+    removedNames,
+  };
+}
+
+/**
+ * Enforces `[features]\napps = false` in a Codex `config.toml` using a
+ * spec-compliant TOML parser/serializer so dotted keys (`features.fast_mode`),
+ * inline tables, escaped keys, and existing `[features]` tables merge cleanly
+ * without introducing duplicate table declarations.
+ */
+export function enforceCodexFeaturesAppsDisabled(config: string): string {
+  const parsed = parseCodexConfigToml(config);
+  const doc: Record<string, unknown> = parsed.ok ? parsed.doc : {};
+  const nextFeatures: Record<string, unknown> = { apps: false };
+  if (Object.hasOwn(doc, "features") && isPlainRecord(doc.features)) {
+    for (const [key, value] of Object.entries(doc.features)) {
+      if (key === "apps") continue;
+      Object.defineProperty(nextFeatures, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  doc.features = nextFeatures;
+  return stringifyCodexConfigToml(doc);
 }
 
 function buildManagedMcpBlock(input: {
   gateways: ManagedCodexMcpGateway[];
   apiBaseUrl: string;
-  existingNames: Set<string>;
-}): { block: string; warnings: string[] } {
-  const warnings: string[] = [];
+}): { block: string } {
   const usedNames = new Set<string>();
   const lines = [
     MANAGED_MCP_BLOCK_START,
@@ -338,19 +412,13 @@ function buildManagedMcpBlock(input: {
   ];
   input.gateways.forEach((gateway, index) => {
     const baseName = sanitizeMcpServerName(gateway.name, `gateway-${index + 1}`);
-    const directOverlap = input.existingNames.has(gateway.name) || input.existingNames.has(baseName);
-    let managedName = directOverlap ? `paperclip-${baseName}` : baseName;
+    let managedName = baseName;
     let suffix = 2;
-    while (usedNames.has(managedName) || input.existingNames.has(managedName)) {
+    while (usedNames.has(managedName)) {
       managedName = `paperclip-${baseName}-${suffix}`;
       suffix += 1;
     }
     usedNames.add(managedName);
-    if (directOverlap) {
-      warnings.push(
-        `Found unmanaged Codex MCP server "${gateway.name}" overlapping a Paperclip-governed gateway; leaving the direct entry in place and adding managed gateway "${managedName}". Paperclip cannot enforce policies for that direct entry.`,
-      );
-    }
     const url = new URL(gateway.endpointPath, input.apiBaseUrl).toString();
     lines.push(
       "",
@@ -360,7 +428,7 @@ function buildManagedMcpBlock(input: {
     );
   });
   lines.push(MANAGED_MCP_BLOCK_END);
-  return { block: lines.join("\n"), warnings };
+  return { block: lines.join("\n") };
 }
 
 export async function writeManagedCodexMcpConfig(input: {
@@ -374,15 +442,27 @@ export async function writeManagedCodexMcpConfig(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
     throw error;
   });
-  const unmanagedConfig = stripManagedMcpBlock(existing);
-  const { block, warnings } = buildManagedMcpBlock({
+  const withoutManagedBlock = stripManagedMcpBlock(existing);
+  const { content: strippedConfig, removedNames, unparseable } = stripUnmanagedCodexMcpServers(withoutManagedBlock);
+  const baseConfig = enforceCodexFeaturesAppsDisabled(strippedConfig);
+  const { block } = buildManagedMcpBlock({
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
-    existingNames: readCodexMcpServerNames(unmanagedConfig),
   });
+  const warnings: string[] = [];
+  if (unparseable) {
+    warnings.push(
+      `Reset unparseable Codex config "${configPath}" while enforcing Paperclip MCP isolation.`,
+    );
+  }
+  if (removedNames.length > 0) {
+    warnings.push(
+      `Removed unmanaged Codex MCP server(s) (${removedNames.join(", ")}) from "${configPath}"; only Paperclip-allowlisted MCP servers are permitted.`,
+    );
+  }
   const next = input.gateways.length > 0
-    ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
-    : `${unmanagedConfig}${unmanagedConfig ? "\n" : ""}`;
+    ? `${baseConfig}${baseConfig ? "\n\n" : ""}${block}\n`
+    : `${baseConfig}${baseConfig ? "\n" : ""}`;
   await fs.writeFile(configPath, next, { mode: 0o600 });
   await fs.chmod(configPath, 0o600);
   return { configPath, warnings };
@@ -787,7 +867,28 @@ export async function seedManagedCodexHome(
     for (const name of COPIED_SHARED_FILES) {
       const source = path.join(sourceHome, name);
       if (!(await pathExists(source))) continue;
+      if (name === "config.toml") {
+        const target = path.join(targetHome, name);
+        const existing = await fs.lstat(target).catch(() => null);
+        if (!existing) {
+          await ensureParentDir(target);
+          const raw = await fs.readFile(source, "utf8");
+          const { content: stripped } = stripUnmanagedCodexMcpServers(stripManagedMcpBlock(raw));
+          const sanitized = `${enforceCodexFeaturesAppsDisabled(stripped)}\n`;
+          await fs.writeFile(target, sanitized, { mode: 0o600 });
+          await fs.chmod(target, 0o600);
+        }
+        continue;
+      }
       await ensureCopiedFile(path.join(targetHome, name), source);
+    }
+
+    // Ensure every managed Codex home carries `[features]\napps = false` in
+    // `config.toml` (even when the shared source home had no config.toml).
+    const managedConfigPath = path.join(targetHome, "config.toml");
+    if (!(await fs.lstat(managedConfigPath).catch(() => null))) {
+      await fs.writeFile(managedConfigPath, `${enforceCodexFeaturesAppsDisabled("")}\n`, { mode: 0o600 });
+      await fs.chmod(managedConfigPath, 0o600);
     }
 
     await onLog(

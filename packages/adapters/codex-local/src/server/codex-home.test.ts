@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { prepareAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
@@ -11,6 +12,7 @@ import {
   CODEX_SYNC_ALLOWLIST,
   buildCodexHomeRefreshProvision,
   codexHomeHasUsableAuth,
+  enforceCodexFeaturesAppsDisabled,
   ensureSymlink,
   evaluateCodexCredentialReadiness,
   mergeManagedCodexMcpGateways,
@@ -19,6 +21,7 @@ import {
   reconcileManagedCodexHome,
   seedManagedCodexHome,
   stageCodexHomeForSync,
+  stripUnmanagedCodexMcpServers,
   writeManagedCodexMcpConfig,
 } from "./codex-home.js";
 
@@ -627,9 +630,11 @@ describe("seedManagedCodexHome", () => {
       const kept = path.join(entryHome, "auth.json");
       expect((await fs.lstat(kept)).isSymbolicLink()).toBe(false);
       expect(await fs.readFile(kept, "utf8")).toBe(stored);
-      // The static shared config still copies in, so a bound run gets the
-      // same config a per-agent home gets.
-      expect(await fs.readFile(path.join(entryHome, "config.toml"), "utf8")).toBe('model = "gpt-5"\n');
+      // The static shared config still copies in (with cloud apps disabled),
+      // so a bound run gets the same config a per-agent home gets.
+      expect(await fs.readFile(path.join(entryHome, "config.toml"), "utf8")).toBe(
+        'model = "gpt-5"\n\n[features]\napps = false\n',
+      );
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1052,6 +1057,321 @@ describe("evaluateCodexCredentialReadiness", () => {
       });
 
       expect((await fs.stat(configPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces [features] apps = false and strips unmanaged host mcp_servers when writing managed MCP config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-lockdown-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          "",
+          "[features]",
+          "apps = true",
+          "fast_mode = true",
+          "",
+          "[mcp_servers.personal_github]",
+          'url = "https://unmanaged.example/mcp"',
+          "",
+          "[mcp_servers.personal_github.http_headers]",
+          'Authorization = "Bearer stray-token"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [{
+          name: "grafana",
+          endpointPath: "/api/run-mcp/grafana",
+          bearerToken: "run-token",
+        }],
+      });
+
+      const written = await fs.readFile(configPath, "utf8");
+      expect(written).toContain('model = "gpt-5"');
+      expect(written).toContain("[features]\napps = false\nfast_mode = true");
+      expect(written).not.toContain("apps = true");
+      expect(written.match(/^\[features\]$/gm)).toHaveLength(1);
+      expect(written).not.toContain("personal_github");
+      expect(written).not.toContain("stray-token");
+      expect(written).toContain('[mcp_servers."grafana"]');
+      expect(written).toContain('url = "https://paperclip.example/api/run-mcp/grafana"');
+      expect(result.warnings).toEqual([
+        expect.stringContaining("personal_github"),
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips stray host MCP servers and writes [features] apps = false when seeding a managed Codex home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-lockdown-"));
+    try {
+      const sharedHome = path.join(root, "shared");
+      const seededFromConfig = path.join(root, "seeded-with-config");
+      const seededFromEmpty = path.join(root, "seeded-without-config");
+      const emptyShared = path.join(root, "empty-shared");
+      await fs.mkdir(sharedHome, { recursive: true });
+      await fs.mkdir(emptyShared, { recursive: true });
+      await fs.writeFile(
+        path.join(sharedHome, "config.toml"),
+        [
+          'model = "gpt-5"',
+          "features.apps = true",
+          "",
+          "[mcp_servers.stray]",
+          'command = "stray-mcp"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await seedManagedCodexHome(seededFromConfig, { CODEX_HOME: sharedHome }, async () => {});
+      await seedManagedCodexHome(seededFromEmpty, { CODEX_HOME: emptyShared }, async () => {});
+
+      const copiedConfig = await fs.readFile(path.join(seededFromConfig, "config.toml"), "utf8");
+      expect(copiedConfig).toContain('model = "gpt-5"');
+      expect(copiedConfig).toContain("[features]\napps = false");
+      expect(copiedConfig).not.toContain("apps = true");
+      expect(copiedConfig).not.toContain("mcp_servers");
+      expect(copiedConfig).not.toContain("stray-mcp");
+
+      const defaultConfig = await fs.readFile(path.join(seededFromEmpty, "config.toml"), "utf8");
+      expect(defaultConfig).toBe("[features]\napps = false\n");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips escaped TOML quoted MCP table headers and dotted keys cleanly", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-escaped-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          "",
+          '["mcp\\u005fservers".personal]',
+          'url = "https://unmanaged.example/mcp"',
+          "",
+          '["mcp\\U0000005fservers".unicode8]',
+          'url = "https://unmanaged-u8.example/mcp"',
+          "",
+          '["mcp\\x5fservers".hex_escaped]',
+          'url = "https://unmanaged-hex.example/mcp"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const withGateway = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [{
+          name: "grafana",
+          endpointPath: "/api/run-mcp/grafana",
+          bearerToken: "run-token",
+        }],
+      });
+      const parsedWithGateway = parseToml(await fs.readFile(configPath, "utf8"));
+      expect(parsedWithGateway).toEqual({
+        model: "gpt-5",
+        features: { apps: false },
+        mcp_servers: {
+          grafana: {
+            url: "https://paperclip.example/api/run-mcp/grafana",
+            http_headers: { Authorization: "Bearer run-token" },
+          },
+        },
+      });
+      expect(withGateway.warnings).toEqual([
+        expect.stringContaining("personal, unicode8, hex_escaped"),
+      ]);
+
+      // Dotted escaped key at root with no allowlisted gateways removes mcp_servers completely.
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          '"mcp\\u005fservers".personal.url = "https://unmanaged.example/mcp"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const withoutGateways = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [],
+      });
+      const parsedWithoutGateways = parseToml(await fs.readFile(configPath, "utf8"));
+      expect(parsedWithoutGateways).toEqual({
+        model: "gpt-5",
+        features: { apps: false },
+      });
+      expect(parsedWithoutGateways).not.toHaveProperty("mcp_servers");
+      expect(withoutGateways.warnings).toEqual([
+        expect.stringContaining("personal"),
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips multiline root MCP array, inline table, and multiline string values without leaving broken TOML", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-multiline-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          "mcp_servers.personal.args = [",
+          '  "serve",',
+          '  "--port",',
+          '  "8080",',
+          "]",
+          'mcp_servers.personal.notes = """',
+          "multiline",
+          "description",
+          '"""',
+          "mcp_servers.inline_srv = {",
+          '  url = "https://inline.example/mcp",',
+          '  args = [',
+          '    "run",',
+          "  ],",
+          "}",
+          "",
+          "[profiles.default]",
+          'model = "o3"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [],
+      });
+      const written = await fs.readFile(configPath, "utf8");
+      const parsed = parseToml(written);
+      expect(parsed).toEqual({
+        model: "gpt-5",
+        features: { apps: false },
+        profiles: { default: { model: "o3" } },
+      });
+      expect(result.warnings).toEqual([
+        expect.stringContaining("personal, inline_srv"),
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("merges features.apps = false cleanly with dotted features keys and preserves unrelated tables, arrays, and profiles", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-features-dotted-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          "features.fast_mode = true",
+          "",
+          "[profiles.work]",
+          'model = "o4-mini"',
+          'approval_policy = "never"',
+          "",
+          "[[history.entries]]",
+          'label = "alpha"',
+          "",
+          "[[history.entries]]",
+          'label = "beta"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [],
+      });
+
+      const written = await fs.readFile(configPath, "utf8");
+      const parsed = parseToml(written);
+      expect(parsed).toEqual({
+        model: "gpt-5",
+        features: { fast_mode: true, apps: false },
+        profiles: {
+          work: {
+            model: "o4-mini",
+            approval_policy: "never",
+          },
+        },
+        history: {
+          entries: [{ label: "alpha" }, { label: "beta" }],
+        },
+      });
+      expect(written.match(/^\[features\]$/gm)).toHaveLength(1);
+
+      // Existing [features] table with apps = true and fast_mode = true also merges cleanly.
+      const existingFeatures = enforceCodexFeaturesAppsDisabled(
+        ["[features]", "apps = true", "fast_mode = true", ""].join("\n"),
+      );
+      expect(parseToml(existingFeatures)).toEqual({
+        features: { apps: false, fast_mode: true },
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when existing config.toml is unparseable TOML", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-corrupt-toml-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        'broken = [1, 2\n[mcp_servers.smuggled]\nurl = "https://evil.example/mcp"\n',
+        "utf8",
+      );
+
+      const stripped = stripUnmanagedCodexMcpServers(await fs.readFile(configPath, "utf8"));
+      expect(stripped).toEqual({ content: "", removedNames: [], unparseable: true });
+
+      const result = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [{
+          name: "grafana",
+          endpointPath: "/api/run-mcp/grafana",
+          bearerToken: "run-token",
+        }],
+      });
+      const written = await fs.readFile(configPath, "utf8");
+      expect(parseToml(written)).toEqual({
+        features: { apps: false },
+        mcp_servers: {
+          grafana: {
+            url: "https://paperclip.example/api/run-mcp/grafana",
+            http_headers: { Authorization: "Bearer run-token" },
+          },
+        },
+      });
+      expect(written).not.toContain("smuggled");
+      expect(result.warnings).toEqual([
+        expect.stringContaining("Reset unparseable Codex config"),
+      ]);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

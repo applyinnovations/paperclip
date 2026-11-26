@@ -67,6 +67,8 @@ export function buildCodexExecArgs(
     args.push("-c", 'service_tier="fast"', "-c", "features.fast_mode=true");
   }
   if (extraArgs.length > 0) args.push(...extraArgs);
+  // Always disable ChatGPT cloud connectors/apps (`codex_apps`) in Paperclip-managed runs.
+  args.push("-c", "features.apps=false");
   if (!bypass && options.networkAccess === false) {
     args.push("-c", "sandbox_workspace_write.network_access=false");
   }

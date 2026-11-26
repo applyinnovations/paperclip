@@ -198,7 +198,7 @@ describe("codex execute", () => {
       expect((await fs.lstat(managedAuth)).isSymbolicLink()).toBe(true);
       expect(await fs.realpath(managedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(managedConfig)).isFile()).toBe(true);
-      expect(await fs.readFile(managedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
+      expect(await fs.readFile(managedConfig, "utf8")).toBe('model = "codex-mini-latest"\n\n[features]\napps = false\n');
       await expect(fs.lstat(path.join(sharedCodexHome, "companies", "company-1"))).rejects.toThrow();
       expect(logs).toContainEqual(
         expect.objectContaining({
@@ -310,18 +310,12 @@ describe("codex execute", () => {
       expect(result.errorMessage).toBeNull();
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
       const configText = capture.codexConfigContents ?? "";
-      expect(configText).toContain("[mcp_servers.github]");
-      expect(configText).toContain("[mcp_servers.\"paperclip-github\"]");
+      expect(configText).not.toContain("https://raw.example/mcp");
+      expect(configText).toContain("[mcp_servers.\"github\"]");
       expect(configText).toContain('url = "http://paperclip.local:3100/api/tool-gateway/gateways/gateway-1/mcp"');
       expect(configText).toContain('Authorization = "Bearer pcgw_secret-managed-token"');
-      expect(logs).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            stream: "stderr",
-            chunk: expect.stringContaining("Paperclip cannot enforce policies for that direct entry"),
-          }),
-        ]),
-      );
+      expect(configText).toContain("[features]\napps = false");
+      expect(capture.argv).toEqual(expect.arrayContaining(["-c", "features.apps=false"]));
       expect(JSON.stringify(logs)).not.toContain("pcgw_secret-managed-token");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -1551,7 +1545,7 @@ process.exit(1);
       expect((await fs.lstat(isolatedAuth)).isSymbolicLink()).toBe(true);
       expect(await fs.realpath(isolatedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(isolatedConfig)).isFile()).toBe(true);
-      expect(await fs.readFile(isolatedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
+      expect(await fs.readFile(isolatedConfig, "utf8")).toBe('model = "codex-mini-latest"\n\n[features]\napps = false\n');
       expect((await fs.lstat(homeSkill)).isSymbolicLink()).toBe(true);
       expect(logs).toContainEqual(
         expect.objectContaining({
@@ -1746,14 +1740,16 @@ process.exit(1);
         expect(JSON.parse(await fs.readFile(path.join(companyNext.codexHome!, "auth.json"), "utf8")).tokens.account_id).toBe("company-account-two");
         expect(await fs.readFile(path.join(sourceHome, "auth.json"), "utf8")).toBe(fakeCodexAuthJson);
       } else {
-        await fs.writeFile(path.join(sourceHome, "config.toml"), '[mcp_servers.changed]\ncommand = "new-selected-server"\n');
+        await fs.writeFile(path.join(sourceHome, "config.toml"), 'model = "custom-selected-model"\n[mcp_servers.changed]\ncommand = "new-selected-server"\n');
         const settingsChanged = await invoke("agent-1", "a".repeat(64));
         expect(settingsChanged.codexHome).not.toBe(first.codexHome);
-        expect(settingsChanged.codexConfigContents).toContain('command = "new-selected-server"');
+        expect(settingsChanged.codexConfigContents).toContain('model = "custom-selected-model"');
+        expect(settingsChanged.codexConfigContents).not.toContain('new-selected-server');
+        expect(settingsChanged.codexConfigContents).toContain("[features]\napps = false");
         expect(settingsChanged.codexConfigContents).toContain('model_provider = "test_gateway"');
         await fs.unlink(path.join(sourceHome, "config.toml"));
         const settingsRemoved = await invoke("agent-1", "a".repeat(64));
-        expect(settingsRemoved.codexConfigContents).not.toContain('new-selected-server');
+        expect(settingsRemoved.codexConfigContents).not.toContain('custom-selected-model');
       }
 
     } finally {

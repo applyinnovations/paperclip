@@ -77,6 +77,7 @@ const payload = {
   paperclipApiUrl: process.env.PAPERCLIP_API_URL || null,
   paperclipApiKey: process.env.PAPERCLIP_API_KEY || null,
   paperclipApiBridgeMode: process.env.PAPERCLIP_API_BRIDGE_MODE || null,
+  enableClaudeAiMcpServers: process.env.ENABLE_CLAUDEAI_MCP_SERVERS ?? null,
 };
 if (capturePath) {
   fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
@@ -446,9 +447,11 @@ describe("claude execute", () => {
     }
   });
 
-  it("uses a strict per-agent MCP config only when managed servers are present", async () => {
+  it("always uses a strict per-agent MCP config and disables claude.ai MCP servers, even with zero allowlisted servers", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-mcp-config-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const previousEnableClaudeAi = process.env.ENABLE_CLAUDEAI_MCP_SERVERS;
+    process.env.ENABLE_CLAUDEAI_MCP_SERVERS = "true";
     try {
       const run = async (runId: string, agentId: string, servers: AdapterRuntimeMcpServer[]) => {
         await execute({
@@ -459,7 +462,10 @@ describe("claude execute", () => {
             engine: "cli",
             command: commandPath,
             cwd: workspace,
-            env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+            env: {
+              PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+              ENABLE_CLAUDEAI_MCP_SERVERS: "true",
+            },
             promptTemplate: "Do work.",
           },
           runtimeMcp: { getServers: () => servers },
@@ -479,6 +485,7 @@ describe("claude execute", () => {
       const zero = await run("run-zero", "agent-zero", []);
 
       expect(alpha.argv).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config"]));
+      expect(alpha.enableClaudeAiMcpServers).toBe("false");
       expect(JSON.parse(alpha.mcpConfigContents)).toEqual({
         mcpServers: {
           alpha: {
@@ -488,12 +495,14 @@ describe("claude execute", () => {
           },
         },
       });
-      expect(zero.argv).not.toContain("--mcp-config");
-      expect(zero.argv).not.toContain("--strict-mcp-config");
-      expect(zero.mcpConfigPath).toBeNull();
-      expect(zero.mcpConfigContents).toBeNull();
+      expect(zero.argv).toEqual(expect.arrayContaining(["--strict-mcp-config", "--mcp-config"]));
+      expect(zero.enableClaudeAiMcpServers).toBe("false");
+      expect(JSON.parse(zero.mcpConfigContents)).toEqual({ mcpServers: {} });
       expect(alpha.mcpConfigPath).toContain("/agents/agent-alpha/");
+      expect(zero.mcpConfigPath).toContain("/agents/agent-zero/");
     } finally {
+      if (previousEnableClaudeAi === undefined) delete process.env.ENABLE_CLAUDEAI_MCP_SERVERS;
+      else process.env.ENABLE_CLAUDEAI_MCP_SERVERS = previousEnableClaudeAi;
       restore();
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1408,7 +1417,7 @@ describe("claude execute", () => {
       expect(capture2.argv).toContain("--resume");
       expect(getFreshSessionHandoff).not.toHaveBeenCalled();
       expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
-      if (change === "removed") expect(capture2.mcpConfigContents).toBeNull();
+      if (change === "removed") expect(capture2.mcpConfigContents).toBe('{"mcpServers":{}}');
       else {
         expect(capture2.mcpConfigContents).toContain("next-run-jwt-token");
         expect(capture2.mcpConfigContents).not.toContain('"run-jwt-token"');
