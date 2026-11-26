@@ -4,7 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
-import { collectProtectedSecretPaths, isWithin, realpathOrResolve } from "./plugin-protected-paths.js";
+import {
+  collectProtectedSecretPaths,
+  isWithin,
+  realpathOrResolve,
+  resolveCanonicalPath,
+} from "./plugin-protected-paths.js";
 
 export { collectProtectedSecretPaths };
 
@@ -299,19 +304,41 @@ function importTargets(execArgv: readonly string[]): string[] {
   return out;
 }
 
+function resolveGrantCandidates(grant: string): string[] {
+  const declared = path.resolve(grant);
+  let canonical: string;
+  try {
+    canonical = resolveCanonicalPath(declared);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    throw new PluginWorkerSandboxError(
+      `Refusing manifest read grant ${grant}: cannot resolve canonical path${code ? ` (${code})` : ""}.`,
+    );
+  }
+  return [...new Set([declared, canonical])];
+}
+
 /**
  * Returns the protected secret file a read grant would reach, or null when the
  * grant is clear. A grant may not be, contain, or sit in the directory of an
  * operator secret file: that covers the file itself, every ancestor (`/`,
- * `/etc`, ...), its parent directory and any sibling in it. Both the declared path and its realpath are checked, so a
- * symlink to a forbidden location is refused too.
+ * `/etc`, ...), its parent directory and any sibling in it. Both the declared
+ * path and its canonical path (resolving the nearest existing ancestor and any
+ * symlinks along the way when the target does not yet exist) are checked for
+ * both grants and protected secret paths, so a symlink to a forbidden location
+ * is refused even for nonexistent descendants. Fails closed with
+ * {@link PluginWorkerSandboxError} if canonicalising the grant fails for any
+ * reason other than missing path components (for example `EACCES` or `ELOOP`).
  */
 export function findForbiddenReadGrant(grant: string, protectedSecretPaths: readonly string[]): string | null {
-  const candidates = [...new Set([path.resolve(grant), realpathOrResolve(grant)])];
+  const grantCandidates = resolveGrantCandidates(grant);
   for (const secret of protectedSecretPaths) {
-    const secretDir = path.dirname(secret);
-    for (const candidate of candidates) {
-      if (isWithin(candidate, secret) || isWithin(secretDir, candidate)) return secret;
+    const secretCandidates = [...new Set([path.resolve(secret), realpathOrResolve(secret)])];
+    for (const secretPath of secretCandidates) {
+      const secretDir = path.dirname(secretPath);
+      for (const candidate of grantCandidates) {
+        if (isWithin(candidate, secretPath) || isWithin(secretDir, candidate)) return secret;
+      }
     }
   }
   return null;
@@ -393,7 +420,7 @@ export function planPluginWorkerSandbox(input: PluginWorkerSandboxInput): Plugin
         }
         // fs calls are checked against the path as given and module loads against
         // the realpath, so grant both; findForbiddenReadGrant checked both.
-        for (const p of new Set([path.resolve(grant), realpathOrResolve(grant)])) {
+        for (const p of resolveGrantCandidates(grant)) {
           grantedReadPaths.push(p);
           read.add(p);
         }

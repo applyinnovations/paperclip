@@ -669,9 +669,11 @@ warning naming the plugin and the reason. An honoured grant becomes
 only: it grants no write access and no child processes, worker threads or other
 permission. Some paths are **never grantable**. For every protected secret file
 (below, including `approvalsApp.privateKeyFile`), a grant is refused when its
-declared path or its realpath (the resolved path when it does not exist) is the
-secret file, is an ancestor of it (`/`, `/etc`, ...), or is the secret file's
-directory or anything inside it, such as a sibling file. A trusted plugin that
+declared path or its canonical path (resolving the nearest existing ancestor
+and any symlinks along the way when the target does not yet exist; failing
+closed if canonicalisation fails) is the secret file, is an ancestor of it
+(`/`, `/etc`, ...), or is the secret file's directory or anything inside it,
+such as a sibling file. A trusted plugin that
 declares a forbidden grant does not start: the start fails with an error naming
 the grant and the protected file. Grants do not affect the trusted exceptions,
 which stay unsandboxed. Node follows symlinks inside a granted directory, so

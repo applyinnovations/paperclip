@@ -20,6 +20,7 @@ import { logger } from "../middleware/logger.js";
 import { createPluginWorkerHandle, parseSandboxProbeMessage } from "../services/plugin-worker-manager.js";
 import {
   collectProtectedSecretPaths,
+  findForbiddenReadGrant,
   planPluginWorkerSandbox,
   PluginWorkerSandboxError,
   SANDBOX_PROBE_PATHS_ENV,
@@ -489,6 +490,7 @@ describe("planPluginWorkerSandbox", () => {
         linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sandbox-link-"));
         fs.symlinkSync(secretsDir, path.join(linkDir, "to-secrets"));
         fs.symlinkSync(keyFile, path.join(linkDir, "to-key"));
+        fs.symlinkSync(path.join(secretsDir, "future.txt"), path.join(linkDir, "dangling-in-secrets"));
       });
 
       const refused = () => [
@@ -500,6 +502,9 @@ describe("planPluginWorkerSandbox", () => {
         ["an ancestor (the tmp dir above the key's directory)", () => path.dirname(secretsDir)],
         ["a symlink to the parent directory", () => path.join(linkDir, "to-secrets")],
         ["a symlink to the key", () => path.join(linkDir, "to-key")],
+        ["a nonexistent direct child through a symlink to the parent directory", () => path.join(linkDir, "to-secrets", "later.txt")],
+        ["a deeper nonexistent descendant through a symlink to the parent directory", () => path.join(linkDir, "to-secrets", "sub", "deep", "later.txt")],
+        ["a dangling symlink pointing into the key's directory", () => path.join(linkDir, "dangling-in-secrets")],
       ] as const;
 
       for (const [label, grant] of refused()) {
@@ -524,6 +529,93 @@ describe("planPluginWorkerSandbox", () => {
 
       it("refuses a key mounted with PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE too", () => {
         expect(() => plan([secretsDir], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile })).toThrow(PluginWorkerSandboxError);
+      });
+    });
+
+    describe("findForbiddenReadGrant symlinked ancestors and fail-closed errors", () => {
+      let sandboxDir: string;
+      beforeEach(() => {
+        sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sandbox-symlink-"));
+      });
+      afterEach(() => {
+        vi.restoreAllMocks();
+        fs.rmSync(sandboxDir, { recursive: true, force: true });
+      });
+
+      it("rejects a nonexistent direct child and deeper missing descendants through a symlinked secret directory", () => {
+        const alias = path.join(sandboxDir, "alias");
+        fs.symlinkSync(secretsDir, alias);
+        expect(findForbiddenReadGrant(path.join(alias, "later.txt"), [keyFile])).toBe(keyFile);
+        expect(findForbiddenReadGrant(path.join(alias, "sub", "deep", "later.txt"), [keyFile])).toBe(keyFile);
+      });
+
+      it("rejects a dangling symlink targeting a nonexistent child or descendant in the secret directory", () => {
+        const danglingFile = path.join(sandboxDir, "dangling-file");
+        const danglingDir = path.join(sandboxDir, "dangling-dir");
+        fs.symlinkSync(path.join(secretsDir, "later.txt"), danglingFile);
+        fs.symlinkSync(path.join(secretsDir, "future-dir"), danglingDir);
+        expect(findForbiddenReadGrant(danglingFile, [keyFile])).toBe(keyFile);
+        expect(findForbiddenReadGrant(path.join(danglingDir, "deep", "later.txt"), [keyFile])).toBe(keyFile);
+      });
+
+      it("allows a nonexistent child under a symlinked ancestor outside the secret directory", () => {
+        const dataDir = path.join(sandboxDir, "data");
+        fs.mkdirSync(dataDir);
+        const dataAlias = path.join(sandboxDir, "data-alias");
+        fs.symlinkSync(dataDir, dataAlias);
+        const missingChild = path.join(dataAlias, "later.txt");
+        const missingDeep = path.join(dataAlias, "sub", "deep", "later.txt");
+        expect(findForbiddenReadGrant(missingChild, [keyFile])).toBeNull();
+        expect(findForbiddenReadGrant(missingDeep, [keyFile])).toBeNull();
+
+        const result = plan([missingChild], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile });
+        expect(result.mode).toBe("enforced");
+        if (result.mode !== "enforced") return;
+        expect(result.grantedReadPaths).toContain(missingChild);
+        expect(result.grantedReadPaths).toContain(path.join(fs.realpathSync(dataDir), "later.txt"));
+      });
+
+      it("rejects a nonexistent sibling when the protected secret file itself lives under a symlinked directory", () => {
+        const secretLink = path.join(sandboxDir, "secret-link");
+        const otherAlias = path.join(sandboxDir, "other-alias");
+        fs.symlinkSync(secretsDir, secretLink);
+        fs.symlinkSync(secretsDir, otherAlias);
+
+        const existingSecretViaLink = path.join(secretLink, "approvals-app.pem");
+        const missingSecretViaLink = path.join(secretLink, "not-mounted-yet.pem");
+
+        expect(findForbiddenReadGrant(path.join(secretsDir, "later.txt"), [existingSecretViaLink])).toBe(existingSecretViaLink);
+        expect(findForbiddenReadGrant(path.join(otherAlias, "sub", "later.txt"), [existingSecretViaLink])).toBe(existingSecretViaLink);
+        expect(findForbiddenReadGrant(path.join(secretsDir, "later.txt"), [missingSecretViaLink])).toBe(missingSecretViaLink);
+        expect(findForbiddenReadGrant(path.join(otherAlias, "sub", "later.txt"), [missingSecretViaLink])).toBe(missingSecretViaLink);
+        expect(() => plan([path.join(secretsDir, "later.txt")], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: missingSecretViaLink })).toThrow(PluginWorkerSandboxError);
+      });
+
+      it("fails closed when canonicalising a grant hits ELOOP or EACCES", () => {
+        const loopA = path.join(sandboxDir, "loop-a");
+        const loopB = path.join(sandboxDir, "loop-b");
+        fs.symlinkSync(loopB, loopA);
+        fs.symlinkSync(loopA, loopB);
+        const loopGrant = path.join(loopA, "later.txt");
+
+        expect(() => findForbiddenReadGrant(loopGrant, [keyFile])).toThrow(PluginWorkerSandboxError);
+        expect(() => findForbiddenReadGrant(loopGrant, [keyFile])).toThrow(/ELOOP/);
+        expect(() => plan([loopGrant], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile })).toThrow(PluginWorkerSandboxError);
+
+        const inaccessible = path.join(sandboxDir, "locked", "later.txt");
+        const realRealpathSync = fs.realpathSync;
+        vi.spyOn(fs, "realpathSync").mockImplementation(((p: fs.PathLike, options?: fs.EncodingOption) => {
+          if (String(p) === inaccessible) {
+            const err = new Error("permission denied") as NodeJS.ErrnoException;
+            err.code = "EACCES";
+            throw err;
+          }
+          return realRealpathSync(p, options as never);
+        }) as typeof fs.realpathSync);
+
+        expect(() => findForbiddenReadGrant(inaccessible, [keyFile])).toThrow(PluginWorkerSandboxError);
+        expect(() => findForbiddenReadGrant(inaccessible, [keyFile])).toThrow(/EACCES/);
+        expect(() => plan([inaccessible], { PAPERCLIP_GITHUB_APP_PRIVATE_KEY_FILE: keyFile })).toThrow(PluginWorkerSandboxError);
       });
     });
   });
