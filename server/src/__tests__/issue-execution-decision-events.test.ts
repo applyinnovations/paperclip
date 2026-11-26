@@ -342,4 +342,166 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
     await expect(services.issues.listExecutionDecisions({ issueId, companyId: foreign.companyId })).resolves.toEqual([]);
     await expect(services.issues.listExecutionDecisions({ issueId: randomUUID(), companyId: seeded.companyId })).resolves.toEqual([]);
   });
+
+  it("rejects agent PATCH status: done when executionState says completed without a recorded approved decision row", async () => {
+    const seeded = await seedCompany("XDG");
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      identifier: "XDG-1",
+      title: "Completed state with only changes_requested",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: seeded.implementerAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId: seeded.implementerAgentId },
+        completedStageIds: [stageId],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    await db.insert(issueExecutionDecisions).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId,
+      stageId,
+      stageType: "review",
+      actorAgentId: seeded.reviewerAgentId,
+      outcome: "changes_requested",
+      body: "Earlier review requested changes",
+    });
+
+    const implRunId = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const res = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("Reviewed-SHA");
+    expect(res.body.details).toMatchObject({
+      code: "unsatisfied_execution_policy_stages",
+      unsatisfiedStages: [
+        expect.objectContaining({
+          stageId,
+          approvalsRecorded: 0,
+          lastOutcome: "changes_requested",
+        }),
+      ],
+    });
+
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persisted?.status).toBe("in_progress");
+  });
+
+  it("records structured request_changes -> resubmit -> approve across a full cycle and lets executor close after approval", async () => {
+    const seeded = await seedCompany("XDR");
+    const { issueId, stageId } = await seedPendingReview({ ...seeded, identifier: "XDR-1" });
+    const reviewerRun1 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+
+    // 1. Reviewer submits structured request_changes decision.
+    const changesRes = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "request_changes",
+        comment: "Please fix the edge case before merge.",
+      });
+    expect(changesRes.status, JSON.stringify(changesRes.body)).toBe(200);
+    expect(changesRes.body.status).toBe("in_progress");
+    expect(changesRes.body.assigneeAgentId).toBe(seeded.implementerAgentId);
+    expect(changesRes.body.executionState).toMatchObject({
+      status: "changes_requested",
+      lastDecisionOutcome: "changes_requested",
+      lastDecisionId: expect.any(String),
+    });
+    const [changesEvent] = await waitForDecisionEvents(1);
+    expect(changesEvent!.payload).toMatchObject({
+      issueId,
+      stageId,
+      outcome: "changes_requested",
+    });
+
+    // 2. Executor attempts to strip executionPolicy to bypass re-review -> 422.
+    const implRunId = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const stripRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(stripRes.status, JSON.stringify(stripRes.body)).toBe(422);
+
+    // 3. Executor re-submits issue to in_review -> returns to pending on reviewer.
+    const resubmitRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", comment: "Fixed edge case; ready for re-review." });
+    expect(resubmitRes.status, JSON.stringify(resubmitRes.body)).toBe(200);
+    expect(resubmitRes.body.status).toBe("in_review");
+    expect(resubmitRes.body.assigneeAgentId).toBe(seeded.reviewerAgentId);
+    expect(resubmitRes.body.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: stageId,
+      completionRequested: false,
+    });
+
+    // 4. Reviewer submits structured approve decision with Reviewed-SHA.
+    const reviewerRun2 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const approveBody = `Looks great now.\n\nReviewed-SHA: ${REVIEWED_SHA}`;
+    const approveRes = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "approve",
+        comment: approveBody,
+      });
+    expect(approveRes.status, JSON.stringify(approveRes.body)).toBe(200);
+    expect(approveRes.body.status).toBe("in_progress");
+    expect(approveRes.body.assigneeAgentId).toBe(seeded.implementerAgentId);
+    expect(approveRes.body.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [stageId],
+      lastDecisionOutcome: "approved",
+      lastDecisionId: expect.any(String),
+    });
+
+    const rows = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(rows).toHaveLength(2);
+    const approvedRow = rows.find((row) => row.outcome === "approved");
+    expect(approvedRow).toBeTruthy();
+    expect(approveRes.body.executionState.lastDecisionId).toBe(approvedRow!.id);
+
+    const events = await waitForDecisionEvents(2);
+    expect(events[1]!.payload).toMatchObject({
+      issueId,
+      issueIdentifier: "XDR-1",
+      decisionId: approvedRow!.id,
+      stageId,
+      stageType: "review",
+      outcome: "approved",
+      reviewedSha: REVIEWED_SHA,
+    });
+
+    // 5. Executor now closes the issue as done -> allowed because approved row exists after changes_requested.
+    const implRun2 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const closeRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Merged and verified." });
+    expect(closeRes.status, JSON.stringify(closeRes.body)).toBe(200);
+    expect(closeRes.body.status).toBe("done");
+  });
 });

@@ -580,6 +580,9 @@ export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_C
 export const ISSUE_EXECUTION_DECISION_OUTCOMES = ["approved", "changes_requested"] as const;
 export type IssueExecutionDecisionOutcome = (typeof ISSUE_EXECUTION_DECISION_OUTCOMES)[number];
 
+export const ISSUE_EXECUTION_DECISION_INPUTS = ["approve", "request_changes"] as const;
+export type IssueExecutionDecisionInput = (typeof ISSUE_EXECUTION_DECISION_INPUTS)[number];
+
 export const GOAL_LEVELS = ["company", "team", "agent", "task"] as const;
 export type GoalLevel = (typeof GOAL_LEVELS)[number];
 

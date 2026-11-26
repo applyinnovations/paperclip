@@ -364,11 +364,16 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  getRequiredExecutionStages,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import {
+  assertAgentExecutionPolicyStagesNotRemoved,
+  assertAgentExecutionPolicyStagesSatisfied,
+} from "../services/issue-execution-policy-guards.js";
 import { recordIssueExecutionDecision } from "../services/issue-execution-decisions.js";
 import { buildExecutionWorkspaceAdapterConfig, parseProjectExecutionWorkspacePolicy, parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -14473,7 +14478,7 @@ export function issueRoutes(
         && !(await resolveManagedIssueForPrivacy(req, res, existing))) return;
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
-        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
+        ["status", "decision", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
       if (mcpParticipationChange) await assertMcpTaskParticipation(db, existing);
 
       assertNoAgentHostWorkspaceCommandMutation(
@@ -14529,6 +14534,7 @@ export function issueRoutes(
         : null;
       const {
         comment: commentBody,
+        decision: requestedDecision,
         commentClientRequestId,
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
@@ -14651,12 +14657,15 @@ export function issueRoutes(
         req.body.reviewPolicy !== existing.reviewPolicy;
       const reviewVerdictRequested =
         existing.status === "in_review" &&
-        (updateFields.status === "done" || updateFields.status === "cancelled");
+        (updateFields.status === "done" ||
+          updateFields.status === "cancelled" ||
+          requestedDecision === "approve");
       const mcpReviewSensitiveMutation = mcpParticipationChange;
       const reviewPolicySensitiveMutationRequested =
         mcpReviewSensitiveMutation || req.body.reviewPolicy !== undefined ||
         updateFields.status === "done" ||
-        updateFields.status === "cancelled";
+        updateFields.status === "cancelled" ||
+        requestedDecision === "approve";
       if (
         (reviewVerdictRequested || reviewPolicyChangeRequested) &&
         existing.reviewPolicy != null &&
@@ -14719,6 +14728,7 @@ export function issueRoutes(
         reopenRequested || resumeRequested === true;
       const recoveryRelevantSourceMutationRequested =
         req.body.status !== undefined ||
+        req.body.decision !== undefined ||
         normalizedAssigneeAgentId !== undefined ||
         req.body.assigneeUserId !== undefined ||
         Array.isArray(req.body.blockedByIssueIds) ||
@@ -14821,6 +14831,7 @@ export function issueRoutes(
       const isAgentWorkUpdate =
         req.actor.type === "agent" &&
         (Object.keys(updateFields).length > 0 ||
+          requestedDecision !== undefined ||
           reviewRequest !== undefined ||
           hiddenAtRaw !== undefined);
 
@@ -14967,6 +14978,14 @@ export function issueRoutes(
         existing.assigneeAgentId,
         req.body.executionPolicy !== undefined && monitorChanged,
       );
+      if (req.actor.type === "agent" && req.body.executionPolicy !== undefined) {
+        await assertAgentExecutionPolicyStagesNotRemoved(db, {
+          companyId: existing.companyId,
+          issueId: existing.id,
+          previousPolicy: previousExecutionPolicy,
+          nextPolicy: nextExecutionPolicy,
+        });
+      }
 
       const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
         ? { patch: {} }
@@ -14978,6 +14997,7 @@ export function issueRoutes(
           typeof updateFields.status === "string"
             ? updateFields.status
             : undefined,
+        decision: requestedDecision,
         requestedAssigneePatch: {
           assigneeAgentId: normalizedAssigneeAgentId,
           assigneeUserId:
@@ -15018,6 +15038,27 @@ export function issueRoutes(
       Object.assign(updateFields, transition.patch);
 
       const nextStatus = updateFields.status ?? existing.status;
+      const plannedNextExecutionState =
+        updateFields.executionState !== undefined
+          ? parseIssueExecutionState(updateFields.executionState)
+          : parseIssueExecutionState(existing.executionState);
+      const requiredStagesPolicy =
+        getRequiredExecutionStages(nextExecutionPolicy).length > 0
+          ? nextExecutionPolicy
+          : previousExecutionPolicy;
+      const agentCompletingGatedIssue =
+        req.actor.type === "agent" &&
+        getRequiredExecutionStages(requiredStagesPolicy).length > 0 &&
+        (nextStatus === "done" ||
+          plannedNextExecutionState?.status === "completed");
+      if (agentCompletingGatedIssue) {
+        await assertAgentExecutionPolicyStagesSatisfied(db, {
+          companyId: existing.companyId,
+          issueId: existing.id,
+          policy: requiredStagesPolicy,
+          pendingDecision: transition.decision ?? null,
+        });
+      }
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable(
           nextStatus === "in_review"
@@ -15554,7 +15595,8 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested;
+        reviewPolicySensitiveMutationRequested ||
+        agentCompletingGatedIssue;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
@@ -15563,6 +15605,30 @@ export function issueRoutes(
               !(await assertLockedReviewPolicyAllowsMutation(tx))
             )
               return null;
+            if (agentCompletingGatedIssue) {
+              const lockedIssue = await svc.getByIdForUpdate(id, tx);
+              if (!lockedIssue) return null;
+              const lockedPreviousPolicy = normalizeIssueExecutionPolicy(
+                lockedIssue.executionPolicy ?? null,
+              );
+              const lockedNextPolicy =
+                updateFields.executionPolicy !== undefined
+                  ? normalizeIssueExecutionPolicy(updateFields.executionPolicy)
+                  : lockedPreviousPolicy;
+              const lockedRequiredPolicy =
+                getRequiredExecutionStages(lockedNextPolicy).length > 0
+                  ? lockedNextPolicy
+                  : lockedPreviousPolicy;
+              await assertAgentExecutionPolicyStagesSatisfied(
+                tx as unknown as Db,
+                {
+                  companyId: lockedIssue.companyId,
+                  issueId: lockedIssue.id,
+                  policy: lockedRequiredPolicy,
+                  pendingDecision: decision ?? null,
+                },
+              );
+            }
             const updated = await updateIssue(tx);
             if (!updated) return null;
             if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
@@ -19774,6 +19840,25 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            const autoApprovalNextState = parseIssueExecutionState(
+              transition.patch.executionState,
+            );
+            if (
+              actor.actorType === "agent" &&
+              getRequiredExecutionStages(currentExecutionPolicy).length > 0 &&
+              (updatePatch.status === "done" ||
+                autoApprovalNextState?.status === "completed")
+            ) {
+              await assertAgentExecutionPolicyStagesSatisfied(
+                tx as unknown as Db,
+                {
+                  companyId: currentIssue.companyId,
+                  issueId: currentIssue.id,
+                  policy: currentExecutionPolicy,
+                  pendingDecision: transition.decision ?? null,
+                },
+              );
+            }
             const insertedComment = await svc.addComment(
               id,
               req.body.body,

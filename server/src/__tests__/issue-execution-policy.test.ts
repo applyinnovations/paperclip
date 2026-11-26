@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  evaluateExecutionPolicyStageSatisfaction,
+  hasRemovedRequiredExecutionStages,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+  stripMonitorFromExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "../../../ui/src/lib/issue-execution-policy.ts";
 
@@ -2537,6 +2544,214 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+      lastDecisionOutcome: "changes_requested",
     });
+  });
+});
+
+describe("mandatory structured review decisions", () => {
+  const policy = reviewOnlyPolicy();
+  const stageId = policy.stages[0].id;
+
+  function pendingReviewIssue(stateOverrides: Partial<IssueExecutionState> = {}) {
+    return {
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        ...stateOverrides,
+      } as IssueExecutionState,
+    };
+  }
+
+  it("supports explicit decision: approve without requiring a status field", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: pendingReviewIssue({ completionRequested: true }),
+      policy,
+      decision: "approve",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Approved.\n\nReviewed-SHA: 0123456789abcdef0123456789abcdef01234567",
+    });
+
+    expect(result.patch.status).toBe("done");
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [stageId],
+      lastDecisionOutcome: "approved",
+    });
+    expect(result.decision).toMatchObject({
+      stageId,
+      stageType: "review",
+      outcome: "approved",
+    });
+  });
+
+  it("supports explicit decision: request_changes without requiring a status field", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: pendingReviewIssue({ completionRequested: false }),
+      policy,
+      decision: "request_changes",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Please add unit tests for the boundary case.",
+    });
+
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: stageId,
+      lastDecisionOutcome: "changes_requested",
+    });
+    expect(result.decision).toMatchObject({
+      stageId,
+      stageType: "review",
+      outcome: "changes_requested",
+    });
+  });
+
+  it("rejects an agent reviewer patching status to todo, blocked, or cancelled out of a pending stage without a structured decision", () => {
+    for (const status of ["todo", "blocked", "cancelled"] as const) {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: pendingReviewIssue(),
+          policy,
+          requestedStatus: status,
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "Trying to move status directly",
+        }),
+      ).toThrow(expect.objectContaining({
+        status: 422,
+        details: expect.objectContaining({ code: "structured_review_decision_required" }),
+      }));
+    }
+  });
+
+  it("rejects conflicting decision and status combinations", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: pendingReviewIssue(),
+        policy,
+        decision: "approve",
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Conflicting",
+      }),
+    ).toThrow(expect.objectContaining({ status: 422 }));
+
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: pendingReviewIssue(),
+        policy,
+        decision: "request_changes",
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Conflicting",
+      }),
+    ).toThrow(expect.objectContaining({ status: 422 }));
+  });
+
+  it("never auto-skips a review stage after a prior changes_requested outcome", () => {
+    const selfReviewPolicy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+    ]);
+    const selfStageId = selfReviewPolicy.stages[0].id;
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: selfReviewPolicy,
+          executionState: {
+            status: "changes_requested",
+            currentStageId: selfStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: qaAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: "changes_requested",
+          },
+        },
+        policy: selfReviewPolicy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      }),
+    ).toThrow("No eligible review participant");
+  });
+
+  it("evaluates stage satisfaction across changes_requested -> approved review cycles", () => {
+    const t1 = new Date("2026-11-26T01:00:00.000Z");
+    const t2 = new Date("2026-11-26T02:00:00.000Z");
+    const t3 = new Date("2026-11-26T03:00:00.000Z");
+
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({ policy, decisions: [] }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsNeeded: 1, approvalsRecorded: 0, lastOutcome: null }],
+    });
+
+    // An earlier approval followed by changes_requested is NOT satisfied.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [
+          { id: "d1", stageId, outcome: "approved", createdAt: t1 },
+          { id: "d2", stageId, outcome: "changes_requested", createdAt: t2 },
+        ],
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsRecorded: 0, lastOutcome: "changes_requested" }],
+    });
+
+    // A fresh approval after changes_requested satisfies the stage.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [
+          { id: "d2", stageId, outcome: "changes_requested", createdAt: t2 },
+          { id: "d1", stageId, outcome: "approved", createdAt: t1 },
+          { id: "d3", stageId, outcome: "approved", createdAt: t3 },
+        ],
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // An in-flight pending approval decision after a persisted changes_requested satisfies the stage.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [{ id: "d2", stageId, outcome: "changes_requested", createdAt: t2 }],
+        pendingDecision: { stageId, outcome: "approved" },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+  });
+
+  it("detects removed or weakened required stages while allowing monitor-only updates", () => {
+    const withMonitor = normalizeIssueExecutionPolicy({
+      ...policy,
+      monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z", notes: "Wait for CI" },
+    })!;
+    expect(hasRemovedRequiredExecutionStages(policy, withMonitor)).toEqual([]);
+    expect(hasRemovedRequiredExecutionStages(policy, null)).toHaveLength(1);
+    expect(hasRemovedRequiredExecutionStages(policy, reviewOnlyPolicy())).toHaveLength(1);
   });
 });
