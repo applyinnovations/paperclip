@@ -627,9 +627,11 @@ describe("seedManagedCodexHome", () => {
       const kept = path.join(entryHome, "auth.json");
       expect((await fs.lstat(kept)).isSymbolicLink()).toBe(false);
       expect(await fs.readFile(kept, "utf8")).toBe(stored);
-      // The static shared config still copies in, so a bound run gets the
-      // same config a per-agent home gets.
-      expect(await fs.readFile(path.join(entryHome, "config.toml"), "utf8")).toBe('model = "gpt-5"\n');
+      // The static shared config still copies in (with cloud apps disabled),
+      // so a bound run gets the same config a per-agent home gets.
+      expect(await fs.readFile(path.join(entryHome, "config.toml"), "utf8")).toBe(
+        'model = "gpt-5"\n\n[features]\napps = false\n',
+      );
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1052,6 +1054,95 @@ describe("evaluateCodexCredentialReadiness", () => {
       });
 
       expect((await fs.stat(configPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces [features] apps = false and strips unmanaged host mcp_servers when writing managed MCP config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-lockdown-"));
+    try {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(
+        configPath,
+        [
+          'model = "gpt-5"',
+          "",
+          "[features]",
+          "apps = true",
+          "fast_mode = true",
+          "",
+          "[mcp_servers.personal_github]",
+          'url = "https://unmanaged.example/mcp"',
+          "",
+          "[mcp_servers.personal_github.http_headers]",
+          'Authorization = "Bearer stray-token"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [{
+          name: "grafana",
+          endpointPath: "/api/run-mcp/grafana",
+          bearerToken: "run-token",
+        }],
+      });
+
+      const written = await fs.readFile(configPath, "utf8");
+      expect(written).toContain('model = "gpt-5"');
+      expect(written).toContain("[features]\napps = false\nfast_mode = true");
+      expect(written).not.toContain("apps = true");
+      expect(written.match(/^\[features\]$/gm)).toHaveLength(1);
+      expect(written).not.toContain("personal_github");
+      expect(written).not.toContain("stray-token");
+      expect(written).toContain('[mcp_servers."grafana"]');
+      expect(written).toContain('url = "https://paperclip.example/api/run-mcp/grafana"');
+      expect(result.warnings).toEqual([
+        expect.stringContaining("personal_github"),
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips stray host MCP servers and writes [features] apps = false when seeding a managed Codex home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-lockdown-"));
+    try {
+      const sharedHome = path.join(root, "shared");
+      const seededFromConfig = path.join(root, "seeded-with-config");
+      const seededFromEmpty = path.join(root, "seeded-without-config");
+      const emptyShared = path.join(root, "empty-shared");
+      await fs.mkdir(sharedHome, { recursive: true });
+      await fs.mkdir(emptyShared, { recursive: true });
+      await fs.writeFile(
+        path.join(sharedHome, "config.toml"),
+        [
+          'model = "gpt-5"',
+          "features.apps = true",
+          "",
+          "[mcp_servers.stray]",
+          'command = "stray-mcp"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      await seedManagedCodexHome(seededFromConfig, { CODEX_HOME: sharedHome }, async () => {});
+      await seedManagedCodexHome(seededFromEmpty, { CODEX_HOME: emptyShared }, async () => {});
+
+      const copiedConfig = await fs.readFile(path.join(seededFromConfig, "config.toml"), "utf8");
+      expect(copiedConfig).toContain('model = "gpt-5"');
+      expect(copiedConfig).toContain("[features]\napps = false");
+      expect(copiedConfig).not.toContain("apps = true");
+      expect(copiedConfig).not.toContain("mcp_servers");
+      expect(copiedConfig).not.toContain("stray-mcp");
+
+      const defaultConfig = await fs.readFile(path.join(seededFromEmpty, "config.toml"), "utf8");
+      expect(defaultConfig).toBe("[features]\napps = false\n");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

@@ -316,21 +316,176 @@ function stripManagedMcpBlock(config: string): string {
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
 }
 
-function readCodexMcpServerNames(config: string): Set<string> {
-  const names = new Set<string>();
-  for (const match of config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([^\]\s#]+))\s*\]/gm)) {
-    const name = match[1] ?? match[2] ?? match[3];
-    if (name) names.add(name.trim());
+function parseTomlTableHeaderPath(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("[")) return null;
+  const isArray = trimmed.startsWith("[[");
+  const openLen = isArray ? 2 : 1;
+  const closeToken = isArray ? "]]" : "]";
+  let inQuote: '"' | "'" | null = null;
+  let escaped = false;
+  let closeIdx = -1;
+  for (let i = openLen; i < trimmed.length; i += 1) {
+    const ch = trimmed[i];
+    if (inQuote) {
+      if (inQuote === '"' && escaped) {
+        escaped = false;
+      } else if (inQuote === '"' && ch === "\\") {
+        escaped = true;
+      } else if (ch === inQuote) {
+        inQuote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
+    if (isArray ? trimmed.startsWith("]]", i) : ch === "]") {
+      closeIdx = i;
+      break;
+    }
   }
-  return names;
+  if (closeIdx < 0) return null;
+  const trailing = trimmed.slice(closeIdx + closeToken.length).trim();
+  if (trailing.length > 0 && !trailing.startsWith("#")) return null;
+  const inner = trimmed.slice(openLen, closeIdx);
+  const segments: string[] = [];
+  let current = "";
+  inQuote = null;
+  escaped = false;
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (inQuote) {
+      if (inQuote === '"' && escaped) {
+        current += ch;
+        escaped = false;
+      } else if (inQuote === '"' && ch === "\\") {
+        escaped = true;
+      } else if (ch === inQuote) {
+        inQuote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
+    if (ch === ".") {
+      segments.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current.trim());
+  return segments.filter((segment) => segment.length > 0);
+}
+
+/**
+ * Strips any unmanaged `[mcp_servers.*]` tables (and root `mcp_servers` keys)
+ * from a Codex `config.toml` so Paperclip-managed runs never inherit stray
+ * host/user MCP configurations outside the explicit Paperclip allowlist.
+ */
+export function stripUnmanagedCodexMcpServers(config: string): { content: string; removedNames: string[] } {
+  const lines = config.split(/\r?\n/);
+  const out: string[] = [];
+  const removedNames = new Set<string>();
+  let inRootRegion = true;
+  let skippingMcpSection = false;
+  for (const line of lines) {
+    const headerPath = parseTomlTableHeaderPath(line);
+    if (headerPath) {
+      inRootRegion = false;
+      if (headerPath[0] === "mcp_servers") {
+        skippingMcpSection = true;
+        if (headerPath[1]) removedNames.add(headerPath[1]);
+        continue;
+      }
+      skippingMcpSection = false;
+    } else if (skippingMcpSection) {
+      continue;
+    }
+    if (inRootRegion) {
+      const rootMcpMatch = line.match(
+        /^\s*(?:"mcp_servers"|'mcp_servers'|mcp_servers)\s*(?:\.\s*(?:"([^"]+)"|'([^']+)'|([^=\s.#]+))|=)/,
+      );
+      if (rootMcpMatch) {
+        const name = rootMcpMatch[1] ?? rootMcpMatch[2] ?? rootMcpMatch[3];
+        if (name) removedNames.add(name.trim());
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  const content = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { content, removedNames: Array.from(removedNames) };
+}
+
+/**
+ * Enforces `[features]\napps = false` in a Codex `config.toml` without
+ * introducing duplicate `[features]` tables, so ChatGPT cloud connectors/apps
+ * (`codex_apps`) remain disabled in Paperclip-managed runs.
+ */
+export function enforceCodexFeaturesAppsDisabled(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const out: string[] = [];
+  let inRootRegion = true;
+  let inFeaturesSection = false;
+  let sawFeaturesSection = false;
+
+  for (const line of lines) {
+    const headerPath = parseTomlTableHeaderPath(line);
+    if (headerPath) {
+      inRootRegion = false;
+      if (headerPath.length === 1 && headerPath[0] === "features") {
+        sawFeaturesSection = true;
+        inFeaturesSection = true;
+        out.push(line);
+        out.push("apps = false");
+        continue;
+      }
+      inFeaturesSection = false;
+      out.push(line);
+      continue;
+    }
+    if (inFeaturesSection) {
+      if (/^\s*(?:"apps"|'apps'|apps)\s*=/.test(line)) {
+        continue;
+      }
+      out.push(line);
+      continue;
+    }
+    if (inRootRegion) {
+      if (/^\s*(?:"features"|'features'|features)\s*\.\s*(?:"apps"|'apps'|apps)\s*=/.test(line)) {
+        continue;
+      }
+      const inlineFeaturesMatch = line.match(/^(\s*(?:"features"|'features'|features)\s*=\s*\{)(.*)(\}\s*(?:#.*)?)$/);
+      if (inlineFeaturesMatch) {
+        sawFeaturesSection = true;
+        const innerEntries = inlineFeaturesMatch[2]
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0 && !/^(?:"apps"|'apps'|apps)\s*=/.test(entry));
+        innerEntries.unshift("apps = false");
+        out.push(`${inlineFeaturesMatch[1]} ${innerEntries.join(", ")} ${inlineFeaturesMatch[3]}`);
+        continue;
+      }
+    }
+    out.push(line);
+  }
+
+  const trimmed = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (sawFeaturesSection) return trimmed;
+  return trimmed ? `${trimmed}\n\n[features]\napps = false` : "[features]\napps = false";
 }
 
 function buildManagedMcpBlock(input: {
   gateways: ManagedCodexMcpGateway[];
   apiBaseUrl: string;
-  existingNames: Set<string>;
-}): { block: string; warnings: string[] } {
-  const warnings: string[] = [];
+}): { block: string } {
   const usedNames = new Set<string>();
   const lines = [
     MANAGED_MCP_BLOCK_START,
@@ -338,19 +493,13 @@ function buildManagedMcpBlock(input: {
   ];
   input.gateways.forEach((gateway, index) => {
     const baseName = sanitizeMcpServerName(gateway.name, `gateway-${index + 1}`);
-    const directOverlap = input.existingNames.has(gateway.name) || input.existingNames.has(baseName);
-    let managedName = directOverlap ? `paperclip-${baseName}` : baseName;
+    let managedName = baseName;
     let suffix = 2;
-    while (usedNames.has(managedName) || input.existingNames.has(managedName)) {
+    while (usedNames.has(managedName)) {
       managedName = `paperclip-${baseName}-${suffix}`;
       suffix += 1;
     }
     usedNames.add(managedName);
-    if (directOverlap) {
-      warnings.push(
-        `Found unmanaged Codex MCP server "${gateway.name}" overlapping a Paperclip-governed gateway; leaving the direct entry in place and adding managed gateway "${managedName}". Paperclip cannot enforce policies for that direct entry.`,
-      );
-    }
     const url = new URL(gateway.endpointPath, input.apiBaseUrl).toString();
     lines.push(
       "",
@@ -360,7 +509,7 @@ function buildManagedMcpBlock(input: {
     );
   });
   lines.push(MANAGED_MCP_BLOCK_END);
-  return { block: lines.join("\n"), warnings };
+  return { block: lines.join("\n") };
 }
 
 export async function writeManagedCodexMcpConfig(input: {
@@ -374,15 +523,22 @@ export async function writeManagedCodexMcpConfig(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
     throw error;
   });
-  const unmanagedConfig = stripManagedMcpBlock(existing);
-  const { block, warnings } = buildManagedMcpBlock({
+  const withoutManagedBlock = stripManagedMcpBlock(existing);
+  const { content: strippedConfig, removedNames } = stripUnmanagedCodexMcpServers(withoutManagedBlock);
+  const baseConfig = enforceCodexFeaturesAppsDisabled(strippedConfig);
+  const { block } = buildManagedMcpBlock({
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
-    existingNames: readCodexMcpServerNames(unmanagedConfig),
   });
+  const warnings: string[] = [];
+  if (removedNames.length > 0) {
+    warnings.push(
+      `Removed unmanaged Codex MCP server(s) (${removedNames.join(", ")}) from "${configPath}"; only Paperclip-allowlisted MCP servers are permitted.`,
+    );
+  }
   const next = input.gateways.length > 0
-    ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
-    : `${unmanagedConfig}${unmanagedConfig ? "\n" : ""}`;
+    ? `${baseConfig}${baseConfig ? "\n\n" : ""}${block}\n`
+    : `${baseConfig}${baseConfig ? "\n" : ""}`;
   await fs.writeFile(configPath, next, { mode: 0o600 });
   await fs.chmod(configPath, 0o600);
   return { configPath, warnings };
@@ -787,7 +943,28 @@ export async function seedManagedCodexHome(
     for (const name of COPIED_SHARED_FILES) {
       const source = path.join(sourceHome, name);
       if (!(await pathExists(source))) continue;
+      if (name === "config.toml") {
+        const target = path.join(targetHome, name);
+        const existing = await fs.lstat(target).catch(() => null);
+        if (!existing) {
+          await ensureParentDir(target);
+          const raw = await fs.readFile(source, "utf8");
+          const { content: stripped } = stripUnmanagedCodexMcpServers(stripManagedMcpBlock(raw));
+          const sanitized = `${enforceCodexFeaturesAppsDisabled(stripped)}\n`;
+          await fs.writeFile(target, sanitized, { mode: 0o600 });
+          await fs.chmod(target, 0o600);
+        }
+        continue;
+      }
       await ensureCopiedFile(path.join(targetHome, name), source);
+    }
+
+    // Ensure every managed Codex home carries `[features]\napps = false` in
+    // `config.toml` (even when the shared source home had no config.toml).
+    const managedConfigPath = path.join(targetHome, "config.toml");
+    if (!(await fs.lstat(managedConfigPath).catch(() => null))) {
+      await fs.writeFile(managedConfigPath, `${enforceCodexFeaturesAppsDisabled("")}\n`, { mode: 0o600 });
+      await fs.chmod(managedConfigPath, 0o600);
     }
 
     await onLog(

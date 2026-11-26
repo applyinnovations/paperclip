@@ -481,6 +481,8 @@ describe("codex remote execution", () => {
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -554,6 +556,8 @@ describe("codex remote execution", () => {
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
+      "-c",
+      "features.apps=false",
       "resume",
       "session-123",
       "-",
@@ -635,6 +639,8 @@ describe("codex remote execution", () => {
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
+      "-c",
+      "features.apps=false",
       "resume",
       "session-123",
       "-",

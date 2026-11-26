@@ -282,10 +282,10 @@ describe("claude_local ACP lane", () => {
   });
 
   it("keeps ACP model precedence consistent with CLI and provider overrides", () => {
-    expect(buildClaudeAcpConfig({ model: "claude-sonnet-4-5", env: { ANTHROPIC_MODEL: "opus" } }))
-      .toMatchObject({ model: "claude-sonnet-4-5", env: { ANTHROPIC_MODEL: "claude-sonnet-4-5" } });
+    expect(buildClaudeAcpConfig({ model: "claude-sonnet-4-5", env: { ANTHROPIC_MODEL: "opus", ENABLE_CLAUDEAI_MCP_SERVERS: "true" } }))
+      .toMatchObject({ model: "claude-sonnet-4-5", env: { ANTHROPIC_MODEL: "claude-sonnet-4-5", ENABLE_CLAUDEAI_MCP_SERVERS: "false" } });
     expect(buildClaudeAcpConfig({}, { ANTHROPIC_MODEL: "custom-model" }))
-      .toMatchObject({ model: "custom-model", env: { ANTHROPIC_MODEL: "custom-model" } });
+      .toMatchObject({ model: "custom-model", env: { ANTHROPIC_MODEL: "custom-model", ENABLE_CLAUDEAI_MCP_SERVERS: "false" } });
     expect(buildClaudeAcpConfig({}, { CLAUDE_CODE_USE_BEDROCK: "1" }).model).toBe("");
     expect(buildClaudeAcpConfig({ env: { CLAUDE_CODE_USE_VERTEX: "1" } }).model).toBe("");
   });

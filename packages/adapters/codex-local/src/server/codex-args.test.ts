@@ -4,14 +4,14 @@ import { resolveCodexLocalCliPolicy } from "../index.js";
 
 describe("buildCodexExecArgs", () => {
   it.each([
-    { config: { extraArgs: ["--sandbox", "read-only"] }, bypass: false, args: ["exec", "--json", "--sandbox", "read-only", "-"] },
-    { config: { args: ["-c", "approval_policy=on-request"] }, bypass: false, args: ["exec", "--json", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "-c", "approval_policy=on-request", "-"] },
-    { config: { extraArgs: [], args: ["--profile", "restricted"] }, bypass: false, args: ["exec", "--json", "--profile", "restricted", "-"] },
-    { config: { extraArgs: [0, null], args: ["--sandbox", "read-only"] }, bypass: false, args: ["exec", "--json", "--sandbox", "read-only", "-"] },
-    { config: { extraArgs: ["--color", "never"], args: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--color", "never", "-"] },
-    { config: { dangerouslyBypassApprovalsAndSandbox: true, extraArgs: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only", "-"] },
-    { config: { dangerouslyBypassSandbox: true, args: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only", "-"] },
-    { config: { dangerouslyBypassApprovalsAndSandbox: false, dangerouslyBypassSandbox: true, extraArgs: ["--color", "never"] }, bypass: false, args: ["exec", "--json", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "--color", "never", "-"] },
+    { config: { extraArgs: ["--sandbox", "read-only"] }, bypass: false, args: ["exec", "--json", "--sandbox", "read-only", "-c", "features.apps=false", "-"] },
+    { config: { args: ["-c", "approval_policy=on-request"] }, bypass: false, args: ["exec", "--json", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "-c", "approval_policy=on-request", "-c", "features.apps=false", "-"] },
+    { config: { extraArgs: [], args: ["--profile", "restricted"] }, bypass: false, args: ["exec", "--json", "--profile", "restricted", "-c", "features.apps=false", "-"] },
+    { config: { extraArgs: [0, null], args: ["--sandbox", "read-only"] }, bypass: false, args: ["exec", "--json", "--sandbox", "read-only", "-c", "features.apps=false", "-"] },
+    { config: { extraArgs: ["--color", "never"], args: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--color", "never", "-c", "features.apps=false", "-"] },
+    { config: { dangerouslyBypassApprovalsAndSandbox: true, extraArgs: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only", "-c", "features.apps=false", "-"] },
+    { config: { dangerouslyBypassSandbox: true, args: ["--sandbox", "read-only"] }, bypass: true, args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only", "-c", "features.apps=false", "-"] },
+    { config: { dangerouslyBypassApprovalsAndSandbox: false, dangerouslyBypassSandbox: true, extraArgs: ["--color", "never"] }, bypass: false, args: ["exec", "--json", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true", "--color", "never", "-c", "features.apps=false", "-"] },
   ])("keeps the browser policy and exact execution arguments consistent for $config", ({ config, bypass, args }) => {
     expect(resolveCodexLocalCliPolicy(config).bypass).toBe(bypass);
     expect(buildCodexExecArgs(config).args).toEqual(args);
@@ -46,6 +46,8 @@ describe("buildCodexExecArgs", () => {
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -84,6 +86,8 @@ describe("buildCodexExecArgs", () => {
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -107,6 +111,8 @@ describe("buildCodexExecArgs", () => {
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -130,6 +136,8 @@ describe("buildCodexExecArgs", () => {
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -150,6 +158,8 @@ describe("buildCodexExecArgs", () => {
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -171,6 +181,8 @@ describe("buildCodexExecArgs", () => {
       "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-5",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -189,6 +201,8 @@ describe("buildCodexExecArgs", () => {
       "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-5.4-mini",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -208,6 +222,8 @@ describe("buildCodexExecArgs", () => {
       "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-5.5",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -229,6 +245,8 @@ describe("buildCodexExecArgs", () => {
       "--model",
       "gpt-5.5",
       "--skip-git-repo-check",
+      "-c",
+      "features.apps=false",
       "-",
     ]);
   });
@@ -274,7 +292,7 @@ describe("buildCodexExecArgs", () => {
     const { args } = buildCodexExecArgs({ extraArgs });
     expect(args).not.toContain('sandbox_mode="workspace-write"');
     expect(args).not.toContain("sandbox_workspace_write.network_access=true");
-    expect(args).toEqual(["exec", "--json", ...extraArgs, "-"]);
+    expect(args).toEqual(["exec", "--json", ...extraArgs, "-c", "features.apps=false", "-"]);
   });
 
   it("preserves an explicit network denial after defaults", () => {
@@ -290,7 +308,17 @@ describe("buildCodexExecArgs", () => {
 
   it("preserves the existing explicit bypass configuration", () => {
     const { args } = buildCodexExecArgs({ dangerouslyBypassApprovalsAndSandbox: true });
-    expect(args).toEqual(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-"]);
+    expect(args).toEqual(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-c", "features.apps=false", "-"]);
+  });
+
+  it("always disables cloud connectors via -c features.apps=false even with empty or custom extraArgs", () => {
+    const empty = buildCodexExecArgs({});
+    expect(empty.args.slice(-3)).toEqual(["-c", "features.apps=false", "-"]);
+
+    const custom = buildCodexExecArgs({ extraArgs: ["--color", "never", "-c", "features.apps=true"] });
+    expect(custom.args.lastIndexOf("features.apps=false"))
+      .toBeGreaterThan(custom.args.indexOf("features.apps=true"));
+    expect(custom.args.slice(-3)).toEqual(["-c", "features.apps=false", "-"]);
   });
 
 });
