@@ -203,14 +203,88 @@ export interface InspectLeaseInput {
   /** Workload resource name (Sandbox CR name or Job name) == providerLeaseId. */
   name: string;
   backend: "sandbox-cr" | "job";
-  /** The lease's pod, when known; checked when the workload is already gone. */
+  /** The lease's pod, when known; checked when the workload is already gone or terminal. */
   podName: string | null;
 }
 
+type JobStatusBody = {
+  status?: {
+    active?: number;
+    terminating?: number;
+    succeeded?: number;
+    failed?: number;
+    conditions?: Array<{
+      type?: string;
+      status?: string;
+    }>;
+  };
+};
+
+type PodLike = {
+  metadata?: {
+    name?: string;
+    deletionTimestamp?: unknown;
+  };
+  status?: {
+    phase?: string;
+    containerStatuses?: Array<{ state?: { running?: unknown } }>;
+    initContainerStatuses?: Array<{ state?: { running?: unknown } }>;
+  };
+};
+
+function isPodTerminallyStopped(pod: PodLike): boolean {
+  const phase = pod.status?.phase;
+  if (phase !== "Succeeded" && phase !== "Failed") return false;
+  const statuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? []),
+  ];
+  if (statuses.some((status) => Boolean(status.state?.running))) return false;
+  return true;
+}
+
+async function listPodsForJob(
+  clients: KubeClients,
+  namespace: string,
+  jobName: string,
+): Promise<PodLike[]> {
+  try {
+    const result = await clients.core.listNamespacedPod({
+      namespace,
+      labelSelector: `job-name=${jobName}`,
+    });
+    const items = (result as { items?: PodLike[] } | null | undefined)?.items;
+    return Array.isArray(items) ? items : [];
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return [];
+    throw err;
+  }
+}
+
+async function readPodIfPresent(
+  clients: KubeClients,
+  namespace: string,
+  podName: string,
+): Promise<PodLike | null> {
+  try {
+    return (await clients.core.readNamespacedPod({
+      namespace,
+      name: podName,
+    })) as PodLike | null;
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return null;
+    throw err;
+  }
+}
+
 /**
- * Read-only observation of a lease's Kubernetes workload and backing pod.
- * Returns `"destroyed"` only when both the workload and any recorded pod return
- * 404 (so nothing of the lease can still execute). Non-404 API errors propagate.
+ * Read-only observation of a lease's Kubernetes workload and backing pod(s).
+ * Returns `"destroyed"` only when both the workload and any backing pods return
+ * 404 / empty (so nothing of the lease can still execute). For the Job backend,
+ * returns `"stopped"` only when the Job carries an authoritative terminal
+ * condition (`Complete=True` or `Failed=True`), reports `active === 0` and
+ * `terminating === 0`, and backing pod inspection confirms no pod can still
+ * execute. Otherwise fails closed with `"active"`. Non-404 API errors propagate.
  */
 export async function inspectLeaseResources(
   clients: KubeClients,
@@ -226,37 +300,58 @@ export async function inspectLeaseResources(
     }
     if (workloadPresent) return "active";
     if (input.podName) {
-      try {
-        await clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName });
-        return "active";
-      } catch (err) {
-        if (!isKubeNotFoundError(err)) throw err;
-      }
+      const recordedPod = await readPodIfPresent(clients, input.namespace, input.podName);
+      if (recordedPod) return "active";
     }
     return "destroyed";
   }
 
-  let jobStatus: { phase: string } | null = null;
+  let job: JobStatusBody | null = null;
   try {
-    jobStatus = await getJobStatus(clients, input.namespace, input.name);
+    job = (await clients.batch.readNamespacedJobStatus({
+      namespace: input.namespace,
+      name: input.name,
+    })) as JobStatusBody | null;
   } catch (err) {
     if (!isKubeNotFoundError(err)) throw err;
   }
-  if (!jobStatus) {
+  if (!job) {
     if (input.podName) {
-      try {
-        await clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName });
-        return "active";
-      } catch (err) {
-        if (!isKubeNotFoundError(err)) throw err;
-      }
+      const recordedPod = await readPodIfPresent(clients, input.namespace, input.podName);
+      if (recordedPod) return "active";
     }
+    const listedPods = await listPodsForJob(clients, input.namespace, input.name);
+    if (listedPods.length > 0) return "active";
     return "destroyed";
   }
-  if (jobStatus.phase === "Succeeded" || jobStatus.phase === "Failed") {
-    return "stopped";
+
+  const status = job.status ?? {};
+  const conditions = Array.isArray(status.conditions) ? status.conditions : [];
+  const hasTerminalCondition = conditions.some(
+    (c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True",
+  );
+  const active = typeof status.active === "number" ? status.active : 0;
+  const terminating = typeof status.terminating === "number" ? status.terminating : 0;
+  if (!hasTerminalCondition || active !== 0 || terminating !== 0) {
+    return "active";
   }
-  return "active";
+
+  const listedPods = await listPodsForJob(clients, input.namespace, input.name);
+  if (listedPods.some((pod) => !isPodTerminallyStopped(pod))) {
+    return "active";
+  }
+
+  if (
+    input.podName &&
+    !listedPods.some((pod) => pod.metadata?.name === input.podName)
+  ) {
+    const recordedPod = await readPodIfPresent(clients, input.namespace, input.podName);
+    if (recordedPod && !isPodTerminallyStopped(recordedPod)) {
+      return "active";
+    }
+  }
+
+  return "stopped";
 }
 
 export interface DestroyLeaseInput {

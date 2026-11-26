@@ -421,4 +421,294 @@ describe("onEnvironmentInspectLease", () => {
       leaseMetadata: leaseMetadata(),
     })).rejects.toThrow("forbidden");
   });
+
+  describe("job backend", () => {
+    const JOB_CONFIG = { inCluster: true, backend: "job" };
+    const jobLeaseMetadata = (overrides: Record<string, unknown> = {}) =>
+      leaseMetadata({
+        jobName: "pc-job",
+        podName: "pc-job-pod",
+        secretName: "pc-job-env",
+        backend: "job",
+        ...overrides,
+      });
+
+    it("reports active for a retrying Job with { active: 1, failed: 1 } and a Running pod", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: { active: 1, failed: 1 },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [{ metadata: { name: "pc-job-pod" }, status: { phase: "Running" } }],
+          }),
+          readNamespacedPod: vi.fn().mockResolvedValue({
+            metadata: { name: "pc-job-pod" },
+            status: { phase: "Running" },
+          }),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports active for a Job with { active: 1, succeeded: 1 } and no authoritative Complete condition", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: { active: 1, succeeded: 1, conditions: [] },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [{ metadata: { name: "pc-job-pod" }, status: { phase: "Running" } }],
+          }),
+          readNamespacedPod: vi.fn().mockResolvedValue({
+            metadata: { name: "pc-job-pod" },
+            status: { phase: "Running" },
+          }),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports active for a Job with { active: 0, failed: 1 } and no authoritative terminal condition (backoff pending)", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: { active: 0, failed: 1, conditions: [] },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [{ metadata: { name: "pc-job-pod" }, status: { phase: "Failed" } }],
+          }),
+          readNamespacedPod: vi.fn().mockResolvedValue({
+            metadata: { name: "pc-job-pod" },
+            status: { phase: "Failed" },
+          }),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports active when Job has Failed=True and active: 0 but terminating > 0", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: {
+              active: 0,
+              terminating: 1,
+              failed: 1,
+              conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }],
+            },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+          readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports active when Job has Failed=True and active: 0 but a backing pod is still Running/Terminating", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: {
+              active: 0,
+              failed: 1,
+              conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }],
+            },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [
+              {
+                metadata: { name: "pc-job-pod", deletionTimestamp: "2026-11-26T00:00:00Z" },
+                status: { phase: "Running" },
+              },
+            ],
+          }),
+          readNamespacedPod: vi.fn().mockResolvedValue({
+            metadata: { name: "pc-job-pod", deletionTimestamp: "2026-11-26T00:00:00Z" },
+            status: { phase: "Running" },
+          }),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports active when Job has Failed=True and active: 0 but the recorded pod (not in label list) is still Pending or Unknown", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: {
+              active: 0,
+              failed: 1,
+              conditions: [{ type: "Failed", status: "True" }],
+            },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+          readNamespacedPod: vi.fn().mockResolvedValue({
+            metadata: { name: "pc-job-pod" },
+            status: { phase: "Unknown" },
+          }),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+
+    it("reports stopped when Job has Complete=True, active: 0, and backing pod is Succeeded", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: {
+              active: 0,
+              succeeded: 1,
+              conditions: [{ type: "Complete", status: "True" }],
+            },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [{ metadata: { name: "pc-job-pod" }, status: { phase: "Succeeded" } }],
+          }),
+          readNamespacedPod: vi.fn(),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "stopped" });
+    });
+
+    it("reports stopped when Job has Failed=True, active: 0, and backing pods are Failed or already 404", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockResolvedValue({
+            status: {
+              failed: 1,
+              conditions: [{ type: "Failed", status: "True", reason: "BackoffLimitExceeded" }],
+            },
+          }),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+          readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "stopped" });
+    });
+
+    it("reports destroyed when both the Job and its backing pods are gone (404 / empty)", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockRejectedValue(notFound()),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+          readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "destroyed" });
+    });
+
+    it("reports active when the Job returns 404 but a backing pod still exists", async () => {
+      h.clients = {
+        batch: {
+          readNamespacedJobStatus: vi.fn().mockRejectedValue(notFound()),
+        },
+        core: {
+          listNamespacedPod: vi.fn().mockResolvedValue({
+            items: [{ metadata: { name: "pc-job-retry" }, status: { phase: "Running" } }],
+          }),
+          readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        },
+      };
+
+      await expect(plugin.definition.onEnvironmentInspectLease!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: JOB_CONFIG,
+        providerLeaseId: "pc-job",
+        leaseMetadata: jobLeaseMetadata(),
+      })).resolves.toEqual({ providerLeaseId: "pc-job", state: "active" });
+    });
+  });
 });
