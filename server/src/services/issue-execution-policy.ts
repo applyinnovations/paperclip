@@ -146,6 +146,31 @@ function blankExecutionState(): IssueExecutionState {
     lastDecisionId: null,
     lastDecisionOutcome: null,
     monitor: null,
+    cycleDecisionIds: [],
+  };
+}
+
+function inheritCycleDecisionIds(previous: IssueExecutionState | null): string[] | undefined {
+  if (!previous || previous.status === "idle") return [];
+  if (previous.cycleDecisionIds !== undefined) return [...previous.cycleDecisionIds];
+  if (previous.completedStageIds.length === 0) return [];
+  return undefined;
+}
+
+export function withRecordedExecutionDecision(
+  state: IssueExecutionState,
+  decisionId: string,
+): IssueExecutionState {
+  const cycleDecisionIds =
+    state.cycleDecisionIds !== undefined
+      ? Array.from(new Set([...state.cycleDecisionIds, decisionId]))
+      : state.completedStageIds.length <= 1
+        ? [decisionId]
+        : undefined;
+  return {
+    ...state,
+    lastDecisionId: decisionId,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -531,6 +556,7 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
 
 function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
   const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
+  const cycleDecisionIds = inheritCycleDecisionIds(previous);
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -545,6 +571,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
     ...(previous?.completionRequested !== undefined ? { completionRequested: previous.completionRequested } : {}),
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -553,6 +580,7 @@ function buildStateWithCompletedStages(input: {
   completedStageIds: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: input.previous?.status ?? PENDING_STATUS,
     currentStageId: input.previous?.currentStageId ?? null,
@@ -565,6 +593,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -573,6 +602,7 @@ function buildSkippedStageCompletedState(input: {
   completedStageIds: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -585,6 +615,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -599,6 +630,7 @@ function buildPendingState(input: {
   completionRequested?: boolean;
 }): IssueExecutionState {
   const completionRequested = input.completionRequested ?? input.previous?.completionRequested;
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: PENDING_STATUS,
     currentStageId: input.stage.id,
@@ -613,6 +645,7 @@ function buildPendingState(input: {
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     ...(completionRequested !== undefined ? { completionRequested } : {}),
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -736,6 +769,7 @@ function decisionTimestampMs(value: Date | string | null | undefined): number {
 export function evaluateExecutionPolicyStageSatisfaction(input: {
   policy: IssueExecutionPolicy | null | undefined;
   decisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  executionState?: IssueExecutionState | null;
   pendingDecision?: Pick<IssueExecutionDecision, "stageId" | "outcome"> | null;
 }): {
   satisfied: boolean;
@@ -746,7 +780,29 @@ export function evaluateExecutionPolicyStageSatisfaction(input: {
     return { satisfied: true, unsatisfiedStages: [] };
   }
 
-  const orderedPersisted = input.decisions
+  let scopedPersistedDecisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  if (input.executionState === undefined) {
+    scopedPersistedDecisions = input.decisions;
+  } else if (input.executionState === null || input.executionState.status === "idle") {
+    // No stages have been completed in the current review cycle (for example a
+    // fresh issue or an issue reopened from done/cancelled). Historical rows in
+    // `issue_execution_decisions` from previous cycles must not satisfy it.
+    scopedPersistedDecisions = [];
+  } else if (Array.isArray(input.executionState.cycleDecisionIds)) {
+    const cycleDecisionIds = new Set(input.executionState.cycleDecisionIds);
+    scopedPersistedDecisions = input.decisions.filter(
+      (decision) => typeof decision.id === "string" && cycleDecisionIds.has(decision.id),
+    );
+  } else {
+    // Legacy state persisted before `cycleDecisionIds` existed: only stages
+    // recorded as completed in this execution state may draw on persisted rows.
+    const completedStageIds = new Set(input.executionState.completedStageIds);
+    scopedPersistedDecisions = input.decisions.filter((decision) =>
+      completedStageIds.has(decision.stageId),
+    );
+  }
+
+  const orderedPersisted = scopedPersistedDecisions
     .map((decision, index) => ({ decision, index }))
     .sort((left, right) => {
       const timeDiff =

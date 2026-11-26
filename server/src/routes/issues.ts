@@ -25,7 +25,7 @@ import { enqueueFastResponse } from "../services/fast-responses.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, isMonitorOnlyExecutionPolicyBody, summarizeIssueMonitor } from "../services/issue-monitors.js";
-import type { IssuePrivacyConstraints } from "@paperclipai/shared";
+import type { IssueExecutionState, IssuePrivacyConstraints } from "@paperclipai/shared";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
   childCreatedByRequest,
@@ -365,10 +365,12 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   getRequiredExecutionStages,
+  hasRemovedRequiredExecutionStages,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  withRecordedExecutionDecision,
 } from "../services/issue-execution-policy.js";
 import {
   assertAgentExecutionPolicyStagesNotRemoved,
@@ -10719,10 +10721,10 @@ export function issueRoutes(
                   "Execution policy decision patch is missing executionState",
                 );
               }
-              updateFields.executionState = {
-                ...nextExecutionState,
-                lastDecisionId: decisionId,
-              };
+              updateFields.executionState = withRecordedExecutionDecision(
+                nextExecutionState as IssueExecutionState,
+                decisionId,
+              );
               await recordIssueExecutionDecision(tx as unknown as Db, {
                 id: decisionId,
                 companyId: lockedIssue.companyId,
@@ -14978,12 +14980,31 @@ export function issueRoutes(
         existing.assigneeAgentId,
         req.body.executionPolicy !== undefined && monitorChanged,
       );
+      const existingExecutionState = parseIssueExecutionState(
+        existing.executionState,
+      );
+      const reopeningFromTerminal =
+        (existing.status === "done" || existing.status === "cancelled") &&
+        typeof updateFields.status === "string" &&
+        updateFields.status !== "done" &&
+        updateFields.status !== "cancelled";
+      const currentCycleExecutionState = reopeningFromTerminal
+        ? null
+        : existingExecutionState;
+      const agentRemovingExecutionPolicyStages =
+        req.actor.type === "agent" &&
+        req.body.executionPolicy !== undefined &&
+        hasRemovedRequiredExecutionStages(
+          previousExecutionPolicy,
+          nextExecutionPolicy,
+        ).length > 0;
       if (req.actor.type === "agent" && req.body.executionPolicy !== undefined) {
         await assertAgentExecutionPolicyStagesNotRemoved(db, {
           companyId: existing.companyId,
           issueId: existing.id,
           previousPolicy: previousExecutionPolicy,
           nextPolicy: nextExecutionPolicy,
+          executionState: currentCycleExecutionState,
         });
       }
 
@@ -15023,10 +15044,10 @@ export function issueRoutes(
             "Execution policy decision patch is missing executionState",
           );
         }
-        transition.patch.executionState = {
-          ...nextExecutionState,
-          lastDecisionId: decisionId,
-        };
+        transition.patch.executionState = withRecordedExecutionDecision(
+          nextExecutionState as IssueExecutionState,
+          decisionId,
+        );
       }
       if (expectedExecutionPolicy !== undefined && (
         (transition.patch.status !== undefined && transition.patch.status !== existing.status) ||
@@ -15041,7 +15062,7 @@ export function issueRoutes(
       const plannedNextExecutionState =
         updateFields.executionState !== undefined
           ? parseIssueExecutionState(updateFields.executionState)
-          : parseIssueExecutionState(existing.executionState);
+          : existingExecutionState;
       const requiredStagesPolicy =
         getRequiredExecutionStages(nextExecutionPolicy).length > 0
           ? nextExecutionPolicy
@@ -15056,6 +15077,7 @@ export function issueRoutes(
           companyId: existing.companyId,
           issueId: existing.id,
           policy: requiredStagesPolicy,
+          executionState: currentCycleExecutionState,
           pendingDecision: transition.decision ?? null,
         });
       }
@@ -15596,7 +15618,8 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested ||
-        agentCompletingGatedIssue;
+        agentCompletingGatedIssue ||
+        agentRemovingExecutionPolicyStages;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
@@ -15605,7 +15628,10 @@ export function issueRoutes(
               !(await assertLockedReviewPolicyAllowsMutation(tx))
             )
               return null;
-            if (agentCompletingGatedIssue) {
+            if (
+              agentCompletingGatedIssue ||
+              agentRemovingExecutionPolicyStages
+            ) {
               const lockedIssue = await svc.getByIdForUpdate(id, tx);
               if (!lockedIssue) return null;
               const lockedPreviousPolicy = normalizeIssueExecutionPolicy(
@@ -15615,19 +15641,43 @@ export function issueRoutes(
                 updateFields.executionPolicy !== undefined
                   ? normalizeIssueExecutionPolicy(updateFields.executionPolicy)
                   : lockedPreviousPolicy;
-              const lockedRequiredPolicy =
-                getRequiredExecutionStages(lockedNextPolicy).length > 0
-                  ? lockedNextPolicy
-                  : lockedPreviousPolicy;
-              await assertAgentExecutionPolicyStagesSatisfied(
-                tx as unknown as Db,
-                {
-                  companyId: lockedIssue.companyId,
-                  issueId: lockedIssue.id,
-                  policy: lockedRequiredPolicy,
-                  pendingDecision: decision ?? null,
-                },
-              );
+              const lockedReopeningFromTerminal =
+                (lockedIssue.status === "done" ||
+                  lockedIssue.status === "cancelled") &&
+                typeof updateFields.status === "string" &&
+                updateFields.status !== "done" &&
+                updateFields.status !== "cancelled";
+              const lockedCycleExecutionState = lockedReopeningFromTerminal
+                ? null
+                : parseIssueExecutionState(lockedIssue.executionState);
+              if (agentRemovingExecutionPolicyStages) {
+                await assertAgentExecutionPolicyStagesNotRemoved(
+                  tx as unknown as Db,
+                  {
+                    companyId: lockedIssue.companyId,
+                    issueId: lockedIssue.id,
+                    previousPolicy: lockedPreviousPolicy,
+                    nextPolicy: lockedNextPolicy,
+                    executionState: lockedCycleExecutionState,
+                  },
+                );
+              }
+              if (agentCompletingGatedIssue) {
+                const lockedRequiredPolicy =
+                  getRequiredExecutionStages(lockedNextPolicy).length > 0
+                    ? lockedNextPolicy
+                    : lockedPreviousPolicy;
+                await assertAgentExecutionPolicyStagesSatisfied(
+                  tx as unknown as Db,
+                  {
+                    companyId: lockedIssue.companyId,
+                    issueId: lockedIssue.id,
+                    policy: lockedRequiredPolicy,
+                    executionState: lockedCycleExecutionState,
+                    pendingDecision: decision ?? null,
+                  },
+                );
+              }
             }
             const updated = await updateIssue(tx);
             if (!updated) return null;
@@ -19803,10 +19853,10 @@ export function issueRoutes(
               "Execution policy decision patch is missing executionState",
             );
           }
-          transition.patch.executionState = {
-            ...nextExecutionState,
-            lastDecisionId: decisionId,
-          };
+          transition.patch.executionState = withRecordedExecutionDecision(
+            nextExecutionState as IssueExecutionState,
+            decisionId,
+          );
         }
 
         issueBeforeCommentDecision = currentIssue;
@@ -19855,6 +19905,7 @@ export function issueRoutes(
                   companyId: currentIssue.companyId,
                   issueId: currentIssue.id,
                   policy: currentExecutionPolicy,
+                  executionState: currentExecutionState,
                   pendingDecision: transition.decision ?? null,
                 },
               );

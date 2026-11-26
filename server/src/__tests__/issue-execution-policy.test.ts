@@ -6,6 +6,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   stripMonitorFromExecutionPolicy,
+  withRecordedExecutionDecision,
 } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "../../../ui/src/lib/issue-execution-policy.ts";
@@ -2753,5 +2754,182 @@ describe("mandatory structured review decisions", () => {
     expect(hasRemovedRequiredExecutionStages(policy, withMonitor)).toEqual([]);
     expect(hasRemovedRequiredExecutionStages(policy, null)).toHaveLength(1);
     expect(hasRemovedRequiredExecutionStages(policy, reviewOnlyPolicy())).toHaveLength(1);
+  });
+
+  it("binds stage satisfaction strictly to the current review cycle and ignores previous-cycle approvals", () => {
+    const cycle1DecisionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const cycle1SecondDecisionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+    const cycle2DecisionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
+    const cycle2SecondDecisionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const t1 = new Date("2026-11-26T01:00:00.000Z");
+    const t2 = new Date("2026-11-26T02:00:00.000Z");
+    const t3 = new Date("2026-11-26T03:00:00.000Z");
+    const t4 = new Date("2026-11-26T04:00:00.000Z");
+
+    // Reopened issue (executionState === null) must reject historical approvals from Cycle 1.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [{ id: cycle1DecisionId, stageId, outcome: "approved", createdAt: t1 }],
+        executionState: null,
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsNeeded: 1, approvalsRecorded: 0, lastOutcome: null }],
+    });
+
+    // Idle state (e.g., reopened issue with retained cleared monitor state) also rejects historical approvals.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [{ id: cycle1DecisionId, stageId, outcome: "approved", createdAt: t1 }],
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          cycleDecisionIds: [],
+        },
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsNeeded: 1, approvalsRecorded: 0, lastOutcome: null }],
+    });
+
+    // Starting a new review cycle initializes cycleDecisionIds: [] and rejects Cycle 1 approvals.
+    const started = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+    const pendingState = started.patch.executionState as IssueExecutionState;
+    expect(pendingState.cycleDecisionIds).toEqual([]);
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [{ id: cycle1DecisionId, stageId, outcome: "approved", createdAt: t1 }],
+        executionState: pendingState,
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsRecorded: 0, lastOutcome: null }],
+    });
+
+    // Recording a new approval in Cycle 2 attaches its ID to cycleDecisionIds and satisfies the stage.
+    const approved = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: pendingState,
+      },
+      policy,
+      decision: "approve",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Approved in cycle 2.\n\nReviewed-SHA: 0123456789abcdef0123456789abcdef01234567",
+    });
+    const completedState = withRecordedExecutionDecision(
+      approved.patch.executionState as IssueExecutionState,
+      cycle2DecisionId,
+    );
+    expect(completedState.cycleDecisionIds).toEqual([cycle2DecisionId]);
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy,
+        decisions: [
+          { id: cycle1DecisionId, stageId, outcome: "approved", createdAt: t1 },
+          { id: cycle2DecisionId, stageId, outcome: "approved", createdAt: t3 },
+        ],
+        executionState: completedState,
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // Multi-approval (approvalsNeeded: 2) after reopen requires 2 fresh approvals in Cycle 2
+    // and never mixes Cycle 1 approvals with Cycle 2 approvals.
+    const twoApprovalPolicy = {
+      ...policy,
+      stages: [{ ...policy.stages[0], approvalsNeeded: 2 as unknown as 1 }],
+    };
+    const historicalTwo = [
+      { id: cycle1DecisionId, stageId, outcome: "approved", createdAt: t1 },
+      { id: cycle1SecondDecisionId, stageId, outcome: "approved", createdAt: t2 },
+    ];
+
+    // 2 old + 1 new pending = 1 < 2 -> unsatisfied.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoApprovalPolicy,
+        decisions: historicalTwo,
+        executionState: pendingState,
+        pendingDecision: { stageId, outcome: "approved" },
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsNeeded: 2, approvalsRecorded: 1, lastOutcome: "approved" }],
+    });
+
+    // 2 old + 1 persisted in Cycle 2 = 1 < 2 -> unsatisfied.
+    const oneCycle2State: IssueExecutionState = {
+      ...pendingState,
+      cycleDecisionIds: [cycle2DecisionId],
+    };
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoApprovalPolicy,
+        decisions: [
+          ...historicalTwo,
+          { id: cycle2DecisionId, stageId, outcome: "approved", createdAt: t3 },
+        ],
+        executionState: oneCycle2State,
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [{ stageId, approvalsNeeded: 2, approvalsRecorded: 1, lastOutcome: "approved" }],
+    });
+
+    // 1 persisted in Cycle 2 + 1 pending in Cycle 2 = 2 -> satisfied.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoApprovalPolicy,
+        decisions: [
+          ...historicalTwo,
+          { id: cycle2DecisionId, stageId, outcome: "approved", createdAt: t3 },
+        ],
+        executionState: oneCycle2State,
+        pendingDecision: { stageId, outcome: "approved" },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // 2 persisted in Cycle 2 = 2 -> satisfied.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoApprovalPolicy,
+        decisions: [
+          ...historicalTwo,
+          { id: cycle2DecisionId, stageId, outcome: "approved", createdAt: t3 },
+          { id: cycle2SecondDecisionId, stageId, outcome: "approved", createdAt: t4 },
+        ],
+        executionState: {
+          ...completedState,
+          cycleDecisionIds: [cycle2DecisionId, cycle2SecondDecisionId],
+        },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
   });
 });

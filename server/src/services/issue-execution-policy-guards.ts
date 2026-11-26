@@ -1,7 +1,11 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueExecutionDecisions } from "@paperclipai/db";
-import type { IssueExecutionDecision, IssueExecutionPolicy } from "@paperclipai/shared";
+import type {
+  IssueExecutionDecision,
+  IssueExecutionPolicy,
+  IssueExecutionState,
+} from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import {
   evaluateExecutionPolicyStageSatisfaction,
@@ -68,6 +72,7 @@ export async function assertAgentExecutionPolicyStagesSatisfied(
     companyId: string;
     issueId: string;
     policy: IssueExecutionPolicy | null;
+    executionState: IssueExecutionState | null;
     pendingDecision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome"> | null;
   },
 ): Promise<void> {
@@ -81,6 +86,7 @@ export async function assertAgentExecutionPolicyStagesSatisfied(
   const evaluation = evaluateExecutionPolicyStageSatisfaction({
     policy: input.policy,
     decisions: recorded,
+    executionState: input.executionState,
     pendingDecision: input.pendingDecision ?? null,
   });
 
@@ -103,6 +109,7 @@ export async function assertAgentExecutionPolicyStagesNotRemoved(
     issueId: string;
     previousPolicy: IssueExecutionPolicy | null;
     nextPolicy: IssueExecutionPolicy | null;
+    executionState: IssueExecutionState | null;
   },
 ): Promise<void> {
   const removedStages = hasRemovedRequiredExecutionStages(
@@ -119,6 +126,7 @@ export async function assertAgentExecutionPolicyStagesNotRemoved(
   const evaluation = evaluateExecutionPolicyStageSatisfaction({
     policy: { ...input.previousPolicy, stages: removedStages },
     decisions: recorded,
+    executionState: input.executionState,
   });
 
   if (!evaluation.satisfied) {

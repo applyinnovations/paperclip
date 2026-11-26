@@ -1935,5 +1935,132 @@ describe("issue execution policy routes", () => {
         expect.any(Array),
       );
     });
+
+    it("rejects agent policy stripping and direct completion after reopen even when a prior cycle recorded an approved decision", async () => {
+      const policy = reviewStagePolicy();
+      const reopenedIssue = {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: executorAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1025",
+        title: "Reopened issue with prior-cycle approval",
+        executionPolicy: policy,
+        executionState: null,
+      };
+      const priorCycleApproved = [
+        {
+          id: "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+          stageId: reviewStageId,
+          outcome: "approved",
+          createdAt: new Date("2026-11-25T00:00:00.000Z"),
+        },
+      ];
+      mockIssueService.getById.mockResolvedValue(reopenedIssue);
+      mockAgentRunAndDecisions(executorAgentId, priorCycleApproved);
+
+      // 1. Agent tries to strip executionPolicy after reopen -> 422.
+      const stripOnlyRes = await request(await createApp({
+        type: "agent",
+        agentId: executorAgentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: null });
+
+      expect(stripOnlyRes.status).toBe(422);
+      expect(stripOnlyRes.body.details).toMatchObject({
+        code: "execution_policy_stages_protected",
+        unsatisfiedStages: [
+          expect.objectContaining({
+            stageId: reviewStageId,
+            approvalsRecorded: 0,
+            lastOutcome: null,
+          }),
+        ],
+      });
+
+      // 2. Agent tries to strip executionPolicy AND close done in one PATCH -> 422.
+      const stripAndDoneRes = await request(await createApp({
+        type: "agent",
+        agentId: executorAgentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: null, status: "done" });
+
+      expect(stripAndDoneRes.status).toBe(422);
+      expect(stripAndDoneRes.body.details).toMatchObject({
+        code: "execution_policy_stages_protected",
+      });
+
+      // 3. Reopened self-review stage cannot be closed with PATCH status: done using Cycle 1 approval -> 422.
+      const selfReviewReopened = {
+        ...reopenedIssue,
+        assigneeAgentId: reviewerAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(selfReviewReopened);
+      mockAgentRunAndDecisions(reviewerAgentId, priorCycleApproved);
+
+      const directDoneRes = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "done" });
+
+      expect(directDoneRes.status).toBe(422);
+      expect(directDoneRes.body.details).toMatchObject({
+        code: "unsatisfied_execution_policy_stages",
+        unsatisfiedStages: [
+          expect.objectContaining({
+            stageId: reviewStageId,
+            approvalsRecorded: 0,
+            lastOutcome: null,
+          }),
+        ],
+      });
+
+      // 4. Agent cannot reopen from done and strip executionPolicy in the same PATCH -> 422.
+      const closedIssue = {
+        ...reopenedIssue,
+        status: "done",
+        executionState: {
+          status: "completed",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: { type: "agent", agentId: executorAgentId },
+          completedStageIds: [reviewStageId],
+          lastDecisionId: "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+          lastDecisionOutcome: "approved",
+          cycleDecisionIds: ["dddddddd-dddd-4ddd-8ddd-ddddddddddd1"],
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(closedIssue);
+      mockAgentRunAndDecisions(executorAgentId, priorCycleApproved);
+
+      const reopenAndStripRes = await request(await createApp({
+        type: "agent",
+        agentId: executorAgentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "todo", executionPolicy: null });
+
+      expect(reopenAndStripRes.status).toBe(422);
+      expect(reopenAndStripRes.body.details).toMatchObject({
+        code: "execution_policy_stages_protected",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 });

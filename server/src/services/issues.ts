@@ -11658,6 +11658,16 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (
+          (receiptExisting.status === "done" || receiptExisting.status === "cancelled") &&
+          patch.status &&
+          patch.status !== "done" &&
+          patch.status !== "cancelled" &&
+          issueData.executionState === undefined &&
+          receiptExisting.executionState != null
+        ) {
+          patch.executionState = null;
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {

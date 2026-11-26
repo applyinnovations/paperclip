@@ -20,6 +20,7 @@ import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { setPluginEventBus } from "../services/activity-log.js";
+import { assertAgentExecutionPolicyStagesSatisfied } from "../services/issue-execution-policy-guards.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -503,5 +504,255 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       .send({ status: "done", comment: "Merged and verified." });
     expect(closeRes.status, JSON.stringify(closeRes.body)).toBe(200);
     expect(closeRes.body.status).toBe("done");
+  });
+
+  it("rejects previous-cycle approvals after reopen and requires a fresh structured approval in the new cycle", async () => {
+    const seeded = await seedCompany("XDO");
+    const { issueId, stageId } = await seedPendingReview({ ...seeded, identifier: "XDO-1" });
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      companyIds: [seeded.companyId],
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    };
+
+    // Cycle 1: Reviewer approves the pending review stage, then executor closes the issue.
+    const reviewerRun1 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const approve1Res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "approve",
+        comment: `Cycle 1 approved.\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+      });
+    expect(approve1Res.status, JSON.stringify(approve1Res.body)).toBe(200);
+    expect(approve1Res.body.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [stageId],
+      cycleDecisionIds: [approve1Res.body.executionState.lastDecisionId],
+    });
+    const cycle1DecisionId = approve1Res.body.executionState.lastDecisionId as string;
+
+    const implRun1 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const close1Res = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Cycle 1 delivered." });
+    expect(close1Res.status, JSON.stringify(close1Res.body)).toBe(200);
+    expect(close1Res.body.status).toBe("done");
+
+    // Reopen the closed issue via board PATCH -> clears executionState while retaining policy & Cycle 1 decision row.
+    const reopenRes = await request(app(boardActor))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(reopenRes.status, JSON.stringify(reopenRes.body)).toBe(200);
+    expect(reopenRes.body.status).toBe("todo");
+    expect(reopenRes.body.executionState).toBeNull();
+
+    const decisionsAfterReopen = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisionsAfterReopen).toHaveLength(1);
+    expect(decisionsAfterReopen[0]?.id).toBe(cycle1DecisionId);
+
+    // Agent bypass attempts after reopen must ALL fail against Cycle 1's historical approval.
+    const implRun2 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+
+    const stripOnlyRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null });
+    expect(stripOnlyRes.status, JSON.stringify(stripOnlyRes.body)).toBe(422);
+    expect(stripOnlyRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
+
+    const stripAndDoneRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(stripAndDoneRes.status, JSON.stringify(stripAndDoneRes.body)).toBe(422);
+    expect(stripAndDoneRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
+
+    // Even if the agent moves to done directly, the issue routes into a fresh pending review stage (never closes).
+    const submitCycle2Res = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Cycle 2 fix ready for review." });
+    expect(submitCycle2Res.status, JSON.stringify(submitCycle2Res.body)).toBe(200);
+    expect(submitCycle2Res.body.status).toBe("in_review");
+    expect(submitCycle2Res.body.assigneeAgentId).toBe(seeded.reviewerAgentId);
+    expect(submitCycle2Res.body.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: stageId,
+      completedStageIds: [],
+      cycleDecisionIds: [],
+      completionRequested: true,
+    });
+
+    // While pending in Cycle 2, agent still cannot strip executionPolicy.
+    const stripWhilePendingRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(stripWhilePendingRes.status, JSON.stringify(stripWhilePendingRes.body)).toBe(422);
+
+    // Cycle 2: Reviewer submits a fresh structured approval -> closes issue and records a 2nd approved row.
+    const reviewerRun2 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const approve2Res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "approve",
+        comment: `Cycle 2 approved.\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+      });
+    expect(approve2Res.status, JSON.stringify(approve2Res.body)).toBe(200);
+    expect(approve2Res.body.status).toBe("done");
+    expect(approve2Res.body.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [stageId],
+      lastDecisionOutcome: "approved",
+    });
+    const cycle2DecisionId = approve2Res.body.executionState.lastDecisionId as string;
+    expect(cycle2DecisionId).not.toBe(cycle1DecisionId);
+    expect(approve2Res.body.executionState.cycleDecisionIds).toEqual([cycle2DecisionId]);
+
+    const decisionsAfterCycle2 = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisionsAfterCycle2).toHaveLength(2);
+
+    // Reopening via human comment also resets executionState so Cycle 3 cannot reuse Cycle 2's approval.
+    const commentReopenRes = await request(app(boardActor))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Found one more issue — reopening.", reopen: true });
+    expect(commentReopenRes.status, JSON.stringify(commentReopenRes.body)).toBe(201);
+
+    const [afterCommentReopen] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(afterCommentReopen?.status).toBe("todo");
+    expect(afterCommentReopen?.executionState).toBeNull();
+
+    const implRun3 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const cycle3BypassRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun3)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(cycle3BypassRes.status, JSON.stringify(cycle3BypassRes.body)).toBe(422);
+    expect(cycle3BypassRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
+  });
+
+  it("requires 2 fresh approvals for approvalsNeeded: 2 after reopen without mixing prior-cycle approvals", async () => {
+    const seeded = await seedCompany("XDM2");
+    const { issueId, stageId } = await seedPendingReview({ ...seeded, identifier: "XDM2-1" });
+    const multiApprovalPolicy = {
+      mode: "normal" as const,
+      commentRequired: true,
+      stages: [{
+        id: stageId,
+        type: "review" as const,
+        approvalsNeeded: 2 as unknown as 1,
+        participants: [{ id: randomUUID(), type: "agent" as const, agentId: seeded.reviewerAgentId, userId: null }],
+      }],
+    };
+
+    // Seed 2 historical Cycle 1 approvals in Postgres.
+    const cycle1Ids = [randomUUID(), randomUUID()];
+    await db.insert(issueExecutionDecisions).values(
+      cycle1Ids.map((id, idx) => ({
+        id,
+        companyId: seeded.companyId,
+        issueId,
+        stageId,
+        stageType: "review",
+        actorAgentId: seeded.reviewerAgentId,
+        outcome: "approved",
+        body: `Cycle 1 approval #${idx + 1}\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+        createdAt: new Date(`2026-11-25T0${idx + 1}:00:00.000Z`),
+      })),
+    );
+
+    const freshCycle2State = {
+      status: "pending" as const,
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review" as const,
+      currentParticipant: { type: "agent" as const, agentId: seeded.reviewerAgentId, userId: null },
+      returnAssignee: { type: "agent" as const, agentId: seeded.implementerAgentId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      cycleDecisionIds: [],
+    };
+
+    // Reopened issue with null executionState -> 0 approvals recorded.
+    await expect(
+      assertAgentExecutionPolicyStagesSatisfied(db, {
+        companyId: seeded.companyId,
+        issueId,
+        policy: multiApprovalPolicy,
+        executionState: null,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "unsatisfied_execution_policy_stages",
+        unsatisfiedStages: [expect.objectContaining({ stageId, approvalsNeeded: 2, approvalsRecorded: 0 })],
+      },
+    });
+
+    // 1 fresh pending approval in Cycle 2 does NOT mix with Cycle 1's 2 historical approvals -> 1 < 2 -> 422.
+    await expect(
+      assertAgentExecutionPolicyStagesSatisfied(db, {
+        companyId: seeded.companyId,
+        issueId,
+        policy: multiApprovalPolicy,
+        executionState: freshCycle2State,
+        pendingDecision: { stageId, stageType: "review", outcome: "approved" },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "unsatisfied_execution_policy_stages",
+        unsatisfiedStages: [expect.objectContaining({ stageId, approvalsNeeded: 2, approvalsRecorded: 1 })],
+      },
+    });
+
+    // Persist 1st fresh Cycle 2 approval -> still 1 < 2 without a 2nd Cycle 2 approval.
+    const cycle2Id1 = randomUUID();
+    await db.insert(issueExecutionDecisions).values({
+      id: cycle2Id1,
+      companyId: seeded.companyId,
+      issueId,
+      stageId,
+      stageType: "review",
+      actorAgentId: seeded.reviewerAgentId,
+      outcome: "approved",
+      body: `Cycle 2 approval #1\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+      createdAt: new Date("2026-11-26T01:00:00.000Z"),
+    });
+    const oneCycle2ApprovalState = {
+      ...freshCycle2State,
+      cycleDecisionIds: [cycle2Id1],
+    };
+
+    await expect(
+      assertAgentExecutionPolicyStagesSatisfied(db, {
+        companyId: seeded.companyId,
+        issueId,
+        policy: multiApprovalPolicy,
+        executionState: oneCycle2ApprovalState,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "unsatisfied_execution_policy_stages",
+        unsatisfiedStages: [expect.objectContaining({ stageId, approvalsNeeded: 2, approvalsRecorded: 1 })],
+      },
+    });
+
+    // 2nd fresh Cycle 2 approval (pending) satisfies approvalsNeeded: 2 -> resolves!
+    await expect(
+      assertAgentExecutionPolicyStagesSatisfied(db, {
+        companyId: seeded.companyId,
+        issueId,
+        policy: multiApprovalPolicy,
+        executionState: oneCycle2ApprovalState,
+        pendingDecision: { stageId, stageType: "review", outcome: "approved" },
+      }),
+    ).resolves.toBeUndefined();
   });
 });
