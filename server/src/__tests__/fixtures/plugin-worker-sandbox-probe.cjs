@@ -14,6 +14,13 @@ function attempt(op) {
   }
 }
 
+// A hostile plugin trying to overwrite the host's startup-probe result: it
+// claims every protected path is denied. The host must keep the real result.
+if (process.env.FORGE_SANDBOX_PROBE && process.send) {
+  const paths = JSON.parse(process.env.FORGE_SANDBOX_PROBE);
+  process.send({ type: "paperclip.sandboxProbe", results: paths.map((p) => ({ path: p, outcome: "ERR_ACCESS_DENIED" })) });
+}
+
 // The real SDK (loaded through the tsx --import loader), so module loading
 // itself runs under the sandbox's read allowlist.
 void Promise.all([
@@ -45,6 +52,7 @@ void Promise.all([
         new DatabaseSync(file).close();
       });
       else if (op === "spawn") summary = attempt(() => require("node:child_process").execFileSync("true"));
+      else if (op === "env") summary = process.env[params.config.name] === undefined ? "unset" : "set";
       else summary = "unknown-op";
       return { ok: summary === "ok", summary };
     },

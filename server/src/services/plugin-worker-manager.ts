@@ -22,7 +22,12 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
  */
 
 import { fork, type ChildProcess } from "node:child_process";
-import { planPluginWorkerSandbox, type PluginWorkerSandboxPlan } from "./plugin-worker-sandbox.js";
+import {
+  planPluginWorkerSandbox,
+  PluginWorkerSandboxError,
+  SANDBOX_PROBE_MESSAGE_TYPE,
+  type PluginWorkerSandboxPlan,
+} from "./plugin-worker-sandbox.js";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
@@ -823,6 +828,43 @@ export interface WorkerDiagnostics {
   pendingRequests: number;
   lastCrashAt: number | null;
   nextRestartAt: number | null;
+  /** How the current worker process was sandboxed and what its startup probe saw. */
+  sandbox?: WorkerSandboxReport | null;
+}
+
+/** One protected secret path the startup probe tried to open: `readable` or the error code. */
+export interface SandboxProbeResult {
+  path: string;
+  outcome: string;
+}
+
+export interface WorkerSandboxReport {
+  mode: "enforced" | "disabled";
+  reason?: "operator-opt-out" | "trusted-exception";
+  capability?: string;
+  /** `null` when the probe never reported. */
+  protectedPathProbe: SandboxProbeResult[] | null;
+}
+
+/** How long to wait after initialize for a probe message that has not arrived. */
+const SANDBOX_PROBE_GRACE_MS = 2_000;
+const PROBE_OUTCOME_PATTERN = /^(readable|error|[A-Z][A-Z0-9_]{0,63})$/;
+
+/**
+ * Accept a probe message only if it names exactly the paths the host asked
+ * about, each once, with a well-formed outcome. Anything else is ignored.
+ */
+export function parseSandboxProbeMessage(message: unknown, expectedPaths: readonly string[]): SandboxProbeResult[] | null {
+  if (!message || typeof message !== "object") return null;
+  const { type, results } = message as { type?: unknown; results?: unknown };
+  if (type !== SANDBOX_PROBE_MESSAGE_TYPE || !Array.isArray(results) || results.length !== expectedPaths.length) return null;
+  const parsed: SandboxProbeResult[] = [];
+  for (const [i, entry] of results.entries()) {
+    const { path: probed, outcome } = (entry ?? {}) as { path?: unknown; outcome?: unknown };
+    if (probed !== expectedPaths[i] || typeof outcome !== "string" || !PROBE_OUTCOME_PATTERN.test(outcome)) return null;
+    parsed.push({ path: probed, outcome });
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1002,8 @@ export function createPluginWorkerHandle(
   let status: WorkerStatus = "stopped";
   let startedAt: number | null = null;
   let stderrExcerpt = "";
+  let sandboxReport: WorkerSandboxReport | null = null;
+  let sandboxProbeArrived: Promise<void> = Promise.resolve();
 
   // Pending RPC requests awaiting a response
   const pendingRequests = new Map<string | number, PendingRequest>();
@@ -3102,7 +3146,7 @@ export function createPluginWorkerHandle(
     // plugin-worker-sandbox.ts and PLUGIN_SPEC.md §12.6.
     // Every plan carries the complete execArgv, including --disable-sigusr1.
     const execArgv = sandbox.execArgv;
-    if (sandbox.mode === "enforced") Object.assign(workerEnv, sandbox.env);
+    Object.assign(workerEnv, sandbox.env);
 
     const child = fork(options.entrypointPath, [], {
       stdio: ["pipe", "pipe", "pipe", "ipc"],
@@ -3406,6 +3450,24 @@ export function createPluginWorkerHandle(
 
     const child = spawnProcess(sandbox);
     childProcess = child;
+    const report: WorkerSandboxReport = {
+      mode: sandbox.mode,
+      ...(sandbox.mode === "disabled" ? { reason: sandbox.reason, capability: sandbox.capability } : {}),
+      protectedPathProbe: null,
+    };
+    sandboxReport = report;
+    // The startup probe is the first code the worker runs, so the first probe
+    // message is the probe's own; plugin code may send later ones, which are ignored.
+    sandboxProbeArrived = new Promise<void>((resolve) => {
+      const onMessage = (message: unknown) => {
+        if ((message as { type?: unknown } | null)?.type !== SANDBOX_PROBE_MESSAGE_TYPE) return;
+        child.off("message", onMessage);
+        report.protectedPathProbe = parseSandboxProbeMessage(message, sandbox.probePaths);
+        resolve();
+      };
+      child.on("message", onMessage);
+      child.once("exit", () => resolve());
+    });
     attachStdioHandlers(child);
     startedAt = Date.now();
 
@@ -3437,11 +3499,41 @@ export function createPluginWorkerHandle(
       throw new Error(`Worker initialize failed for "${pluginId}": ${msg}`);
     }
 
+    // Startup probe: a sandboxed worker that can open a protected secret path
+    // means the sandbox failed, so it must not serve. See PLUGIN_SPEC.md §12.6.
+    await Promise.race([sandboxProbeArrived, new Promise((r) => setTimeout(r, SANDBOX_PROBE_GRACE_MS).unref())]);
+    const probe = report.protectedPathProbe;
+    const readable = (probe ?? []).filter((r) => r.outcome === "readable").map((r) => r.path);
+    const sandboxLog = {
+      sandbox: report.mode,
+      sandboxReason: report.reason,
+      sandboxCapability: report.capability,
+      protectedPathProbe: probe ?? "no-report",
+    };
+    if (report.mode === "enforced" && readable.length > 0) {
+      log.error({ pid: child.pid, ...sandboxLog }, "plugin worker sandbox probe failed; refusing to run the worker");
+      await killProcess();
+      setStatus("crashed");
+      throw new PluginWorkerSandboxError(
+        `Refusing to run plugin worker "${pluginId}": its sandbox startup probe could open ` +
+          `protected secret path(s) ${readable.join(", ")}.`,
+      );
+    }
+    // No report is not proof of denial; say so rather than stay silent. The
+    // permission flags still apply, so the worker keeps running.
+    if (probe === null) log.error({ pid: child.pid, ...sandboxLog }, "plugin worker sandbox probe did not report");
+
     // Reset crash counter on successful start
     consecutiveCrashes = 0;
     setStatus("running");
     emitter.emit("ready", { pluginId });
-    log.info({ pid: child.pid }, "worker process started and initialized");
+    log.info({ pid: child.pid, ...sandboxLog }, "worker process started and initialized");
+    if (readable.length > 0) {
+      log.warn(
+        { pid: child.pid, ...sandboxLog, readablePaths: readable },
+        "unsandboxed plugin worker can open protected secret paths",
+      );
+    }
   }
 
   async function stopInternal(): Promise<void> {
@@ -3970,6 +4062,9 @@ export function createPluginWorkerHandle(
         pendingRequests: pendingRequests.size,
         lastCrashAt,
         nextRestartAt,
+        sandbox: sandboxReport
+          ? { ...sandboxReport, protectedPathProbe: sandboxReport.protectedPathProbe?.map((r) => ({ ...r })) ?? null }
+          : null,
       };
     },
   };
