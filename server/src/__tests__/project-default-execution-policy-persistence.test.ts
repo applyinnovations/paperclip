@@ -70,12 +70,79 @@ if (!support.supported) {
     });
   });
 
-  it("skips the default when the caller asks for no stages", async () => {
-    const { companyId, reviewerId } = await fixture();
+  it("skips the default when a board caller asks for no stages, but never for an agent caller", async () => {
+    const { companyId, reviewerId, engineerId } = await fixture();
     const project = await projectService(db).create(companyId, { name: "Build", executionWorkspacePolicy: policyWith(reviewBy(reviewerId)) });
     const issues = issueService(db);
-    const release = await issues.create(companyId, { title: "Release", projectId: project.id, skipProjectDefaultExecutionStages: true });
-    expect((await issues.getById(release.id))?.executionPolicy ?? null).toBeNull();
+
+    const boardRelease = await issues.create(companyId, {
+      title: "Board release",
+      projectId: project.id,
+      createdByUserId: "board-user-1",
+      skipProjectDefaultExecutionStages: true,
+    });
+    expect((await issues.getById(boardRelease.id))?.executionPolicy ?? null).toBeNull();
+
+    const agentAttempt = await issues.create(companyId, {
+      title: "Agent cannot bypass",
+      projectId: project.id,
+      createdByAgentId: engineerId,
+      skipProjectDefaultExecutionStages: true,
+    });
+    expect((await issues.getById(agentAttempt.id))?.executionPolicy).toMatchObject(reviewBy(reviewerId));
+  });
+
+  it("initializes stage 0 cleanly when an issue is created directly in in_review", async () => {
+    const { companyId, reviewerId, engineerId } = await fixture();
+    const project = await projectService(db).create(companyId, {
+      name: "Review Gated",
+      executionWorkspacePolicy: policyWith({
+        mode: "normal",
+        maxReviewRounds: 4,
+        ...reviewBy(reviewerId),
+      }),
+    });
+    const issues = issueService(db);
+
+    const created = await issues.create(companyId, {
+      title: "Directly in review",
+      projectId: project.id,
+      status: "in_review",
+      assigneeAgentId: engineerId,
+      createdByAgentId: engineerId,
+    });
+    const saved = await issues.getById(created.id);
+    expect(saved?.status).toBe("in_review");
+    expect(saved?.assigneeAgentId).toBe(reviewerId);
+    expect(saved?.executionPolicy).toMatchObject({
+      maxReviewRounds: 4,
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    });
+    expect(saved?.executionState).toMatchObject({
+      status: "pending",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+      returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+      completedStageIds: [],
+    });
+
+    const assignedToReviewer = await issues.create(companyId, {
+      title: "Created in review assigned to reviewer",
+      projectId: project.id,
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+    });
+    const savedReviewerIssue = await issues.getById(assignedToReviewer.id);
+    expect(savedReviewerIssue?.status).toBe("in_review");
+    expect(savedReviewerIssue?.assigneeAgentId).toBe(reviewerId);
+    expect(savedReviewerIssue?.executionState).toMatchObject({
+      status: "pending",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+      returnAssignee: null,
+    });
   });
 
   it("applies whether or not isolated workspaces are enabled", async () => {

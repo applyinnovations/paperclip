@@ -3,7 +3,12 @@ import type { AgentRunnerChoice } from "../agent-runner.js";
 import type { AgentEnvConfig } from "./secrets.js";
 import type { RoutineVariable } from "./routine.js";
 import type { IssueCommentAuthorType, PermissionKey } from "../constants.js";
-import type { IssueCommentMetadata, IssueCommentPresentation } from "./issue.js";
+import type {
+  IssueCommentMetadata,
+  IssueCommentPresentation,
+  IssueExecutionPolicy,
+  IssueExecutionStage,
+} from "./issue.js";
 
 export interface CompanyPortabilityInclude {
   company: boolean;
@@ -86,11 +91,16 @@ export interface CompanyPortabilityEmbeddedAssetManifestEntry {
  * `executionWorkspacePolicy.defaultIssueExecutionPolicy` of a project in a
  * package. Participants are agents named by slug and resolved in the importing
  * company, so one package can declare "review by the code-reviewer" for every
- * company built from it.
+ * company built from it. Portable issue execution policy settings (`mode`,
+ * `commentRequired`, `maxReviewRounds`, `requiredQualityReview`,
+ * `reviewPreset`, and portable `authorizationPolicy` settings) travel with
+ * the stages. Non-portable settings (scheduled `monitor` timestamps and
+ * company-scoped `authorizationPolicy.trustBoundary` entity IDs) are omitted.
  */
-export interface CompanyPortabilityProjectDefaultExecutionPolicy {
+export interface CompanyPortabilityProjectDefaultExecutionPolicy
+  extends Partial<Omit<IssueExecutionPolicy, "stages" | "monitor">> {
   stages: Array<{
-    type: "review" | "approval";
+    type: IssueExecutionStage["type"];
     participants: Array<{ agentSlug: string }>;
   }>;
 }

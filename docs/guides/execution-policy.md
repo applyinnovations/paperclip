@@ -271,10 +271,11 @@ PATCH /api/projects/{projectId}
 - `executionWorkspacePolicy` is replaced as a whole on update, so send the
   current policy with the change; omit `defaultIssueExecutionPolicy` (or set it
   to `null`) to remove the default. Existing issues are not changed.
-- To create an issue without them (a release or verification step, say), send
-  `"executionPolicy": null` explicitly on create; omitting the field applies
-  the default. Removing them later by updating the issue's `executionPolicy`
-  works too.
+- Board users can create an issue without them (a release or verification step,
+  say) by sending `"executionPolicy": null` explicitly on create; omitting the
+  field applies the default. Non-board agents always inherit the project's
+  default stages even if they pass `"executionPolicy": null`. Removing stages
+  later by updating the issue's `executionPolicy` works too.
 
 In a company package, declare it in the project's `executionWorkspacePolicy`
 in `.paperclip.yaml`, naming agents by slug; the import resolves each slug in
@@ -292,8 +293,11 @@ projects:
               - agentSlug: code-reviewer
 ```
 
-Export writes the same form. User participants are not portable and are
-omitted with a warning.
+Export writes the same form and preserves portable policy settings (`mode`,
+`commentRequired`, `maxReviewRounds`, `requiredQualityReview`, `reviewPreset`,
+and portable `authorizationPolicy` fields). User participants, scheduled
+`monitor` timestamps, and company-scoped `authorizationPolicy.trustBoundary`
+entity IDs are not portable and are omitted with a warning.
 
 ### Updating execution policy on an existing issue
 

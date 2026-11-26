@@ -39,6 +39,27 @@ describe("normalizeProjectDefaultExecutionPolicy", () => {
     expect(() => normalizeProjectDefaultExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent" }] }] }))
       .toThrow(/Invalid execution policy/);
   });
+
+  it("preserves optional issueExecutionPolicy fields when provided and rejects invalid ones", () => {
+    const normalized = normalizeProjectDefaultExecutionPolicy({
+      mode: "normal",
+      commentRequired: true,
+      maxReviewRounds: 4,
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    });
+    expect(normalized).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      maxReviewRounds: 4,
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    });
+    expect(() => normalizeProjectDefaultExecutionPolicy({
+      maxReviewRounds: -1,
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    })).toThrow(/Invalid execution policy/);
+    expect(() => normalizeProjectDefaultExecutionPolicy("not-an-object"))
+      .toThrow(/Invalid default execution policy/);
+  });
 });
 
 describe("applyProjectDefaultExecutionPolicy", () => {

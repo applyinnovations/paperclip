@@ -1,11 +1,13 @@
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { z } from "zod";
-import { PERMISSION_KEYS } from "../constants.js";
+import { ISSUE_EXECUTION_STAGE_TYPES, PERMISSION_KEYS } from "../constants.js";
 import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  issueExecutionPolicySchema,
 } from "./issue.js";
+import { objectWithoutDefaults } from "./partial.js";
 import { routineVariableSchema } from "./routine.js";
 
 export const portabilityIncludeSchema = z
@@ -111,6 +113,26 @@ export const portabilitySkillManifestEntrySchema = z.object({
     kind: z.string().min(1),
   })).default([]),
 });
+
+export const portabilityProjectDefaultExecutionPolicyStageSchema = z.object({
+  type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
+  participants: z.array(z.object({
+    agentSlug: z.string().min(1),
+  }).strict()).min(1),
+}).strict();
+
+export const portabilityProjectDefaultExecutionPolicySchema = objectWithoutDefaults(
+  issueExecutionPolicySchema,
+)
+  .omit({ monitor: true })
+  .extend({
+    stages: z.array(portabilityProjectDefaultExecutionPolicyStageSchema).max(10),
+  })
+  .strict();
+
+export type PortabilityProjectDefaultExecutionPolicyInput = z.infer<
+  typeof portabilityProjectDefaultExecutionPolicySchema
+>;
 
 export const portabilityProjectManifestEntrySchema = z.object({
   slug: z.string().min(1),
