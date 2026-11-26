@@ -1,5 +1,4 @@
 import { readProcessStartedAt } from "./hot-restart.js";
-import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -56,7 +55,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
-        !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
+        run.executionStage !== "settled" &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }
   // Release an expired owner only after its cancelled execution has stop proof.

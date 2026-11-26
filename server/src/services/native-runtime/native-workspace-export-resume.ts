@@ -107,15 +107,18 @@ export async function settleNativeWorkspaceExportResume(db: Db, lease: Lease, op
   if (!marker) return null;
   const receipt = remoteTerminationReceipt(lease, options.receipt);
   const stopped = receipt?.state === "stopped";
+  const destroyed = receipt?.state === "destroyed";
+  const terminated = stopped || destroyed;
   const now = new Date();
   const [row] = await writeEnvironmentCleanup(db, async tx => {
-    if (stopped) await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+    if (terminated) await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
     return tx.update(environmentLeases).set({
-      status: stopped ? options.status ?? "released" : "pending_cleanup", cleanupStatus: stopped ? "success" : "failed",
+      status: terminated ? options.status ?? "released" : "pending_cleanup", cleanupStatus: terminated ? "success" : "failed",
+      ...(destroyed ? { failureReason: "workspace_source_unavailable" } : {}),
       releasedAt: now, lastUsedAt: now, updatedAt: now,
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination'
-        ${stopped ? sql`- 'nativeWorkspaceExportResume'` : sql``}) || ${JSON.stringify({
-          ...(stopped ? { remoteExecutionTermination: receipt } : {}),
+        ${terminated ? sql`- 'nativeWorkspaceExportResume'` : sql``}) || ${JSON.stringify({
+          ...(terminated ? { remoteExecutionTermination: receipt } : {}),
           pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
         })}::jsonb`,
     }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),

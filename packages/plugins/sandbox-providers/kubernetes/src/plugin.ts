@@ -3,6 +3,8 @@ import { definePlugin, type PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
+  PluginEnvironmentInspectLeaseParams,
+  PluginEnvironmentLeaseObservation,
   PluginEnvironmentTerminationReceipt,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
@@ -41,7 +43,7 @@ import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from ".
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources } from "./lease-lifecycle.js";
+import { checkLeaseResumable, confirmLeaseResourcesGone, destroyLeaseResources, inspectLeaseResources } from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -851,6 +853,37 @@ const plugin = definePlugin({
       backend: leaseBackend,
       podName,
     });
+  },
+
+  async onEnvironmentInspectLease(
+    params: PluginEnvironmentInspectLeaseParams,
+  ): Promise<PluginEnvironmentLeaseObservation> {
+    const config = kubernetesProviderConfigSchema.parse(params.config);
+    const namespace =
+      typeof params.leaseMetadata?.namespace === "string"
+        ? params.leaseMetadata.namespace
+        : deriveTenantNamespace(config, params.companyId);
+    const leaseBackend =
+      typeof params.leaseMetadata?.backend === "string"
+        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
+        : config.backend;
+    const podName =
+      typeof params.leaseMetadata?.podName === "string" &&
+      params.leaseMetadata.podName.length > 0
+        ? params.leaseMetadata.podName
+        : null;
+    const kc = createKubeConfig({
+      inCluster: config.inCluster,
+      kubeconfig: config.kubeconfig,
+    });
+    const clients = makeKubeClients(kc);
+    const state = await inspectLeaseResources(clients, {
+      namespace,
+      name: params.providerLeaseId,
+      backend: leaseBackend,
+      podName,
+    });
+    return { providerLeaseId: params.providerLeaseId, state };
   },
 
   async onEnvironmentExecute(
