@@ -32,16 +32,151 @@ if (!['git', 'gh'].includes(program) || !executable) {
 const localGitCommands = new Set(['init', 'status', 'add', 'config', 'rev-parse', 'log', 'diff', 'diff-files', 'write-tree', 'show', 'branch', 'checkout', 'switch', 'restore', 'reset', 'rm', 'mv', 'worktree', 'grep', 'blame', 'describe', 'ls-files', 'ls-tree', 'cat-file', 'rev-list', 'merge-base', 'show-ref', 'for-each-ref', 'symbolic-ref', 'check-ignore', 'version', 'help']);
 const gitValueOptions = ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source'];
 const gitFlagOptions = ['-p', '-P', '--paginate', '--no-pager', '--bare', '--no-replace-objects', '--no-lazy-fetch', '--no-optional-locks', '--no-advice', '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs'];
-function isLocalGit(args) {
-  if (program !== 'git') return false;
+function gitSubcommand(args) {
+  if (program !== 'git') return null;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (gitValueOptions.includes(arg)) { index += 1; continue; }
     if (gitValueOptions.some(option => arg.startsWith(option + '='))) continue;
     if (gitFlagOptions.includes(arg)) continue;
-    return arg === '--version' || arg === '--help' || localGitCommands.has(arg);
+    return { name: arg, rest: args.slice(index + 1) };
   }
-  return false;
+  return null;
+}
+function isLocalGit(args) {
+  const command = gitSubcommand(args);
+  return !!command && (command.name === '--version' || command.name === '--help' || localGitCommands.has(command.name));
+}
+// Push provenance: the ref updates each push transport actually sent, read from git's own
+// packet and trace2 streams written in append order to one private file. Each transport
+// (send-pack / direct transport, or a remote-https helper emitting packets directly) gets
+// its own session and report; uncorrelatable or overlapping packets fail closed.
+function githubRepository(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== 'github.com') return null;
+    const match = /^\/+([^/]+)\/([^/]+?)(?:\.git)?\/*$/.exec(parsed.pathname);
+    return match ? (match[1] + '/' + match[2]).toLowerCase() : null;
+  } catch { return null; }
+}
+function sendPackInfo(argv) {
+  if (!Array.isArray(argv) || !argv.length) return null;
+  const bin = path.basename(String(argv[0])).replace(/\.exe$/i, '');
+  let index = -1;
+  if (bin === 'git-send-pack') index = 1;
+  else if (bin === 'git') {
+    for (let i = 1; i < argv.length; i++) {
+      const arg = String(argv[i]);
+      if (gitValueOptions.includes(arg)) { i += 1; continue; }
+      if (gitValueOptions.some(option => arg.startsWith(option + '='))) continue;
+      if (gitFlagOptions.includes(arg)) continue;
+      if (arg === 'send-pack') index = i + 1;
+      break;
+    }
+  }
+  if (index < 0) return null;
+  let url = null;
+  for (let i = index; i < argv.length; i++) {
+    const arg = String(argv[i]);
+    if (!arg.startsWith('-') && /^https?:\/\//i.test(arg)) { url = arg; break; }
+  }
+  return { url };
+}
+function pushReports(trace) {
+  const sessions = [];
+  const activeSenders = new Map();
+  const activeHelpers = new Map();
+  const activeHooks = new Set();
+  let anonId = 0;
+  const eventKey = (event) => typeof event.sid === 'string' && event.sid.length && typeof event.child_id === 'number'
+    ? event.sid + '\0' + event.child_id : null;
+  const newSession = (sid, repository) => {
+    const session = { sid: typeof sid === 'string' ? sid : '', repository, sent: new Map(), results: new Map(), tainted: false, usedSendPack: false };
+    sessions.push(session);
+    return session;
+  };
+  const enclosingHelper = (sid) => {
+    if (typeof sid !== 'string' || !sid.length) return null;
+    let best = null, tie = false;
+    for (const helper of activeHelpers.values()) {
+      if (helper.sid && (sid === helper.sid || sid.startsWith(helper.sid + '/'))) {
+        if (!best || helper.sid.length > best.sid.length) { best = helper; tie = false; }
+        else if (helper.sid.length === best.sid.length) tie = true;
+      }
+    }
+    return tie ? null : best;
+  };
+  for (const line of trace.split('\n')) {
+    if (line.startsWith('{')) {
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (!event || typeof event !== 'object') continue;
+      if (event.event === 'child_start') {
+        const key = eventKey(event) || ('anon:' + (++anonId));
+        const childClass = typeof event.child_class === 'string' ? event.child_class : '';
+        const sendPack = sendPackInfo(event.argv);
+        if (sendPack) {
+          const parentHelper = enclosingHelper(event.sid);
+          if (parentHelper) parentHelper.usedSendPack = true;
+          const repository = sendPack.url ? githubRepository(sendPack.url) : (parentHelper ? parentHelper.repository : null);
+          activeSenders.set(key, newSession(event.sid, repository));
+        } else if (childClass.startsWith('transport/')) {
+          activeSenders.set(key, newSession(event.sid, null));
+        } else if (childClass.startsWith('remote-')) {
+          const repository = /^remote-https?$/.test(childClass) && Array.isArray(event.argv) && event.argv.length
+            ? githubRepository(String(event.argv[event.argv.length - 1])) : null;
+          activeHelpers.set(key, newSession(event.sid, repository));
+        } else if (childClass === 'hook') {
+          activeHooks.add(key);
+        }
+      } else if (event.event === 'child_exit') {
+        const key = eventKey(event);
+        if (key) {
+          activeSenders.delete(key);
+          activeHelpers.delete(key);
+          activeHooks.delete(key);
+        }
+      }
+      continue;
+    }
+    const packet = /packet:\s+([\w-]+)([<>]) (.*)$/.exec(line);
+    if (!packet || packet[1] === 'receive-pack' || packet[1] === 'sideband' || packet[1] === 'fetch' || packet[1] === 'upload-pack') continue;
+    let command = null, status = null;
+    if (packet[2] === '>') {
+      command = /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) (refs\/[^\s\\]+)/.exec(packet[3]);
+      if (!command || command[1] === command[2] || command[1].length !== command[2].length) continue;
+    } else {
+      status = /^(ok|ng) (refs\/[^\s\\]+)/.exec(packet[3]);
+      if (!status) continue;
+    }
+    let owner = null;
+    if (activeSenders.size === 1) {
+      owner = activeSenders.values().next().value;
+    } else if (activeSenders.size > 1) {
+      for (const session of activeSenders.values()) session.tainted = true;
+      continue;
+    } else if (activeHooks.size === 0 && activeHelpers.size === 1) {
+      const helper = activeHelpers.values().next().value;
+      if (!helper.usedSendPack) owner = helper;
+    } else {
+      for (const helper of activeHelpers.values()) helper.tainted = true;
+      continue;
+    }
+    if (!owner || owner.tainted) continue;
+    if (command) owner.sent.set(command[3], { ref: command[3], before: command[1], after: command[2] });
+    else if (status) owner.results.set(status[2], status[1]);
+  }
+  const reports = [];
+  for (const session of sessions) {
+    if (session.tainted || !session.repository || !session.sent.size) continue;
+    const updates = [...session.sent.values()].map(update => ({ ...update, result: session.results.get(update.ref) || 'unknown' }));
+    reports.push({ repository: session.repository, updates });
+  }
+  return reports;
+}
+function forceRequested(args) {
+  return args.some(arg => arg === '-f' || arg === '--force' || arg === '--mirror' || arg.startsWith('--force-with-lease') ||
+    (!arg.startsWith('-') && arg.startsWith('+')) || (/^-[a-zA-Z]+$/.test(arg) && arg.includes('f')));
 }
 // With a Paperclip GitHub connection, repositories are created and forked
 // through its tools so access rules, approvals, owner defaults and audit apply.
@@ -68,6 +203,7 @@ ${options.brokerFile ? String.raw`
 ` : ''}
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   let connected = false;
+  let bases = [], brokerHeaders = null;
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
   // fallback deliberately cannot load the host's gh authentication files.
@@ -102,7 +238,9 @@ ${options.brokerFile ? String.raw`
     // the run's API URL, which on a remote target is the callback bridge, and
     // the bridge forwards this route. So a broker that can't be reached at all
     // falls back to the API URL.
-    const bases = [...new Set([env.PAPERCLIP_GITHUB_BROKER_URL, env.PAPERCLIP_API_URL].filter(Boolean))];
+    bases = [...new Set([env.PAPERCLIP_GITHUB_BROKER_URL, env.PAPERCLIP_API_URL].filter(Boolean))];
+    brokerHeaders = { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
+      'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' };
     const askBroker = !isLocalGit(process.argv.slice(2));
     try {
     let response;
@@ -118,8 +256,7 @@ ${options.brokerFile ? String.raw`
         try {
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
-            headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
+            headers: brokerHeaders,
             body: '{}',
           });
           if (response.status === 409 && conflicts < 29) {
@@ -173,10 +310,47 @@ ${options.brokerFile ? String.raw`
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
+  // A managed push reports the ref updates it sent, so the server can attribute them to this
+  // run once GitHub's own push evidence arrives. It never changes the push's exit status.
+  const push = gitSubcommand(process.argv.slice(2));
+  const tracePush = !!push && push.name === 'push' && configReady && bases.length > 0 &&
+    !!env.PAPERCLIP_GITHUB_BROKER_TOKEN && !env.GIT_TRACE_PACKET && !env.GIT_TRACE2_EVENT;
+  const tracePath = path.join(configDirectory, 'push-packets.trace');
+  if (tracePush) { env.GIT_TRACE_PACKET = tracePath; env.GIT_TRACE2_EVENT = tracePath; }
   const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
-  child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
-  child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });
+  const exitCode = await new Promise(resolve => {
+    child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); resolve(1); });
+    child.once('exit', (code) => resolve(code === null ? 128 : code));
+  });
+  process.exitCode = exitCode;
+  if (!tracePush) return;
+  let reports = [];
+  try {
+    reports = pushReports(fs.readFileSync(tracePath, 'utf8'));
+  } catch {}
+  try { fs.rmSync(tracePath, { force: true }); } catch {}
+  if (!reports.length) return;
+  const forced = forceRequested(push.rest);
+  for (const report of reports) {
+    for (let start = 0; start < report.updates.length; start += 100) {
+      const body = JSON.stringify({ repository: report.repository, exitCode, forced, updates: report.updates.slice(start, start + 100) });
+      let recorded = false, status = 'transport_unavailable';
+      for (let attempt = 0; attempt < 2 * bases.length && !recorded; attempt++) {
+        const url = bases[attempt % bases.length].replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/push-attempts';
+        try {
+          const response = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000), headers: brokerHeaders, body });
+          await response.arrayBuffer().catch(() => undefined);
+          if (response.ok) recorded = true;
+          else { status = 'rejected_' + response.status; if (response.status < 500) break; }
+        } catch {}
+      }
+      if (!recorded) {
+        process.stderr.write('Paperclip: GitHub push provenance not recorded (' + status + '); approval attribution for this push will stay pending.\n');
+        break;
+      }
+    }
+  }
 }
 main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
 `;

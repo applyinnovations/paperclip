@@ -265,3 +265,28 @@ it.each([false, true])("keeps anonymous launchers usable when the remote broker 
   expect(result.stdout).toBe("anonymous");
   expect(b.resolveCredentials).not.toHaveBeenCalled();
 });
+
+it("binds a managed push report to the active run, whatever the body says", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "native-github-push-"));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const recordPushAttempts = vi.fn(async (_binding: ReturnType<typeof run>, body: unknown) => ({ recorded: (body as { updates: unknown[] }).updates.length }));
+  const b = await createNativeGitHubAccess({ scope, target: null, cwd: root, env: { PATH: "/usr/bin:/bin" },
+    resolveCredentials: vi.fn(async () => ({ status: "absent", env: {} })), recordPushAttempts });
+  cleanups.push(b.stop);
+  const report = { repository: "acme/widgets", runId: "forged", companyId: "other", updates: [{ ref: "refs/heads/x" }] };
+  const push = (extra: RequestInit = {}) => request(b, { body: JSON.stringify(report), ...extra }, "/runtime-tools/github/push-attempts");
+  expect((await push()).status).toBe(403); // No active run yet.
+  const release = b.activate(run("a"));
+  expect((await push({ headers: { authorization: "Bearer wrong" } })).status).toBe(403);
+  expect((await push({ body: "not json" })).status).toBe(422);
+  expect((await push({ body: "x".repeat(300 * 1024) })).status).toBe(422);
+  const response = await push();
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ recorded: 1 });
+  expect(recordPushAttempts).toHaveBeenCalledExactlyOnceWith(run("a"), report);
+  recordPushAttempts.mockRejectedValueOnce(Object.assign(new Error("secret detail"), { status: 500 }));
+  const failed = await push();
+  expect(failed.status).toBe(503);
+  expect(await failed.text()).not.toContain("secret detail");
+  release();
+});

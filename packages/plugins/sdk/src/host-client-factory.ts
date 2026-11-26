@@ -158,7 +158,10 @@ export interface HostServices {
     ): Promise<string>;
   };
 
-  /** Provides `githubApp.getInstallationToken`, `githubApp.verifyWebhook` and `githubApp.getApprovalsToken`. */
+  /**
+   * Provides `githubApp.getInstallationToken`, `githubApp.verifyWebhook`, `githubApp.getApprovalsToken`,
+   * `githubApp.recordPushEvidence` and `githubApp.listBranchUpdates`.
+   */
   githubApp: {
     getInstallationToken(
       params: { companyId: string },
@@ -171,6 +174,13 @@ export interface HostServices {
       params: { repository: string; companyId: string },
       context?: WorkerHostCallContext,
     ): Promise<WorkerToHostMethods["githubApp.getApprovalsToken"][1]>;
+    recordPushEvidence(
+      params: WorkerToHostMethods["githubApp.recordPushEvidence"][0],
+    ): Promise<WorkerToHostMethods["githubApp.recordPushEvidence"][1]>;
+    listBranchUpdates(
+      params: Omit<WorkerToHostMethods["githubApp.listBranchUpdates"][0], "companyId"> & { companyId: string },
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["githubApp.listBranchUpdates"][1]>;
   };
 
   /** Provides `activity.log`. */
@@ -440,6 +450,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "githubApp.getInstallationToken": "github.app.token",
   "githubApp.verifyWebhook": "github.app.webhooks.verify",
   "githubApp.getApprovalsToken": "github.approvals.token",
+  "githubApp.recordPushEvidence": "github.push-provenance.record",
+  "githubApp.listBranchUpdates": "github.push-provenance.read",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -832,6 +844,26 @@ export function createHostClientHandlers(
         throw new Error("githubApp.getApprovalsToken requires a repository");
       }
       return services.githubApp.getApprovalsToken({ repository: params.repository, companyId }, context);
+    }),
+    // The host verifies the delivery and takes its company from the verified App.
+    "githubApp.recordPushEvidence": gated("githubApp.recordPushEvidence", async (params) => {
+      return services.githubApp.recordPushEvidence({ headers: params.headers, rawBody: params.rawBody });
+    }),
+    // Provenance is read for the invocation's company only.
+    "githubApp.listBranchUpdates": gated("githubApp.listBranchUpdates", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("githubApp.listBranchUpdates", params, context);
+      if (typeof params?.repository !== "string" || params.repository.trim() === "" ||
+          typeof params.ref !== "string" || params.ref.trim() === "") {
+        throw new Error("githubApp.listBranchUpdates requires a repository and ref");
+      }
+      return services.githubApp.listBranchUpdates({
+        repository: params.repository,
+        ref: params.ref,
+        ...(params.afterSha !== undefined ? { afterSha: params.afterSha } : {}),
+        ...(params.cursor !== undefined ? { cursor: params.cursor } : {}),
+        ...(params.limit !== undefined ? { limit: params.limit } : {}),
+        companyId,
+      }, context);
     }),
 
     // Activity

@@ -1034,6 +1034,8 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `secrets.read-ref`
 - `github.app.token` — `ctx.githubApp.getInstallationToken()`: a short-lived installation token for the invocation company's operator-owned GitHub App. Never the private key; never another company's token
 - `github.app.webhooks.verify` — `ctx.githubApp.verifyWebhook()`: the host checks a GitHub App webhook signature and returns the App's company. The plugin never reads the webhook secret
+- `github.push-provenance.record` — `ctx.githubApp.recordPushEvidence()`: the host re-verifies a GitHub App `push` delivery and records its ref update for the App's company
+- `github.push-provenance.read` — `ctx.githubApp.listBranchUpdates()`: paginated, company-scoped branch update provenance (`attempted` / `confirmed` / `unattributed` / `ambiguous`, with an explicit `complete` flag). See `doc/connections/GITHUB.md`
 - `environment.drivers.register`
 
 ### Agent Tools

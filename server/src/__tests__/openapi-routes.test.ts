@@ -1280,6 +1280,9 @@ describe("openapi routes", () => {
     expect(
       spec.paths["/runtime-tools/github/credentials"].post.security,
     ).toEqual([{ RuntimeToolsBearerAuth: [] }]);
+    expect(
+      spec.paths["/runtime-tools/github/push-attempts"].post.security,
+    ).toEqual([{ RuntimeToolsBearerAuth: [] }]);
     expect(spec.paths["/api/plugins/install"].post.security).toEqual([
       { BoardSessionAuth: [] },
       { BoardApiKeyAuth: [] },

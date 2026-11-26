@@ -470,3 +470,305 @@ it("captures the current task broker file once per invocation and never falls ba
   expect((await run()).stdout).toBe("anonymous");
   expect(captured).toEqual(["Bearer first-run", "Bearer next-run"]);
 });
+
+describe("managed push provenance reports", () => {
+  const before = "cd24b048da21e60a9fb6fdc45051c403fc2cd86e";
+  const after = "7d091de1de2e70c45b98967fdfca3dd3820bf4f2";
+  const other = "1111111111111111111111111111111111111111";
+  const secondBefore = "2222222222222222222222222222222222222222";
+  const secondAfter = "3333333333333333333333333333333333333333";
+  const hookBefore = "4444444444444444444444444444444444444444";
+  const hookAfter = "5555555555555555555555555555555555555555";
+  // Interleaved GIT_TRACE_PACKET + GIT_TRACE2_EVENT lines in git's append-file order.
+  // The receive-pack lines (local transports) must be ignored; tokens in URLs are redacted by git.
+  const defaultTrace = [
+    JSON.stringify({ event: "start", sid: "S0", argv: ["git", "push", "--force", "origin", "main", "rejected"] }),
+    JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+      argv: ["git", "remote-https", "origin", "https://x-access-token:<REDACTED>@github.com/Acme/Widgets.git"] }),
+    `11:05:53.072437 pkt-line.c:85           packet:          git< ${before} refs/heads/main\\0report-status delete-refs side-band-64k`,
+    `11:05:53.072460 pkt-line.c:85           packet:          git< ${other} refs/heads/rejected`,
+    JSON.stringify({ event: "child_start", sid: "S0/S1/S2", child_id: 0, child_class: "?",
+      argv: ["git", "send-pack", "--stateless-rpc", "--helper-status", "--thin", "--no-progress",
+        "https://x-access-token:<REDACTED>@github.com/Acme/Widgets.git/", "--stdin"] }),
+    `11:05:53.072654 pkt-line.c:85           packet:          git> ${before} ${after} refs/heads/main\\0 report-status-v2 side-band-64k quiet`,
+    `11:05:53.072655 pkt-line.c:85           packet:          git> ${other} ${after} refs/heads/rejected`,
+    `11:05:53.072656 pkt-line.c:85           packet: receive-pack< ${other} ${before} refs/heads/forged`,
+    `11:05:53.072664 pkt-line.c:85           packet:          git> 0000`,
+    `11:05:53.091804 pkt-line.c:85           packet:     sideband< \\1000eunpack ok0017ok refs/heads/main0000`,
+    `11:05:53.091836 pkt-line.c:85           packet:          git< unpack ok`,
+    `11:05:53.091846 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+    `11:05:53.091847 pkt-line.c:85           packet:          git< ng refs/heads/rejected protected branch hook declined`,
+    JSON.stringify({ event: "child_exit", sid: "S0/S1/S2", child_id: 0, code: 0 }),
+    JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 0 }),
+  ].join("\n") + "\n";
+
+  async function fixture(options: { trace?: string; status?: number; brokerStatus?: number } = {}) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-push-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real"), seenEnv = path.join(root, "env.json");
+    await mkdir(bin); await mkdir(real);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "git"), `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(seenEnv)}, JSON.stringify({ packet: process.env.GIT_TRACE_PACKET || null, trace2: process.env.GIT_TRACE2_EVENT || null }));
+if (process.argv[2] === "push" && process.env.GIT_TRACE_PACKET) {
+  fs.appendFileSync(process.env.GIT_TRACE_PACKET, ${JSON.stringify(options.trace ?? defaultTrace)});
+}
+process.exit(${options.status ?? 0});
+`, { mode: 0o700 });
+    const reports: Array<{ headers: Record<string, unknown>; body: unknown }> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        if (req.url === "/runtime-tools/github/push-attempts") {
+          reports.push({ headers: { capability: req.headers["x-paperclip-github-capability"] }, body: JSON.parse(body) });
+          res.writeHead(options.brokerStatus ?? 200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ recorded: 1 }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "secret-installation-token" } }));
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: "run-capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}${path.delimiter}${real}${path.delimiter}${process.env.PATH}` };
+    const run = (args: string[]) => exec(path.join(bin, "git"), args, { env, cwd: root });
+    const tracedWith = async () => JSON.parse(await readFile(seenEnv, "utf8")) as { packet: string | null; trace2: string | null };
+    return { run, reports, tracedWith, root };
+  }
+
+  it("reports exactly the ref updates the remote received, with the remote's per-ref result", async () => {
+    const { run, reports, tracedWith } = await fixture();
+    await run(["push", "--force", "origin", "main", "rejected"]);
+    expect(reports).toEqual([{ headers: { capability: "run-capability" }, body: {
+      repository: "acme/widgets", exitCode: 0, forced: true,
+      updates: [
+        { ref: "refs/heads/main", before, after, result: "ok" },
+        { ref: "refs/heads/rejected", before: other, after, result: "ng" },
+      ],
+    } }]);
+    // No URL, token or trace text leaves the launcher, and the private trace file is gone.
+    expect(JSON.stringify(reports)).not.toMatch(/secret|REDACTED|x-access-token|https:/);
+    const traced = await tracedWith();
+    expect(traced.packet).toMatch(/push-packets\.trace$/);
+    expect(traced.trace2).toBe(traced.packet);
+    await expect(readFile(traced.packet!, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("emits separate per-transport reports across multiple push URLs with the same ref, different SHAs, and mixed results", async () => {
+    const multiPushUrlTrace = [
+      JSON.stringify({ event: "start", sid: "S0", argv: ["git", "push", "origin", "main", "feature"] }),
+      // First pushurl: acme/first (main ok, feature ng)
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://x-access-token:<REDACTED>@github.com/Acme/First.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/S1/S2", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "--helper-status", "--thin", "--no-progress",
+          "https://x-access-token:<REDACTED>@github.com/Acme/First.git/", "--stdin"] }),
+      `11:05:53.010001 pkt-line.c:85           packet:          git> ${before} ${after} refs/heads/main\\0 report-status-v2`,
+      `11:05:53.010002 pkt-line.c:85           packet:          git> ${other} ${after} refs/heads/feature`,
+      `11:05:53.020001 pkt-line.c:85           packet:          git< unpack ok`,
+      `11:05:53.020002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      `11:05:53.020003 pkt-line.c:85           packet:          git< ng refs/heads/feature protected branch`,
+      JSON.stringify({ event: "child_exit", sid: "S0/S1/S2", child_id: 0, code: 1 }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 1 }),
+      // Second pushurl: acme/second (same ref names, different before/after SHAs, opposite ok/ng results)
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 1, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://x-access-token:<REDACTED>@github.com/Acme/Second.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/S3/S4", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "--helper-status", "--thin", "--no-progress",
+          "https://x-access-token:<REDACTED>@github.com/Acme/Second.git/", "--stdin"] }),
+      `11:05:53.030001 pkt-line.c:85           packet:          git> ${secondBefore} ${secondAfter} refs/heads/main\\0 report-status-v2`,
+      `11:05:53.030002 pkt-line.c:85           packet:          git> ${hookBefore} ${hookAfter} refs/heads/feature`,
+      `11:05:53.040001 pkt-line.c:85           packet:          git< unpack ok`,
+      `11:05:53.040002 pkt-line.c:85           packet:          git< ng refs/heads/main pre-receive hook declined`,
+      `11:05:53.040003 pkt-line.c:85           packet:          git< ok refs/heads/feature`,
+      JSON.stringify({ event: "child_exit", sid: "S0/S3/S4", child_id: 0, code: 1 }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 1, code: 1 }),
+    ].join("\n") + "\n";
+
+    const { run, reports } = await fixture({ trace: multiPushUrlTrace, status: 1 });
+    await expect(run(["push", "origin", "main", "feature"])).rejects.toMatchObject({ code: 1 });
+    expect(reports).toEqual([
+      {
+        headers: { capability: "run-capability" },
+        body: {
+          repository: "acme/first",
+          exitCode: 1,
+          forced: false,
+          updates: [
+            { ref: "refs/heads/main", before, after, result: "ok" },
+            { ref: "refs/heads/feature", before: other, after, result: "ng" },
+          ],
+        },
+      },
+      {
+        headers: { capability: "run-capability" },
+        body: {
+          repository: "acme/second",
+          exitCode: 1,
+          forced: false,
+          updates: [
+            { ref: "refs/heads/main", before: secondBefore, after: secondAfter, result: "ng" },
+            { ref: "refs/heads/feature", before: hookBefore, after: hookAfter, result: "ok" },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it("keeps a pre-push hook's nested transports separate from the outer push and ignores non-GitHub transports", async () => {
+    const hookTrace = [
+      JSON.stringify({ event: "start", sid: "S0", argv: ["git", "push", "origin", "main"] }),
+      // Outer remote-https starts and pauses while pre-push hook runs
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://x-access-token:<REDACTED>@github.com/Acme/First.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 1, child_class: "hook",
+        argv: [".git/hooks/pre-push", "origin", "https://github.com/Acme/First.git"] }),
+      // Hook first pushes to a local file:// bare repo (must never be attributed to acme/first)
+      JSON.stringify({ event: "child_start", sid: "S0/Sh1", child_id: 0, child_class: "transport/file",
+        argv: ["git-receive-pack '/tmp/local-backup.git'"] }),
+      `11:05:53.010001 pkt-line.c:85           packet:         push> ${other} ${secondAfter} refs/heads/main\\0 report-status-v2`,
+      `11:05:53.010002 pkt-line.c:85           packet:         push< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/Sh1", child_id: 0, code: 0 }),
+      // Hook next pushes to a non-GitHub HTTPS remote (must be ignored)
+      JSON.stringify({ event: "child_start", sid: "S0/Sh2", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "mirror", "https://gitlab.example.com/acme/mirror.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/Sh2/Sa/Sb", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://gitlab.example.com/acme/mirror.git/", "--stdin"] }),
+      `11:05:53.015001 pkt-line.c:85           packet:          git> ${secondBefore} ${secondAfter} refs/heads/main`,
+      `11:05:53.015002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/Sh2/Sa/Sb", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0/Sh2", child_id: 0, code: 0 }),
+      // Hook also pushes to a separate GitHub repo acme/hook-target
+      JSON.stringify({ event: "child_start", sid: "S0/Sh3", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "hook-remote", "https://x-access-token:<REDACTED>@github.com/Acme/Hook-Target.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/Sh3/Sa/Sb", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://x-access-token:<REDACTED>@github.com/Acme/Hook-Target.git/", "--stdin"] }),
+      `11:05:53.020001 pkt-line.c:85           packet:          git> ${hookBefore} ${hookAfter} refs/heads/main`,
+      `11:05:53.020002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/Sh3/Sa/Sb", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0/Sh3", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 1, code: 0 }),
+      // Outer acme/first now sends its own updates
+      JSON.stringify({ event: "child_start", sid: "S0/S1/S2", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://x-access-token:<REDACTED>@github.com/Acme/First.git/", "--stdin"] }),
+      `11:05:53.030001 pkt-line.c:85           packet:          git> ${before} ${after} refs/heads/main`,
+      `11:05:53.030002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/S1/S2", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 0 }),
+    ].join("\n") + "\n";
+
+    const { run, reports } = await fixture({ trace: hookTrace });
+    await run(["push", "origin", "main"]);
+    expect(reports).toEqual([
+      {
+        headers: { capability: "run-capability" },
+        body: {
+          repository: "acme/hook-target",
+          exitCode: 0,
+          forced: false,
+          updates: [{ ref: "refs/heads/main", before: hookBefore, after: hookAfter, result: "ok" }],
+        },
+      },
+      {
+        headers: { capability: "run-capability" },
+        body: {
+          repository: "acme/first",
+          exitCode: 0,
+          forced: false,
+          updates: [{ ref: "refs/heads/main", before, after, result: "ok" }],
+        },
+      },
+    ]);
+  });
+
+  it("does not manufacture a repository match when transport correlation is missing or ambiguous", async () => {
+    // 1) Orphan packets with no active transport (packets arrive after child_exit)
+    const orphanTrace = [
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://github.com/Acme/First.git"] }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 0 }),
+      `11:05:53.010001 pkt-line.c:85           packet:          git> ${before} ${after} refs/heads/main`,
+      `11:05:53.010002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+    ].join("\n") + "\n";
+    const orphan = await fixture({ trace: orphanTrace });
+    await orphan.run(["push", "origin", "main"]);
+    expect(orphan.reports).toEqual([]);
+
+    // 2) Two remote-https transports opened without closing the first: packets are ambiguous
+    const overlappingHelpersTrace = [
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://github.com/Acme/First.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 1, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://github.com/Acme/Second.git"] }),
+      `11:05:53.010001 pkt-line.c:85           packet:         push> ${before} ${after} refs/heads/main`,
+      `11:05:53.010002 pkt-line.c:85           packet:         push< ok refs/heads/main`,
+    ].join("\n") + "\n";
+    const overlappingHelpers = await fixture({ trace: overlappingHelpersTrace });
+    await overlappingHelpers.run(["push", "origin", "main"]);
+    expect(overlappingHelpers.reports).toEqual([]);
+
+    // 3) One clean transport finishes, then two concurrent send-pack transports overlap:
+    //    only the unambiguous transport is reported; overlapping transports fail closed.
+    const partialOverlapTrace = [
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://github.com/Acme/Clean.git"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/S1", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://github.com/Acme/Clean.git/", "--stdin"] }),
+      `11:05:53.010001 pkt-line.c:85           packet:          git> ${before} ${after} refs/heads/main`,
+      `11:05:53.010002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/S1", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 0 }),
+      // Concurrent send-pack overlap for OverlapA and OverlapB
+      JSON.stringify({ event: "child_start", sid: "S0/S2", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://github.com/Acme/OverlapA.git/", "--stdin"] }),
+      JSON.stringify({ event: "child_start", sid: "S0/S3", child_id: 0, child_class: "?",
+        argv: ["git", "send-pack", "--stateless-rpc", "https://github.com/Acme/OverlapB.git/", "--stdin"] }),
+      `11:05:53.020001 pkt-line.c:85           packet:          git> ${secondBefore} ${secondAfter} refs/heads/main`,
+      `11:05:53.020002 pkt-line.c:85           packet:          git< ok refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0/S2", child_id: 0, code: 0 }),
+      JSON.stringify({ event: "child_exit", sid: "S0/S3", child_id: 0, code: 0 }),
+    ].join("\n") + "\n";
+    const partialOverlap = await fixture({ trace: partialOverlapTrace });
+    await partialOverlap.run(["push", "origin", "main"]);
+    expect(partialOverlap.reports).toEqual([{
+      headers: { capability: "run-capability" },
+      body: {
+        repository: "acme/clean",
+        exitCode: 0,
+        forced: false,
+        updates: [{ ref: "refs/heads/main", before, after, result: "ok" }],
+      },
+    }]);
+  });
+
+  it("reports nothing for a push that sent no ref update, and never traces other commands", async () => {
+    const noopTrace = [
+      JSON.stringify({ event: "child_start", sid: "S0", child_id: 0, child_class: "remote-https",
+        argv: ["git", "remote-https", "origin", "https://github.com/Acme/Widgets.git"] }),
+      `11:05:53.072437 pkt-line.c:85           packet:          git< ${before} refs/heads/main`,
+      JSON.stringify({ event: "child_exit", sid: "S0", child_id: 0, code: 0 }),
+    ].join("\n") + "\n";
+    const noop = await fixture({ trace: noopTrace });
+    await noop.run(["push", "origin", "main"]);
+    expect(noop.reports).toEqual([]);
+    const fetch = await fixture();
+    await fetch.run(["fetch", "origin"]);
+    expect(await fetch.tracedWith()).toEqual({ packet: null, trace2: null });
+    expect(fetch.reports).toEqual([]);
+  });
+
+  it("keeps the push's exit status when the push fails or the report is rejected", async () => {
+    const failed = await fixture({ status: 1 });
+    await expect(failed.run(["push", "origin", "main"])).rejects.toMatchObject({ code: 1 });
+    expect(failed.reports).toHaveLength(1);
+    expect((failed.reports[0]!.body as { exitCode: number }).exitCode).toBe(1);
+    const rejected = await fixture({ brokerStatus: 403 });
+    const result = await rejected.run(["push", "origin", "main"]);
+    expect(result.stderr).toContain("push provenance not recorded (rejected_403)");
+    expect(rejected.reports).toHaveLength(1);
+  });
+});

@@ -18,6 +18,7 @@ import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { recordPushAttempts } from "../services/github-push-provenance.js";
 
 function bearer(req: Request) {
   const value = req.header("authorization") ?? "";
@@ -56,6 +57,19 @@ export function runtimeConnectionIntentRoutes(db: Db) {
     res.json(await resolveGitHubOperationCredentials(db, {
       companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
     }));
+  });
+
+  router.post("/runtime-tools/github/push-attempts", async (req, res) => {
+    // Same run-scoped capability as credentials. Company, run and agent come only from the
+    // verified claims; the body names the repository and ref updates, never an identity.
+    if (req.headers.origin || req.headers.cookie || req.headers["sec-fetch-site"]) throw forbidden("Push reports require runtime authentication");
+    const claims = verifyRuntimeToolsToken(typeof req.headers["x-paperclip-github-capability"] === "string"
+      ? req.headers["x-paperclip-github-capability"] : bearer(req), "github_credentials");
+    if (!claims) throw unauthorized("Invalid GitHub runtime capability");
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await recordPushAttempts(db, {
+      companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
+    }, req.body));
   });
 
   router.get("/mcp/runtime-tools", async (req, res) => {

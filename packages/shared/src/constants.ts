@@ -1443,6 +1443,10 @@ export const PLUGIN_CAPABILITIES = [
   // The shared approvals App: a token scoped to one operator-allowlisted repository of the
   // invocation's company, for posting gate results. The key never reaches the plugin.
   "github.approvals.token",
+  // Push provenance: record GitHub's host-verified push evidence, and read which runs
+  // updated a branch of the invocation's company.
+  "github.push-provenance.record",
+  "github.push-provenance.read",
   "environment.drivers.register",
   "local.folders",
   // Agent Tools

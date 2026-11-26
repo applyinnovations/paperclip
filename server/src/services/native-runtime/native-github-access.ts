@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import {
   cleanupGitHubOperationLaunchers,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
@@ -9,6 +9,29 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+
+const MAX_PUSH_REPORT_BYTES = 256 * 1024;
+
+/** Resolves the parsed JSON body, or undefined when it is too large or not JSON. */
+function readBoundedJson(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    req.on("data", (chunk: Buffer) => {
+      if (done) return;
+      size += chunk.length;
+      if (size > MAX_PUSH_REPORT_BYTES) { done = true; resolve(undefined); return; }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { resolve(undefined); }
+    });
+    req.on("error", () => { if (!done) { done = true; resolve(undefined); } });
+  });
+}
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -24,6 +47,8 @@ export async function createNativeGitHubAccess(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   resolveCredentials: (binding: Binding) => Promise<unknown>;
+  /** Record a managed push's ref updates for the bound run. The body never selects the run. */
+  recordPushAttempts?: (binding: Binding, body: unknown) => Promise<unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }, startBridge = startAdapterExecutionTargetPaperclipBridge) {
   const duplexRequested = adapterExecutionTargetEnablesSandboxDuplexBridge(input.target);
@@ -37,7 +62,10 @@ export async function createNativeGitHubAccess(input: {
   const server = createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/json");
-    req.resume();
+    const pushReport = req.method === "POST" && req.url === "/runtime-tools/github/push-attempts";
+    // Only a push report carries a body; it is bounded and parsed after authentication.
+    const body = pushReport ? readBoundedJson(req) : null;
+    if (!pushReport) req.resume();
     const reply = (status: number, body: unknown) => {
       res.writeHead(status);
       res.end(JSON.stringify(body));
@@ -50,13 +78,30 @@ export async function createNativeGitHubAccess(input: {
       reply(403, { error: "GitHub session authentication required" });
       return;
     }
-    if (req.method !== "POST" || req.url !== "/runtime-tools/github/credentials") {
+    if (req.method !== "POST" || (req.url !== "/runtime-tools/github/credentials" && !pushReport) ||
+        (pushReport && !input.recordPushAttempts)) {
       reply(404, { error: "Unknown GitHub session operation" });
       return;
     }
     const binding = active;
     if (!binding || stopped) {
       reply(403, { error: "No active GitHub run" });
+      return;
+    }
+    if (pushReport) {
+      try {
+        // Bind at receipt; the body names ref updates, never the run.
+        const parsed = await body;
+        if (parsed === undefined) {
+          reply(422, { error: "Push report must be JSON of at most 256 KiB" });
+          return;
+        }
+        const result = await input.recordPushAttempts!({ ...binding }, parsed);
+        reply(200, result);
+      } catch (error) {
+        const status = (error as { status?: number })?.status;
+        reply(status === 403 || status === 422 ? status : 503, { error: "Push report not recorded" });
+      }
       return;
     }
     try {

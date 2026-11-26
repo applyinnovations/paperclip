@@ -1374,6 +1374,7 @@ const RUNTIME_TOOLS_SECURITY: Array<Record<string, string[]>> = [
 
 const RUNTIME_TOOLS_OPERATIONS = new Set([
   "POST /runtime-tools/github/credentials",
+  "POST /runtime-tools/github/push-attempts",
   "GET /mcp/runtime-tools",
   "POST /mcp/runtime-tools",
   "POST /runtime-tools/connections/search",
@@ -11299,6 +11300,31 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/runtime-tools/github/push-attempts",
+  tags: ["connection-intents"],
+  summary:
+    "Record the ref updates the active run's managed git push sent, using a run capability with github_credentials scope",
+  body: z.object({
+    repository: z.string(),
+    exitCode: z.number().int().nullable().optional(),
+    forced: z.boolean().optional(),
+    updates: z.array(z.object({
+      ref: z.string(),
+      before: z.string(),
+      after: z.string(),
+      result: z.enum(["ok", "ng", "unknown"]),
+    })).min(1).max(100),
+  }),
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
   },
 });
 

@@ -979,6 +979,14 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "github.approvals.token");
         return null;
       },
+      async recordPushEvidence() {
+        requireCapability(manifest, capabilitySet, "github.push-provenance.record");
+        return { recorded: false, reason: "not_configured" };
+      },
+      async listBranchUpdates() {
+        requireCapability(manifest, capabilitySet, "github.push-provenance.read");
+        return { updates: [], nextCursor: null, complete: true };
+      },
     },
     activity: {
       async log(entry) {
