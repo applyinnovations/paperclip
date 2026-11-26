@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import type { SandboxManagedRuntimeAssetProvision } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -316,170 +317,88 @@ function stripManagedMcpBlock(config: string): string {
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
 }
 
-function parseTomlTableHeaderPath(line: string): string[] | null {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith("[")) return null;
-  const isArray = trimmed.startsWith("[[");
-  const openLen = isArray ? 2 : 1;
-  const closeToken = isArray ? "]]" : "]";
-  let inQuote: '"' | "'" | null = null;
-  let escaped = false;
-  let closeIdx = -1;
-  for (let i = openLen; i < trimmed.length; i += 1) {
-    const ch = trimmed[i];
-    if (inQuote) {
-      if (inQuote === '"' && escaped) {
-        escaped = false;
-      } else if (inQuote === '"' && ch === "\\") {
-        escaped = true;
-      } else if (ch === inQuote) {
-        inQuote = null;
-      }
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inQuote = ch;
-      continue;
-    }
-    if (isArray ? trimmed.startsWith("]]", i) : ch === "]") {
-      closeIdx = i;
-      break;
-    }
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function parseCodexConfigToml(
+  config: string,
+): { ok: true; doc: Record<string, unknown> } | { ok: false } {
+  if (config.trim().length === 0) return { ok: true, doc: {} };
+  try {
+    const parsed = parseToml(config, { integersAsBigInt: "asNeeded" });
+    if (!isPlainRecord(parsed)) return { ok: false };
+    return { ok: true, doc: parsed };
+  } catch {
+    return { ok: false };
   }
-  if (closeIdx < 0) return null;
-  const trailing = trimmed.slice(closeIdx + closeToken.length).trim();
-  if (trailing.length > 0 && !trailing.startsWith("#")) return null;
-  const inner = trimmed.slice(openLen, closeIdx);
-  const segments: string[] = [];
-  let current = "";
-  inQuote = null;
-  escaped = false;
-  for (let i = 0; i < inner.length; i += 1) {
-    const ch = inner[i];
-    if (inQuote) {
-      if (inQuote === '"' && escaped) {
-        current += ch;
-        escaped = false;
-      } else if (inQuote === '"' && ch === "\\") {
-        escaped = true;
-      } else if (ch === inQuote) {
-        inQuote = null;
-      } else {
-        current += ch;
-      }
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inQuote = ch;
-      continue;
-    }
-    if (ch === ".") {
-      segments.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += ch;
-  }
-  segments.push(current.trim());
-  return segments.filter((segment) => segment.length > 0);
+}
+
+function stringifyCodexConfigToml(doc: Record<string, unknown>): string {
+  if (Object.keys(doc).length === 0) return "";
+  return stringifyToml(doc).trim();
 }
 
 /**
- * Strips any unmanaged `[mcp_servers.*]` tables (and root `mcp_servers` keys)
- * from a Codex `config.toml` so Paperclip-managed runs never inherit stray
- * host/user MCP configurations outside the explicit Paperclip allowlist.
+ * Strips any unmanaged `[mcp_servers.*]` tables and root `mcp_servers` keys
+ * (including escaped/quoted keys and multiline values) from a Codex
+ * `config.toml` using a spec-compliant TOML parser so Paperclip-managed runs
+ * never inherit stray host/user MCP configurations outside the explicit
+ * Paperclip allowlist.
+ *
+ * Fails closed on unparseable TOML by returning an empty document instead of
+ * passing through unverified content.
  */
-export function stripUnmanagedCodexMcpServers(config: string): { content: string; removedNames: string[] } {
-  const lines = config.split(/\r?\n/);
-  const out: string[] = [];
-  const removedNames = new Set<string>();
-  let inRootRegion = true;
-  let skippingMcpSection = false;
-  for (const line of lines) {
-    const headerPath = parseTomlTableHeaderPath(line);
-    if (headerPath) {
-      inRootRegion = false;
-      if (headerPath[0] === "mcp_servers") {
-        skippingMcpSection = true;
-        if (headerPath[1]) removedNames.add(headerPath[1]);
-        continue;
-      }
-      skippingMcpSection = false;
-    } else if (skippingMcpSection) {
-      continue;
-    }
-    if (inRootRegion) {
-      const rootMcpMatch = line.match(
-        /^\s*(?:"mcp_servers"|'mcp_servers'|mcp_servers)\s*(?:\.\s*(?:"([^"]+)"|'([^']+)'|([^=\s.#]+))|=)/,
-      );
-      if (rootMcpMatch) {
-        const name = rootMcpMatch[1] ?? rootMcpMatch[2] ?? rootMcpMatch[3];
-        if (name) removedNames.add(name.trim());
-        continue;
-      }
-    }
-    out.push(line);
+export function stripUnmanagedCodexMcpServers(
+  config: string,
+): { content: string; removedNames: string[]; unparseable?: boolean } {
+  const parsed = parseCodexConfigToml(config);
+  if (!parsed.ok) {
+    return { content: "", removedNames: [], unparseable: true };
   }
-  const content = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  return { content, removedNames: Array.from(removedNames) };
+  const removedNames: string[] = [];
+  if (Object.hasOwn(parsed.doc, "mcp_servers")) {
+    const mcpServers = parsed.doc.mcp_servers;
+    if (isPlainRecord(mcpServers)) {
+      for (const name of Object.keys(mcpServers)) {
+        removedNames.push(name);
+      }
+    } else {
+      removedNames.push("mcp_servers");
+    }
+    delete parsed.doc.mcp_servers;
+  }
+  return {
+    content: stringifyCodexConfigToml(parsed.doc),
+    removedNames,
+  };
 }
 
 /**
- * Enforces `[features]\napps = false` in a Codex `config.toml` without
- * introducing duplicate `[features]` tables, so ChatGPT cloud connectors/apps
- * (`codex_apps`) remain disabled in Paperclip-managed runs.
+ * Enforces `[features]\napps = false` in a Codex `config.toml` using a
+ * spec-compliant TOML parser/serializer so dotted keys (`features.fast_mode`),
+ * inline tables, escaped keys, and existing `[features]` tables merge cleanly
+ * without introducing duplicate table declarations.
  */
 export function enforceCodexFeaturesAppsDisabled(config: string): string {
-  const lines = config.split(/\r?\n/);
-  const out: string[] = [];
-  let inRootRegion = true;
-  let inFeaturesSection = false;
-  let sawFeaturesSection = false;
-
-  for (const line of lines) {
-    const headerPath = parseTomlTableHeaderPath(line);
-    if (headerPath) {
-      inRootRegion = false;
-      if (headerPath.length === 1 && headerPath[0] === "features") {
-        sawFeaturesSection = true;
-        inFeaturesSection = true;
-        out.push(line);
-        out.push("apps = false");
-        continue;
-      }
-      inFeaturesSection = false;
-      out.push(line);
-      continue;
+  const parsed = parseCodexConfigToml(config);
+  const doc: Record<string, unknown> = parsed.ok ? parsed.doc : {};
+  const nextFeatures: Record<string, unknown> = { apps: false };
+  if (Object.hasOwn(doc, "features") && isPlainRecord(doc.features)) {
+    for (const [key, value] of Object.entries(doc.features)) {
+      if (key === "apps") continue;
+      Object.defineProperty(nextFeatures, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
-    if (inFeaturesSection) {
-      if (/^\s*(?:"apps"|'apps'|apps)\s*=/.test(line)) {
-        continue;
-      }
-      out.push(line);
-      continue;
-    }
-    if (inRootRegion) {
-      if (/^\s*(?:"features"|'features'|features)\s*\.\s*(?:"apps"|'apps'|apps)\s*=/.test(line)) {
-        continue;
-      }
-      const inlineFeaturesMatch = line.match(/^(\s*(?:"features"|'features'|features)\s*=\s*\{)(.*)(\}\s*(?:#.*)?)$/);
-      if (inlineFeaturesMatch) {
-        sawFeaturesSection = true;
-        const innerEntries = inlineFeaturesMatch[2]
-          .split(",")
-          .map((entry) => entry.trim())
-          .filter((entry) => entry.length > 0 && !/^(?:"apps"|'apps'|apps)\s*=/.test(entry));
-        innerEntries.unshift("apps = false");
-        out.push(`${inlineFeaturesMatch[1]} ${innerEntries.join(", ")} ${inlineFeaturesMatch[3]}`);
-        continue;
-      }
-    }
-    out.push(line);
   }
-
-  const trimmed = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  if (sawFeaturesSection) return trimmed;
-  return trimmed ? `${trimmed}\n\n[features]\napps = false` : "[features]\napps = false";
+  doc.features = nextFeatures;
+  return stringifyCodexConfigToml(doc);
 }
 
 function buildManagedMcpBlock(input: {
@@ -524,13 +443,18 @@ export async function writeManagedCodexMcpConfig(input: {
     throw error;
   });
   const withoutManagedBlock = stripManagedMcpBlock(existing);
-  const { content: strippedConfig, removedNames } = stripUnmanagedCodexMcpServers(withoutManagedBlock);
+  const { content: strippedConfig, removedNames, unparseable } = stripUnmanagedCodexMcpServers(withoutManagedBlock);
   const baseConfig = enforceCodexFeaturesAppsDisabled(strippedConfig);
   const { block } = buildManagedMcpBlock({
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
   });
   const warnings: string[] = [];
+  if (unparseable) {
+    warnings.push(
+      `Reset unparseable Codex config "${configPath}" while enforcing Paperclip MCP isolation.`,
+    );
+  }
   if (removedNames.length > 0) {
     warnings.push(
       `Removed unmanaged Codex MCP server(s) (${removedNames.join(", ")}) from "${configPath}"; only Paperclip-allowlisted MCP servers are permitted.`,
