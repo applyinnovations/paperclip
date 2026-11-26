@@ -845,6 +845,13 @@ export interface IssueExecutionState {
    * stage then hands the issue back to the executor instead of closing it.
    */
   completionRequested?: boolean;
+  /**
+   * IDs of `issue_execution_decisions` rows recorded during the current review
+   * cycle. Cleared whenever `executionState` resets (for example on reopen from
+   * a terminal state) so approvals from previous cycles cannot satisfy a new
+   * cycle.
+   */
+  cycleDecisionIds?: string[];
 }
 
 export interface IssueExecutionDecision {

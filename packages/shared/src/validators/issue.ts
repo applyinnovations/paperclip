@@ -5,6 +5,7 @@ import { maxStringLength } from "./text.js";
 import { ISSUE_SUMMARIES_MAX_IDS } from "../constants.js";
 
 import {
+  ISSUE_EXECUTION_DECISION_INPUTS,
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
   ISSUE_EXECUTION_MONITOR_KINDS,
@@ -547,6 +548,7 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   completionRequested: z.boolean().optional(),
+  cycleDecisionIds: z.array(z.string().guid()).optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
@@ -993,6 +995,7 @@ export const updateIssueSchema = objectWithoutDefaults(
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
+    decision: z.enum(ISSUE_EXECUTION_DECISION_INPUTS).optional(),
     commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),

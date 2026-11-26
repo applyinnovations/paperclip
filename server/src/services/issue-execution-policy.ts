@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   IssueExecutionDecision,
+  IssueExecutionDecisionInput,
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
@@ -47,12 +48,28 @@ type TransitionInput = {
   policy: IssueExecutionPolicy | null;
   previousPolicy?: IssueExecutionPolicy | null;
   requestedStatus?: string;
+  decision?: IssueExecutionDecisionInput;
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
   allowBoardOverride?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+};
+
+export type ExecutionPolicyDecisionLike = {
+  id?: string | null;
+  stageId: string;
+  outcome: "approved" | "changes_requested" | string;
+  createdAt?: Date | string | null;
+};
+
+export type UnsatisfiedExecutionStageSummary = {
+  stageId: string;
+  stageType: "review" | "approval";
+  approvalsNeeded: number;
+  approvalsRecorded: number;
+  lastOutcome: "approved" | "changes_requested" | null;
 };
 
 type TransitionResult = {
@@ -74,6 +91,8 @@ const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_request
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
+const STRUCTURED_DECISION_GUIDANCE =
+  'Submit a structured review decision (decision: "approve" or "request_changes" with a comment including Reviewed-SHA) instead of patching status directly.';
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
 
 function normalizeMonitorNotes(notes: string | null | undefined) {
@@ -127,6 +146,105 @@ function blankExecutionState(): IssueExecutionState {
     lastDecisionId: null,
     lastDecisionOutcome: null,
     monitor: null,
+    cycleDecisionIds: [],
+  };
+}
+
+function inheritCycleDecisionIds(previous: IssueExecutionState | null): string[] | undefined {
+  if (!previous || previous.status === "idle") return [];
+  if (previous.cycleDecisionIds !== undefined) return [...previous.cycleDecisionIds];
+  if (previous.completedStageIds.length === 0) {
+    return previous.lastDecisionId ? [previous.lastDecisionId] : [];
+  }
+  return undefined;
+}
+
+export function hydrateLegacyCycleDecisionIds(input: {
+  executionState: IssueExecutionState | null;
+  decisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  policy?: IssueExecutionPolicy | null;
+}): string[] {
+  const state = input.executionState;
+  if (!state || state.status === "idle") return [];
+  if (state.cycleDecisionIds !== undefined) return [...state.cycleDecisionIds];
+  if (state.completedStageIds.length === 0) {
+    return state.lastDecisionId ? [state.lastDecisionId] : [];
+  }
+
+  const ordered = sortExecutionDecisionsChronologically(input.decisions);
+  const stageById = new Map(
+    (input.policy?.stages ?? []).map((stage) => [stage.id, stage]),
+  );
+  const hydratedIds = new Set<string>();
+
+  for (const stageId of state.completedStageIds) {
+    const stageDecisions = ordered.filter(
+      (decision) =>
+        decision.stageId === stageId &&
+        typeof decision.id === "string" &&
+        decision.id.length > 0,
+    );
+    let lastChangesRequestedIndex = -1;
+    for (let i = stageDecisions.length - 1; i >= 0; i -= 1) {
+      if (stageDecisions[i]!.outcome === "changes_requested") {
+        lastChangesRequestedIndex = i;
+        break;
+      }
+    }
+    const trailingApprovals = stageDecisions
+      .slice(lastChangesRequestedIndex + 1)
+      .filter((decision) => decision.outcome === "approved");
+    if (trailingApprovals.length > 0) {
+      const configuredStage = stageById.get(stageId);
+      const selectedApprovals = configuredStage
+        ? trailingApprovals.slice(-Math.max(1, configuredStage.approvalsNeeded ?? 1))
+        : trailingApprovals;
+      for (const decision of selectedApprovals) {
+        if (typeof decision.id === "string") {
+          hydratedIds.add(decision.id);
+        }
+      }
+    } else if (lastChangesRequestedIndex >= 0) {
+      const latestChangesRequested = stageDecisions[lastChangesRequestedIndex];
+      if (typeof latestChangesRequested?.id === "string") {
+        hydratedIds.add(latestChangesRequested.id);
+      }
+    }
+  }
+
+  if (
+    state.lastDecisionId &&
+    ordered.some((decision) => decision.id === state.lastDecisionId)
+  ) {
+    hydratedIds.add(state.lastDecisionId);
+  }
+
+  return Array.from(hydratedIds);
+}
+
+export function withRecordedExecutionDecision(
+  state: IssueExecutionState,
+  decisionId: string,
+  hydratedCycleDecisionIds?: ReadonlyArray<string>,
+): IssueExecutionState {
+  const baseCycleDecisionIds =
+    state.cycleDecisionIds !== undefined
+      ? state.cycleDecisionIds
+      : hydratedCycleDecisionIds !== undefined
+        ? hydratedCycleDecisionIds
+        : state.completedStageIds.length === 0
+          ? state.lastDecisionId
+            ? [state.lastDecisionId]
+            : []
+          : undefined;
+  const cycleDecisionIds =
+    baseCycleDecisionIds !== undefined
+      ? Array.from(new Set([...baseCycleDecisionIds, decisionId]))
+      : undefined;
+  return {
+    ...state,
+    lastDecisionId: decisionId,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -512,6 +630,7 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
 
 function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
   const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
+  const cycleDecisionIds = inheritCycleDecisionIds(previous);
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -526,6 +645,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
     ...(previous?.completionRequested !== undefined ? { completionRequested: previous.completionRequested } : {}),
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -534,6 +654,7 @@ function buildStateWithCompletedStages(input: {
   completedStageIds: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: input.previous?.status ?? PENDING_STATUS,
     currentStageId: input.previous?.currentStageId ?? null,
@@ -546,6 +667,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -554,6 +676,7 @@ function buildSkippedStageCompletedState(input: {
   completedStageIds: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: COMPLETED_STATUS,
     currentStageId: null,
@@ -566,6 +689,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -580,6 +704,7 @@ function buildPendingState(input: {
   completionRequested?: boolean;
 }): IssueExecutionState {
   const completionRequested = input.completionRequested ?? input.previous?.completionRequested;
+  const cycleDecisionIds = inheritCycleDecisionIds(input.previous);
   return {
     status: PENDING_STATUS,
     currentStageId: input.stage.id,
@@ -594,6 +719,7 @@ function buildPendingState(input: {
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     ...(completionRequested !== undefined ? { completionRequested } : {}),
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -602,6 +728,7 @@ function buildChangesRequestedState(
   currentStage: IssueExecutionStage,
   changesRequestedCount: number,
 ): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(previous);
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
@@ -610,6 +737,7 @@ function buildChangesRequestedState(
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
     changesRequestedCount,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -651,11 +779,180 @@ function clearExecutionStatePatch(input: {
   }
 }
 
+export function getRequiredExecutionStages(
+  policy: IssueExecutionPolicy | null | undefined,
+): IssueExecutionStage[] {
+  if (!policy) return [];
+  return policy.stages.filter(
+    (stage) =>
+      (stage.type === "review" || stage.type === "approval") &&
+      stage.participants.length > 0,
+  );
+}
+
+function participantKeys(stage: IssueExecutionStage): Set<string> {
+  const keys = new Set<string>();
+  for (const participant of stage.participants) {
+    if (participant.type === "agent" && participant.agentId) {
+      keys.add(`agent:${participant.agentId}`);
+    } else if (participant.type === "user" && participant.userId) {
+      keys.add(`user:${participant.userId}`);
+    }
+  }
+  return keys;
+}
+
+function stagePreserved(
+  previousStage: IssueExecutionStage,
+  nextStage: IssueExecutionStage | undefined,
+): boolean {
+  if (!nextStage) return false;
+  if (nextStage.type !== previousStage.type) return false;
+  if ((nextStage.approvalsNeeded ?? 1) < (previousStage.approvalsNeeded ?? 1)) return false;
+  const prevKeys = participantKeys(previousStage);
+  const nextKeys = participantKeys(nextStage);
+  if (prevKeys.size !== nextKeys.size) return false;
+  for (const key of prevKeys) {
+    if (!nextKeys.has(key)) return false;
+  }
+  return true;
+}
+
+export function hasRemovedRequiredExecutionStages(
+  previousPolicy: IssueExecutionPolicy | null | undefined,
+  nextPolicy: IssueExecutionPolicy | null | undefined,
+): IssueExecutionStage[] {
+  const previousRequired = getRequiredExecutionStages(previousPolicy);
+  if (previousRequired.length === 0) return [];
+  const nextById = new Map(
+    getRequiredExecutionStages(nextPolicy).map((stage) => [stage.id, stage]),
+  );
+  return previousRequired.filter((stage) => !stagePreserved(stage, nextById.get(stage.id)));
+}
+
+function decisionTimestampMs(value: Date | string | null | undefined): number {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  return 0;
+}
+
+function sortExecutionDecisionsChronologically(
+  decisions: ReadonlyArray<ExecutionPolicyDecisionLike>,
+): ExecutionPolicyDecisionLike[] {
+  return decisions
+    .map((decision, index) => ({ decision, index }))
+    .sort((left, right) => {
+      const timeDiff =
+        decisionTimestampMs(left.decision.createdAt) -
+        decisionTimestampMs(right.decision.createdAt);
+      if (timeDiff !== 0) return timeDiff;
+      const leftId = left.decision.id ?? "";
+      const rightId = right.decision.id ?? "";
+      if (leftId !== rightId) return leftId.localeCompare(rightId);
+      return left.index - right.index;
+    })
+    .map((entry) => entry.decision);
+}
+
+export function evaluateExecutionPolicyStageSatisfaction(input: {
+  policy: IssueExecutionPolicy | null | undefined;
+  decisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  executionState?: IssueExecutionState | null;
+  pendingDecision?: Pick<IssueExecutionDecision, "stageId" | "outcome"> | null;
+}): {
+  satisfied: boolean;
+  unsatisfiedStages: UnsatisfiedExecutionStageSummary[];
+} {
+  const requiredStages = getRequiredExecutionStages(input.policy);
+  if (requiredStages.length === 0) {
+    return { satisfied: true, unsatisfiedStages: [] };
+  }
+
+  let scopedPersistedDecisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  if (input.executionState === undefined) {
+    scopedPersistedDecisions = input.decisions;
+  } else if (input.executionState === null || input.executionState.status === "idle") {
+    // No stages have been completed in the current review cycle (for example a
+    // fresh issue or an issue reopened from done/cancelled). Historical rows in
+    // `issue_execution_decisions` from previous cycles must not satisfy it.
+    scopedPersistedDecisions = [];
+  } else if (Array.isArray(input.executionState.cycleDecisionIds)) {
+    const cycleDecisionIds = new Set(input.executionState.cycleDecisionIds);
+    scopedPersistedDecisions = input.decisions.filter(
+      (decision) => typeof decision.id === "string" && cycleDecisionIds.has(decision.id),
+    );
+  } else {
+    // Legacy state persisted before `cycleDecisionIds` existed: only stages
+    // recorded as completed in this execution state may draw on persisted rows.
+    const completedStageIds = new Set(input.executionState.completedStageIds);
+    scopedPersistedDecisions = input.decisions.filter((decision) =>
+      completedStageIds.has(decision.stageId),
+    );
+  }
+
+  const orderedPersisted = sortExecutionDecisionsChronologically(scopedPersistedDecisions);
+
+  const orderedAll: ExecutionPolicyDecisionLike[] = input.pendingDecision
+    ? [
+        ...orderedPersisted,
+        {
+          stageId: input.pendingDecision.stageId,
+          outcome: input.pendingDecision.outcome,
+        },
+      ]
+    : orderedPersisted;
+
+  const unsatisfiedStages: UnsatisfiedExecutionStageSummary[] = [];
+
+  for (const stage of requiredStages) {
+    const approvalsNeeded = stage.approvalsNeeded ?? 1;
+    let approvalsRecorded = 0;
+    let lastOutcome: "approved" | "changes_requested" | null = null;
+    for (const decision of orderedAll) {
+      if (decision.stageId !== stage.id) continue;
+      if (decision.outcome === "changes_requested") {
+        approvalsRecorded = 0;
+        lastOutcome = "changes_requested";
+      } else if (decision.outcome === "approved") {
+        approvalsRecorded += 1;
+        lastOutcome = "approved";
+      }
+    }
+    if (approvalsRecorded < approvalsNeeded || lastOutcome !== "approved") {
+      unsatisfiedStages.push({
+        stageId: stage.id,
+        stageType: stage.type,
+        approvalsNeeded,
+        approvalsRecorded,
+        lastOutcome,
+      });
+    }
+  }
+
+  return {
+    satisfied: unsatisfiedStages.length === 0,
+    unsatisfiedStages,
+  };
+}
+
 function canAutoSkipPendingStage(input: {
   stage: IssueExecutionStage;
   returnAssignee: IssueExecutionStagePrincipal | null;
   requestedStatus?: string;
+  existingState?: IssueExecutionState | null;
 }) {
+  if (
+    input.existingState?.status === CHANGES_REQUESTED_STATUS ||
+    input.existingState?.lastDecisionOutcome === "changes_requested"
+  ) {
+    return false;
+  }
   if (input.requestedStatus !== "done" || input.stage.type !== "review" || !input.returnAssignee) {
     return false;
   }
@@ -673,10 +970,32 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   const explicitAssignee = assigneePrincipal(input.requestedAssigneePatch);
   const currentStage = input.policy ? findStageById(input.policy, existingState?.currentStageId) : null;
   const requestedStatus = input.requestedStatus;
+  const requestedDecision = input.decision;
   const activeStage = currentStage && existingState?.status === PENDING_STATUS ? currentStage : null;
   const effectiveReviewRequest = input.reviewRequest === undefined
     ? existingState?.reviewRequest ?? null
     : input.reviewRequest;
+
+  if (requestedDecision !== undefined) {
+    if (!activeStage) {
+      throw unprocessable(
+        "Submitting a structured review decision requires an active review or approval stage",
+        { code: "no_active_execution_stage" },
+      );
+    }
+    if (requestedDecision === "approve" && requestedStatus !== undefined && requestedStatus !== "done") {
+      throw unprocessable(
+        'decision "approve" cannot be combined with a non-done status',
+        { code: "conflicting_execution_decision" },
+      );
+    }
+    if (requestedDecision === "request_changes" && requestedStatus === "done") {
+      throw unprocessable(
+        'decision "request_changes" cannot be combined with status "done"',
+        { code: "conflicting_execution_decision" },
+      );
+    }
+  }
 
   if (!input.policy) {
     if (existingState) {
@@ -753,6 +1072,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       // advance" rule below — and a drifted assignee must be re-asserted
       // rather than left pointing away from the escalated human.
       const attemptedAdvanceDuringHold =
+        requestedDecision !== undefined ||
         (requestedStatus !== undefined && requestedStatus !== "in_review") ||
         (requestedAssigneePatchProvided && !principalsEqual(explicitAssignee, currentParticipant));
       if (attemptedAdvanceDuringHold) {
@@ -806,9 +1126,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
-      if (requestedStatus === "done") {
+      if (requestedDecision === "approve" || requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
-          throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
+          throw unprocessable(
+            `Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT} ${STRUCTURED_DECISION_GUIDANCE}`,
+            { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
+          );
         }
         const approvedState = buildCompletedState(existingState, activeStage);
         // Only stages after the stage being approved are advance candidates.
@@ -829,7 +1152,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           patch.executionState = approvedState;
           if (existingState?.completionRequested === true) {
             // The executor explicitly marked the work complete and this was the
-            // last gate: the reviewer's `done` closes the issue.
+            // last gate: the reviewer's approval closes the issue.
+            if (requestedStatus === undefined) {
+              patch.status = "done";
+            }
             return { patch, decision };
           }
           // The executor only asked for review; delivery (merge, release,
@@ -868,6 +1194,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
       if (
         input.allowBoardOverride &&
+        requestedDecision === undefined &&
         requestedStatus &&
         requestedStatus !== "in_review" &&
         requestedStatus !== "in_progress"
@@ -876,9 +1203,25 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         return { patch };
       }
 
-      if (requestedStatus && requestedStatus !== "in_review") {
+      if (
+        !input.allowBoardOverride &&
+        requestedDecision === undefined &&
+        requestedStatus !== undefined &&
+        requestedStatus !== "in_review" &&
+        requestedStatus !== "in_progress"
+      ) {
+        throw unprocessable(
+          `Cannot patch status to "${requestedStatus}" while an active ${activeStage.type} stage is pending. ${STRUCTURED_DECISION_GUIDANCE}`,
+          { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
+        );
+      }
+
+      if (requestedDecision === "request_changes" || (requestedStatus && requestedStatus !== "in_review")) {
         if (!input.commentBody?.trim()) {
-          throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
+          throw unprocessable(
+            `Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT} ${STRUCTURED_DECISION_GUIDANCE}`,
+            { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
+          );
         }
         if (!existingState?.returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
@@ -903,7 +1246,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             // counter), or re-scopes.
             buildPendingStagePatch({
               patch,
-              previous: existingState,
+              previous: {
+                ...existingState,
+                lastDecisionOutcome: "changes_requested",
+              },
               policy: input.policy,
               stage: activeStage,
               participant: { type: "user", agentId: null, userId: escalationUserId },
@@ -930,6 +1276,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     const attemptedStageAdvance =
+      requestedDecision !== undefined ||
       (requestedStatus !== undefined && requestedStatus !== "in_review") ||
       (requestedAssigneePatchProvided && !principalsEqual(explicitAssignee, currentParticipant));
     const stageStateDrifted =
@@ -968,8 +1315,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       return { patch };
     }
 
-    if (attemptedStageAdvance && !stageStateDrifted) {
-      throw unprocessable("Only the active reviewer or approver can advance the current execution stage");
+    if ((attemptedStageAdvance && !stageStateDrifted) || requestedStatus === "done" || requestedDecision !== undefined) {
+      throw unprocessable(
+        `Only the active reviewer or approver can advance the current execution stage. ${STRUCTURED_DECISION_GUIDANCE}`,
+        { code: "active_reviewer_required", stageId: activeStage.id, stageType: activeStage.type },
+      );
     }
 
     if (stageStateDrifted) {
@@ -1020,7 +1370,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         : explicitAssignee,
     exclude: returnAssignee,
   });
-  while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
+  while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus, existingState })) {
     skippedStageIds.push(pendingStage.id);
     pendingStage = nextPendingStage(
       input.policy,
