@@ -755,4 +755,193 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       }),
     ).resolves.toBeUndefined();
   });
+
+  it("upgrades a legacy two-stage executionState across stage-2 changes_requested -> resubmit -> approve without replaying stage 1", async () => {
+    const seeded = await seedCompany("XDL2");
+    const approverAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: approverAgentId,
+      companyId: seeded.companyId,
+      name: "XDL2 Approver",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    const reviewStageId = randomUUID();
+    const approvalStageId = randomUUID();
+    const priorCycleApprovalId = randomUUID();
+    const reviewDecisionId = randomUUID();
+
+    // Seed a legacy pre-deploy two-stage issue where review is already completed
+    // and approval is pending, with NO `cycleDecisionIds` persisted yet.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      identifier: "XDL2-1",
+      title: "Legacy two-stage review then approval",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: approverAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerAgentId }],
+          },
+          {
+            id: approvalStageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: approverAgentId }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentStageIndex: 1,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: approverAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.implementerAgentId },
+        completedStageIds: [reviewStageId],
+        lastDecisionId: reviewDecisionId,
+        lastDecisionOutcome: "approved",
+        completionRequested: true,
+      },
+    });
+
+    // Seed both a historical prior-cycle approval on stage 2 (must NOT leak into
+    // this cycle) and the current-cycle approval on stage 1 (MUST be preserved).
+    await db.insert(issueExecutionDecisions).values([
+      {
+        id: priorCycleApprovalId,
+        companyId: seeded.companyId,
+        issueId,
+        stageId: approvalStageId,
+        stageType: "approval",
+        actorAgentId: approverAgentId,
+        outcome: "approved",
+        body: `Prior cycle approval.\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+        createdAt: new Date("2026-11-24T01:00:00.000Z"),
+      },
+      {
+        id: reviewDecisionId,
+        companyId: seeded.companyId,
+        issueId,
+        stageId: reviewStageId,
+        stageType: "review",
+        actorAgentId: seeded.reviewerAgentId,
+        outcome: "approved",
+        body: `Stage 1 review approved.\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+        createdAt: new Date("2026-11-25T01:00:00.000Z"),
+      },
+    ]);
+
+    // 1. Approver requests changes at stage 2 (approval).
+    const approverRun1 = await seedRun(seeded.companyId, approverAgentId, issueId);
+    const changesRes = await request(app(agentActor(seeded.companyId, approverAgentId, approverRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "request_changes",
+        comment: "Please update release notes before final approval.",
+      });
+    expect(changesRes.status, JSON.stringify(changesRes.body)).toBe(200);
+    expect(changesRes.body.status).toBe("in_progress");
+    expect(changesRes.body.assigneeAgentId).toBe(seeded.implementerAgentId);
+    const changesDecisionId = changesRes.body.executionState.lastDecisionId as string;
+    expect(changesDecisionId).toBeTruthy();
+    expect(changesRes.body.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: approvalStageId,
+      completedStageIds: [reviewStageId],
+      lastDecisionOutcome: "changes_requested",
+      cycleDecisionIds: [reviewDecisionId, changesDecisionId],
+    });
+    expect(changesRes.body.executionState.cycleDecisionIds).not.toContain(priorCycleApprovalId);
+
+    // 2. Implementer fixes and resubmits -> routes directly back to stage 2 (does NOT replay stage 1).
+    const implRun1 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const resubmitRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "done",
+        comment: "Updated release notes; ready for final approval.",
+      });
+    expect(resubmitRes.status, JSON.stringify(resubmitRes.body)).toBe(200);
+    expect(resubmitRes.body.status).toBe("in_review");
+    expect(resubmitRes.body.assigneeAgentId).toBe(approverAgentId);
+    expect(resubmitRes.body.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStageId,
+      currentStageType: "approval",
+      completedStageIds: [reviewStageId],
+      completionRequested: true,
+      cycleDecisionIds: [reviewDecisionId, changesDecisionId],
+    });
+
+    // 3. Implementer still cannot strip the policy while stage 2 is unsatisfied
+    // (the historical prior-cycle approval on stage 2 must not satisfy it).
+    const stripRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(stripRes.status, JSON.stringify(stripRes.body)).toBe(422);
+    expect(stripRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
+
+    // 4. Approver approves stage 2 -> issue completes directly to `done` without replaying stage 1!
+    const approverRun2 = await seedRun(seeded.companyId, approverAgentId, issueId);
+    const approveRes = await request(app(agentActor(seeded.companyId, approverAgentId, approverRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        decision: "approve",
+        comment: `Release notes look good.\n\nReviewed-SHA: ${REVIEWED_SHA}`,
+      });
+    expect(approveRes.status, JSON.stringify(approveRes.body)).toBe(200);
+    expect(approveRes.body.status).toBe("done");
+    const finalApprovalDecisionId = approveRes.body.executionState.lastDecisionId as string;
+    expect(approveRes.body.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [reviewStageId, approvalStageId],
+      lastDecisionOutcome: "approved",
+      cycleDecisionIds: [reviewDecisionId, changesDecisionId, finalApprovalDecisionId],
+    });
+
+    const [persistedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persistedIssue?.status).toBe("done");
+    const allDecisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(allDecisions.filter((row) => row.stageId === reviewStageId)).toHaveLength(1);
+    expect(allDecisions.filter((row) => row.stageId === approvalStageId)).toHaveLength(3);
+
+    // 5. Reopening after completion still resets executionState and isolates the new cycle.
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      companyIds: [seeded.companyId],
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    };
+    const reopenRes = await request(app(boardActor))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(reopenRes.status, JSON.stringify(reopenRes.body)).toBe(200);
+    expect(reopenRes.body.executionState).toBeNull();
+
+    const implRun2 = await seedRun(seeded.companyId, seeded.implementerAgentId, issueId);
+    const postReopenStripRes = await request(app(agentActor(seeded.companyId, seeded.implementerAgentId, implRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: null, status: "done" });
+    expect(postReopenStripRes.status, JSON.stringify(postReopenStripRes.body)).toBe(422);
+    expect(postReopenStripRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
+  });
 });

@@ -375,6 +375,7 @@ import {
 import {
   assertAgentExecutionPolicyStagesNotRemoved,
   assertAgentExecutionPolicyStagesSatisfied,
+  loadHydratedLegacyCycleDecisionIds,
 } from "../services/issue-execution-policy-guards.js";
 import { recordIssueExecutionDecision } from "../services/issue-execution-decisions.js";
 import { buildExecutionWorkspaceAdapterConfig, parseProjectExecutionWorkspacePolicy, parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -10696,6 +10697,9 @@ export function issueRoutes(
             const executionPolicy = normalizeIssueExecutionPolicy(
               lockedIssue.executionPolicy ?? null,
             );
+            const lockedExecutionState = parseIssueExecutionState(
+              lockedIssue.executionState,
+            );
             const transition = applyIssueExecutionPolicyTransition({
               issue: lockedIssue,
               policy: executionPolicy,
@@ -10721,9 +10725,20 @@ export function issueRoutes(
                   "Execution policy decision patch is missing executionState",
                 );
               }
+              const typedNextExecutionState = nextExecutionState as IssueExecutionState;
+              const hydratedCycleDecisionIds =
+                typedNextExecutionState.cycleDecisionIds === undefined
+                  ? await loadHydratedLegacyCycleDecisionIds(tx as unknown as Db, {
+                      companyId: lockedIssue.companyId,
+                      issueId: lockedIssue.id,
+                      executionState: lockedExecutionState,
+                      policy: executionPolicy,
+                    })
+                  : undefined;
               updateFields.executionState = withRecordedExecutionDecision(
-                nextExecutionState as IssueExecutionState,
+                typedNextExecutionState,
                 decisionId,
+                hydratedCycleDecisionIds,
               );
               await recordIssueExecutionDecision(tx as unknown as Db, {
                 id: decisionId,
@@ -15044,9 +15059,20 @@ export function issueRoutes(
             "Execution policy decision patch is missing executionState",
           );
         }
+        const typedNextExecutionState = nextExecutionState as IssueExecutionState;
+        const hydratedCycleDecisionIds =
+          typedNextExecutionState.cycleDecisionIds === undefined
+            ? await loadHydratedLegacyCycleDecisionIds(db, {
+                companyId: existing.companyId,
+                issueId: existing.id,
+                executionState: currentCycleExecutionState,
+                policy: nextExecutionPolicy,
+              })
+            : undefined;
         transition.patch.executionState = withRecordedExecutionDecision(
-          nextExecutionState as IssueExecutionState,
+          typedNextExecutionState,
           decisionId,
+          hydratedCycleDecisionIds,
         );
       }
       if (expectedExecutionPolicy !== undefined && (
@@ -19853,9 +19879,20 @@ export function issueRoutes(
               "Execution policy decision patch is missing executionState",
             );
           }
+          const typedNextExecutionState = nextExecutionState as IssueExecutionState;
+          const hydratedCycleDecisionIds =
+            typedNextExecutionState.cycleDecisionIds === undefined
+              ? await loadHydratedLegacyCycleDecisionIds(db, {
+                  companyId: currentIssue.companyId,
+                  issueId: currentIssue.id,
+                  executionState: currentExecutionState,
+                  policy: currentExecutionPolicy,
+                })
+              : undefined;
           transition.patch.executionState = withRecordedExecutionDecision(
-            nextExecutionState as IssueExecutionState,
+            typedNextExecutionState,
             decisionId,
+            hydratedCycleDecisionIds,
           );
         }
 

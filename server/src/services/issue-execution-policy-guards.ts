@@ -11,6 +11,7 @@ import {
   evaluateExecutionPolicyStageSatisfaction,
   getRequiredExecutionStages,
   hasRemovedRequiredExecutionStages,
+  hydrateLegacyCycleDecisionIds,
   type ExecutionPolicyDecisionLike,
 } from "./issue-execution-policy.js";
 
@@ -58,6 +59,41 @@ async function loadRecordedStageDecisions(
     }
   }
   return decisions;
+}
+
+/**
+ * Hydrate current-cycle decision IDs from `issue_execution_decisions` when
+ * upgrading a pre-deploy `executionState` that has `completedStageIds` but no
+ * `cycleDecisionIds` yet. Returns `undefined` when no hydration is needed.
+ */
+export async function loadHydratedLegacyCycleDecisionIds(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    executionState: IssueExecutionState | null;
+    policy: IssueExecutionPolicy | null;
+  },
+): Promise<string[] | undefined> {
+  if (
+    !input.executionState ||
+    input.executionState.status === "idle" ||
+    input.executionState.cycleDecisionIds !== undefined ||
+    input.executionState.completedStageIds.length === 0
+  ) {
+    return undefined;
+  }
+
+  const recorded = await loadRecordedStageDecisions(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+  });
+
+  return hydrateLegacyCycleDecisionIds({
+    executionState: input.executionState,
+    decisions: recorded,
+    policy: input.policy,
+  });
 }
 
 /**

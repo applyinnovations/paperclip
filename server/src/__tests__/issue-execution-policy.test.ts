@@ -3,6 +3,7 @@ import {
   applyIssueExecutionPolicyTransition,
   evaluateExecutionPolicyStageSatisfaction,
   hasRemovedRequiredExecutionStages,
+  hydrateLegacyCycleDecisionIds,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   stripMonitorFromExecutionPolicy,
@@ -2931,5 +2932,179 @@ describe("mandatory structured review decisions", () => {
         },
       }),
     ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+  });
+
+  it("preserves completed earlier stage approvals when a legacy two-stage workflow requests changes at stage 2 and later approves", () => {
+    const twoStage = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "approval", participants: [{ type: "agent", agentId: ctoAgentId }] },
+    ]);
+    const reviewStageId = twoStage.stages[0].id;
+    const approvalStageId = twoStage.stages[1].id;
+    const priorCycleApprovalId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01";
+    const reviewApprovedId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb01";
+    const approvalChangesId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02";
+    const approvalApprovedId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb03";
+    const t0 = new Date("2026-11-25T01:00:00.000Z");
+    const t1 = new Date("2026-11-26T01:00:00.000Z");
+    const t2 = new Date("2026-11-26T02:00:00.000Z");
+    const t3 = new Date("2026-11-26T03:00:00.000Z");
+
+    const legacyPendingApprovalState: IssueExecutionState = {
+      status: "pending",
+      currentStageId: approvalStageId,
+      currentStageIndex: 1,
+      currentStageType: "approval",
+      currentParticipant: { type: "agent", agentId: ctoAgentId, userId: null },
+      returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [reviewStageId],
+      lastDecisionId: reviewApprovedId,
+      lastDecisionOutcome: "approved",
+      completionRequested: true,
+    };
+
+    const recordedBeforeChanges = [
+      { id: priorCycleApprovalId, stageId: approvalStageId, outcome: "approved", createdAt: t0 },
+      { id: reviewApprovedId, stageId: reviewStageId, outcome: "approved", createdAt: t1 },
+    ];
+
+    // 1. Direct approval from legacy state satisfies both stages without replaying review.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoStage,
+        decisions: recordedBeforeChanges,
+        executionState: legacyPendingApprovalState,
+        pendingDecision: { stageId: approvalStageId, outcome: "approved" },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // 2. Stage 2 requests changes.
+    const changesTransition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: twoStage,
+        executionState: legacyPendingApprovalState,
+      },
+      policy: twoStage,
+      decision: "request_changes",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Please fix issue before final approval.",
+    });
+
+    // 2a. Pure-helper path (without DB hydration) must NOT initialize cycleDecisionIds to only [approvalChangesId].
+    const afterChangesPure = withRecordedExecutionDecision(
+      changesTransition.patch.executionState as IssueExecutionState,
+      approvalChangesId,
+    );
+    expect(afterChangesPure.completedStageIds).toEqual([reviewStageId]);
+    expect(afterChangesPure.cycleDecisionIds).toBeUndefined();
+
+    const resubmittedPure = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: twoStage,
+        executionState: afterChangesPure,
+      },
+      policy: twoStage,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+    const pendingRetryPure = resubmittedPure.patch.executionState as IssueExecutionState;
+    expect(pendingRetryPure.currentStageId).toBe(approvalStageId);
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoStage,
+        decisions: [
+          ...recordedBeforeChanges,
+          { id: approvalChangesId, stageId: approvalStageId, outcome: "changes_requested", createdAt: t2 },
+        ],
+        executionState: pendingRetryPure,
+        pendingDecision: { stageId: approvalStageId, outcome: "approved" },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // 2b. Hydrated upgrade path preserves reviewApprovedId and excludes prior-cycle approvalStageId history.
+    const hydratedIds = hydrateLegacyCycleDecisionIds({
+      executionState: legacyPendingApprovalState,
+      decisions: recordedBeforeChanges,
+      policy: twoStage,
+    });
+    expect(hydratedIds).toEqual([reviewApprovedId]);
+
+    const afterChangesHydrated = withRecordedExecutionDecision(
+      changesTransition.patch.executionState as IssueExecutionState,
+      approvalChangesId,
+      hydratedIds,
+    );
+    expect(afterChangesHydrated.cycleDecisionIds).toEqual([reviewApprovedId, approvalChangesId]);
+
+    const resubmittedHydrated = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: twoStage,
+        executionState: afterChangesHydrated,
+      },
+      policy: twoStage,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+    const pendingRetryHydrated = resubmittedHydrated.patch.executionState as IssueExecutionState;
+    expect(pendingRetryHydrated.currentStageId).toBe(approvalStageId);
+    expect(pendingRetryHydrated.cycleDecisionIds).toEqual([reviewApprovedId, approvalChangesId]);
+
+    // Retrying stage-2 approval satisfies both stages without replaying review.
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoStage,
+        decisions: [
+          ...recordedBeforeChanges,
+          { id: approvalChangesId, stageId: approvalStageId, outcome: "changes_requested", createdAt: t2 },
+        ],
+        executionState: pendingRetryHydrated,
+        pendingDecision: { stageId: approvalStageId, outcome: "approved" },
+      }),
+    ).toEqual({ satisfied: true, unsatisfiedStages: [] });
+
+    // And for approvalsNeeded: 2 on stage 2, priorCycleApprovalId from before reopen is NOT mixed in.
+    const twoApprovalFinalStagePolicy: IssueExecutionPolicy = {
+      ...twoStage,
+      stages: [
+        twoStage.stages[0],
+        { ...twoStage.stages[1], approvalsNeeded: 2 as unknown as 1 },
+      ],
+    };
+    expect(
+      evaluateExecutionPolicyStageSatisfaction({
+        policy: twoApprovalFinalStagePolicy,
+        decisions: [
+          ...recordedBeforeChanges,
+          { id: approvalChangesId, stageId: approvalStageId, outcome: "changes_requested", createdAt: t2 },
+          { id: approvalApprovedId, stageId: approvalStageId, outcome: "approved", createdAt: t3 },
+        ],
+        executionState: {
+          ...pendingRetryHydrated,
+          cycleDecisionIds: [reviewApprovedId, approvalChangesId, approvalApprovedId],
+        },
+      }),
+    ).toMatchObject({
+      satisfied: false,
+      unsatisfiedStages: [
+        expect.objectContaining({
+          stageId: approvalStageId,
+          approvalsNeeded: 2,
+          approvalsRecorded: 1,
+        }),
+      ],
+    });
   });
 });

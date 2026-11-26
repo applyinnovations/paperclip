@@ -153,20 +153,94 @@ function blankExecutionState(): IssueExecutionState {
 function inheritCycleDecisionIds(previous: IssueExecutionState | null): string[] | undefined {
   if (!previous || previous.status === "idle") return [];
   if (previous.cycleDecisionIds !== undefined) return [...previous.cycleDecisionIds];
-  if (previous.completedStageIds.length === 0) return [];
+  if (previous.completedStageIds.length === 0) {
+    return previous.lastDecisionId ? [previous.lastDecisionId] : [];
+  }
   return undefined;
+}
+
+export function hydrateLegacyCycleDecisionIds(input: {
+  executionState: IssueExecutionState | null;
+  decisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
+  policy?: IssueExecutionPolicy | null;
+}): string[] {
+  const state = input.executionState;
+  if (!state || state.status === "idle") return [];
+  if (state.cycleDecisionIds !== undefined) return [...state.cycleDecisionIds];
+  if (state.completedStageIds.length === 0) {
+    return state.lastDecisionId ? [state.lastDecisionId] : [];
+  }
+
+  const ordered = sortExecutionDecisionsChronologically(input.decisions);
+  const stageById = new Map(
+    (input.policy?.stages ?? []).map((stage) => [stage.id, stage]),
+  );
+  const hydratedIds = new Set<string>();
+
+  for (const stageId of state.completedStageIds) {
+    const stageDecisions = ordered.filter(
+      (decision) =>
+        decision.stageId === stageId &&
+        typeof decision.id === "string" &&
+        decision.id.length > 0,
+    );
+    let lastChangesRequestedIndex = -1;
+    for (let i = stageDecisions.length - 1; i >= 0; i -= 1) {
+      if (stageDecisions[i]!.outcome === "changes_requested") {
+        lastChangesRequestedIndex = i;
+        break;
+      }
+    }
+    const trailingApprovals = stageDecisions
+      .slice(lastChangesRequestedIndex + 1)
+      .filter((decision) => decision.outcome === "approved");
+    if (trailingApprovals.length > 0) {
+      const configuredStage = stageById.get(stageId);
+      const selectedApprovals = configuredStage
+        ? trailingApprovals.slice(-Math.max(1, configuredStage.approvalsNeeded ?? 1))
+        : trailingApprovals;
+      for (const decision of selectedApprovals) {
+        if (typeof decision.id === "string") {
+          hydratedIds.add(decision.id);
+        }
+      }
+    } else if (lastChangesRequestedIndex >= 0) {
+      const latestChangesRequested = stageDecisions[lastChangesRequestedIndex];
+      if (typeof latestChangesRequested?.id === "string") {
+        hydratedIds.add(latestChangesRequested.id);
+      }
+    }
+  }
+
+  if (
+    state.lastDecisionId &&
+    ordered.some((decision) => decision.id === state.lastDecisionId)
+  ) {
+    hydratedIds.add(state.lastDecisionId);
+  }
+
+  return Array.from(hydratedIds);
 }
 
 export function withRecordedExecutionDecision(
   state: IssueExecutionState,
   decisionId: string,
+  hydratedCycleDecisionIds?: ReadonlyArray<string>,
 ): IssueExecutionState {
-  const cycleDecisionIds =
+  const baseCycleDecisionIds =
     state.cycleDecisionIds !== undefined
-      ? Array.from(new Set([...state.cycleDecisionIds, decisionId]))
-      : state.completedStageIds.length <= 1
-        ? [decisionId]
-        : undefined;
+      ? state.cycleDecisionIds
+      : hydratedCycleDecisionIds !== undefined
+        ? hydratedCycleDecisionIds
+        : state.completedStageIds.length === 0
+          ? state.lastDecisionId
+            ? [state.lastDecisionId]
+            : []
+          : undefined;
+  const cycleDecisionIds =
+    baseCycleDecisionIds !== undefined
+      ? Array.from(new Set([...baseCycleDecisionIds, decisionId]))
+      : undefined;
   return {
     ...state,
     lastDecisionId: decisionId,
@@ -654,6 +728,7 @@ function buildChangesRequestedState(
   currentStage: IssueExecutionStage,
   changesRequestedCount: number,
 ): IssueExecutionState {
+  const cycleDecisionIds = inheritCycleDecisionIds(previous);
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
@@ -662,6 +737,7 @@ function buildChangesRequestedState(
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
     changesRequestedCount,
+    ...(cycleDecisionIds !== undefined ? { cycleDecisionIds } : {}),
   };
 }
 
@@ -766,6 +842,24 @@ function decisionTimestampMs(value: Date | string | null | undefined): number {
   return 0;
 }
 
+function sortExecutionDecisionsChronologically(
+  decisions: ReadonlyArray<ExecutionPolicyDecisionLike>,
+): ExecutionPolicyDecisionLike[] {
+  return decisions
+    .map((decision, index) => ({ decision, index }))
+    .sort((left, right) => {
+      const timeDiff =
+        decisionTimestampMs(left.decision.createdAt) -
+        decisionTimestampMs(right.decision.createdAt);
+      if (timeDiff !== 0) return timeDiff;
+      const leftId = left.decision.id ?? "";
+      const rightId = right.decision.id ?? "";
+      if (leftId !== rightId) return leftId.localeCompare(rightId);
+      return left.index - right.index;
+    })
+    .map((entry) => entry.decision);
+}
+
 export function evaluateExecutionPolicyStageSatisfaction(input: {
   policy: IssueExecutionPolicy | null | undefined;
   decisions: ReadonlyArray<ExecutionPolicyDecisionLike>;
@@ -802,19 +896,7 @@ export function evaluateExecutionPolicyStageSatisfaction(input: {
     );
   }
 
-  const orderedPersisted = scopedPersistedDecisions
-    .map((decision, index) => ({ decision, index }))
-    .sort((left, right) => {
-      const timeDiff =
-        decisionTimestampMs(left.decision.createdAt) -
-        decisionTimestampMs(right.decision.createdAt);
-      if (timeDiff !== 0) return timeDiff;
-      const leftId = left.decision.id ?? "";
-      const rightId = right.decision.id ?? "";
-      if (leftId !== rightId) return leftId.localeCompare(rightId);
-      return left.index - right.index;
-    })
-    .map((entry) => entry.decision);
+  const orderedPersisted = sortExecutionDecisionsChronologically(scopedPersistedDecisions);
 
   const orderedAll: ExecutionPolicyDecisionLike[] = input.pendingDecision
     ? [
