@@ -242,6 +242,10 @@ import {
   IssueMonitorComposerStrip,
   hasVisibleMonitorSurface,
 } from "../components/IssueMonitorBanner";
+import {
+  ExecutionStageDecisionCard,
+  canActOnPendingExecutionStage,
+} from "../components/ExecutionStageDecisionCard";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { ExternallyConnectedTaskBanner } from "../components/chat/ExternallyConnectedTaskBanner";
 import {
@@ -8632,8 +8636,24 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   onLoadOlderComments={loadOlderComments}
                   onRefreshLatestComments={refetchLatestComments}
                   composerRef={commentComposerRef}
-                  composerAccessory={
-                    hasVisibleMonitorSurface(issue) ? (
+                  composerAccessory={(() => {
+                    const showDecisionCard = canActOnPendingExecutionStage(issue, currentUserId);
+                    const showMonitorStrip = hasVisibleMonitorSurface(issue);
+                    if (!showDecisionCard && !showMonitorStrip) return null;
+                    const decisionCard = showDecisionCard ? (
+                      <ExecutionStageDecisionCard
+                        issue={issue}
+                        currentUserId={currentUserId}
+                        agentMap={agentMap}
+                        userLabelMap={userLabelMap}
+                        onResolved={() => {
+                          invalidateIssueDetail();
+                          invalidateIssueCollections();
+                          void refetchLatestComments();
+                        }}
+                      />
+                    ) : null;
+                    const monitorStrip = showMonitorStrip ? (
                       <IssueMonitorComposerStrip
                         issue={issue}
                         hasActiveRun={hasLiveRuns}
@@ -8642,8 +8662,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                         onCheckNow={() => checkIssueMonitorNow.mutate()}
                         checkingNow={checkIssueMonitorNow.isPending}
                       />
-                    ) : null
-                  }
+                    ) : null;
+                    if (decisionCard && monitorStrip) {
+                      return (
+                        <div className="space-y-2">
+                          {decisionCard}
+                          {monitorStrip}
+                        </div>
+                      );
+                    }
+                    return decisionCard ?? monitorStrip;
+                  })()}
                   footer={
                     !taskChatShellEnabled && siblingNavigation ? (
                       <IssueSiblingNavigation
