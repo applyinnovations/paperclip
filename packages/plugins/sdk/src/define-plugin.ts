@@ -163,6 +163,16 @@ export interface PluginWebhookInput {
   requestId: string;
 }
 
+/**
+ * Optional result of `onWebhook`. The host answers the delivery with
+ * `status` when it is 2xx, 4xx or 5xx, and with 200 otherwise. A 4xx or 5xx
+ * also records the delivery as failed, so a provider's delivery history and
+ * the host's HTTP metrics show a rejected delivery instead of a success.
+ */
+export interface PluginWebhookResult {
+  status?: number;
+}
+
 export interface PluginApiRequestInput {
   routeKey: string;
   method: string;
@@ -334,10 +344,13 @@ export interface PluginDefinition {
    * If not implemented but webhooks are declared in the manifest, the host
    * returns HTTP 501 for webhook deliveries.
    *
+   * Return `{ status }` to choose the HTTP status the host answers with, for
+   * example 401 when a signature does not verify (see `PluginWebhookResult`).
+   *
    * @param input - Webhook delivery metadata and payload
    * @see PLUGIN_SPEC.md §13.7 — `handleWebhook`
    */
-  onWebhook?(input: PluginWebhookInput): Promise<void>;
+  onWebhook?(input: PluginWebhookInput): Promise<PluginWebhookResult | void>;
 
   /**
    * Called for manifest-declared scoped JSON API routes under
