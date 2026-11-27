@@ -6,6 +6,33 @@ cd "$(git rev-parse --show-toplevel)"
 export COREPACK_HOME="${COREPACK_HOME:-$PWD/.xlab/.cache/corepack}"
 export CI=true
 
+# CI_TEST_SCOPE picks what runs:
+#   full (default)  everything below, then the whole suite in one process
+#   changed         everything below, then the test files the PR adds or changes
+#   lane            one lane of the nightly full suite (CI_TEST_LANE, from
+#                   .xlab/full-test-lanes.txt): install, build and its shards,
+#                   plus the static checks (xlab scripts, typecheck) in the
+#                   lane that lists them
+scope=${CI_TEST_SCOPE:-full}
+run_static=true
+lane_steps=()
+case $scope in
+  full | changed) ;;
+  lane)
+    : "${CI_TEST_LANE:?set CI_TEST_LANE to a lane in .xlab/full-test-lanes.txt}"
+    lane_plan=$(python3 -I .xlab/full_test_lanes.py plan "$CI_TEST_LANE")
+    mapfile -t lane_steps <<<"$lane_plan"
+    run_static=false
+    for entry in "${lane_steps[@]}"; do
+      if [ "$entry" = static ]; then run_static=true; fi
+    done
+    ;;
+  *)
+    echo "unknown CI_TEST_SCOPE=${scope} (full, changed or lane)" >&2
+    exit 2
+    ;;
+esac
+
 # Upstream CI runs as an ordinary user on Ubuntu, and parts of the suite
 # assume it. Tekton's nix-v1 step runs this script as root (inside a user
 # namespace) on the nixos/nix image, which has no FHS loader and nothing in
@@ -35,18 +62,29 @@ if $fhs_ci; then
   done
 fi
 
+# Runs and times a command, returning its status: under set -e a failed step
+# still ends the script, and `step ... || ...` can carry on past it.
 step() {
   local name=$1; shift
-  local start=$SECONDS
+  local start=$SECONDS status=0
   echo "::: ${name}"
-  "$@"
-  echo "::: ${name} done in $((SECONDS - start))s"
+  "$@" || status=$?
+  if [ "$status" = 0 ]; then
+    echo "::: ${name} done in $((SECONDS - start))s"
+  else
+    echo "::: ${name} failed with exit code ${status} after $((SECONDS - start))s"
+  fi
+  return "$status"
 }
 
-# The fork's own CI scripts (.xlab/*.py, intake-push.sh).
-step xlab-scripts env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .xlab -p 'test_*.py'
+if $run_static; then
+  # The fork's own CI scripts (.xlab/*.py, intake-push.sh).
+  step xlab-scripts env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .xlab -p 'test_*.py'
+fi
 step install pnpm install --frozen-lockfile
-step typecheck pnpm -r typecheck
+if $run_static; then
+  step typecheck pnpm -r typecheck
+fi
 step build pnpm build
 
 # The tests run as this user when the script runs as root: embedded Postgres
@@ -92,9 +130,9 @@ if $fhs_ci; then
 fi
 # Pull requests run the test files they add or change. Import-graph selection
 # (vitest --changed) still picks most of the suite for any server change, and
-# the full suite takes about 2 hours, so it runs weekly from
-# .tekton/full-tests.yaml and before a deploy.
-if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
+# the full suite takes hours on one pod, so it runs nightly from
+# .tekton/full-tests.yaml, spread over lanes, and before a deploy.
+if [ "$scope" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
   diff_base=$CI_BASE_REF
   # An upstream intake pull request merges a stable release, changing
@@ -145,6 +183,20 @@ if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   done
   if [ ${#tests[@]} -eq 0 ]; then
     echo "::: test skipped: the change adds or edits no test files"
+  fi
+elif [ "$scope" = lane ]; then
+  # Every shard runs even after one fails, so one failure cannot hide the
+  # rest (pnpm test:run stops at its first failed group).
+  failed=()
+  for entry in "${lane_steps[@]}"; do
+    [ "$entry" != static ] || continue
+    label=${entry%%$'\t'*}
+    read -ra shard_command <<<"${entry#*$'\t'}"
+    step "test ${label}" "${as_test_user[@]}" "${shard_command[@]}" || failed+=("$label")
+  done
+  if [ ${#failed[@]} -gt 0 ]; then
+    printf '::: failed shard: %s\n' "${failed[@]}"
+    exit 1
   fi
 else
   step test "${as_test_user[@]}" pnpm test:run

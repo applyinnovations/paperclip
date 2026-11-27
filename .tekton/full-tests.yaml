@@ -1,8 +1,15 @@
-# Weekly full test suite on xlab (about 2 hours on one pod; upstream spreads
-# it over ~25 jobs), triggered on Sundays (UTC) through the PaC incoming
-# webhook by deployments' nightly-cron-trigger. Not a required check;
-# failures show on the xlab commit. Pull requests, including upstream
-# intake ones, test only what differs from tested source (.xlab/ci.sh).
+# Nightly full test suite on xlab, triggered through the PaC incoming webhook
+# by deployments' nightly-cron-trigger. Not a required check; failures show
+# on the xlab commit. Pull requests, including upstream intake ones, test only
+# what differs from tested source (.xlab/ci.sh).
+#
+# The suite runs as upstream's CI shards it, packed into the lanes of
+# .xlab/full-test-lanes.txt: one pod per lane, in parallel, each with its own
+# clone, install and build (nix-v1 clone mode). On one pod it no longer fit
+# its 4 hours (test-full-wjtgv, 27 Nov 2026, APP-749). The run binds no
+# volume, so it gets no affinity assistant and each lane goes to whichever
+# worker has room. It warms no Nix cache: that needs a shared claim, which
+# would pin every lane to one node.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -24,50 +31,33 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
-      nodeSelector:
-        storage.xlab.now/fast-local: "true"
   timeouts:
-    pipeline: 250m
+    pipeline: 100m
   taskRunSpecs:
-    - pipelineTaskName: checks
+    - pipelineTaskName: lanes
       podTemplate:
         hostUsers: false
       stepSpecs:
-        # Measured peak over the 14 days to 22 Nov 2026: RSS 8.3 GiB, working
-        # set 9.0 GiB. Request what it uses so it is not packed onto a small node.
+        # Each lane's peak is its build (~6.8 GiB RSS in test-full-wjtgv);
+        # the serial run's tests held 2.6-4.5 GiB with one file at a time, and
+        # a server shard runs three. Five lanes at 6 GiB fit the ~36 GiB the
+        # two workers have beside their services at night. Measure and
+        # resize from the lanes' own peaks.
         - name: run
           computeResources:
-            requests: { cpu: "1", memory: 10Gi }
-            limits: { memory: 24Gi }
-    - pipelineTaskName: publish-cache
-      serviceAccountName: nix-cache-publisher
+            requests: { cpu: "3", memory: 6Gi }
+            limits: { memory: 16Gi }
   pipelineSpec:
     params:
       - name: revision
         type: string
     workspaces:
-      - name: source
       - name: git-auth
-      - name: nix-cache-export
     tasks:
-      - name: clone
-        timeout: 10m
-        taskRef:
-          resolver: cluster
-          params:
-            - { name: kind, value: task }
-            - { name: name, value: git-clone-v1 }
-            - { name: namespace, value: tekton-pipelines }
-        params:
-          - { name: url, value: https://github.com/applyinnovations/paperclip.git }
-          - { name: revision, value: $(params.revision) }
-          - { name: expectedCommitSha, value: $(params.revision) }
-        workspaces:
-          - { name: output, workspace: source }
-          - { name: basic-auth, workspace: git-auth }
-      - name: checks
-        timeout: 240m
-        runAfter: [clone]
+      - name: lanes
+        # About 40 minutes by upstream's file durations; the slack covers a
+        # lane that waits for room.
+        timeout: 90m
         taskRef:
           resolver: cluster
           params:
@@ -75,46 +65,20 @@ spec:
             - { name: name, value: nix-v1 }
             - { name: namespace, value: tekton-buildkit }
         params:
-          - name: SCRIPT
-            value: nix develop ./.xlab --command .xlab/ci.sh
-        workspaces:
-          - { name: source, workspace: source }
-          - { name: nix-cache-export, workspace: nix-cache-export }
-    # Scheduled runs publish what the checks exported to the shared Nix cache.
-    finally:
-      - name: publish-cache
-        taskRef:
-          resolver: cluster
+          - { name: URL, value: https://github.com/applyinnovations/paperclip.git }
+          - { name: REVISION, value: $(params.revision) }
+        matrix:
           params:
-            - name: kind
-              value: task
-            - name: name
-              value: nix-cache-publish-v1
-            - name: namespace
-              value: tekton-pipelines
+            - name: SCRIPT
+              value:
+                - CI_TEST_SCOPE=lane CI_TEST_LANE=1 nix develop ./.xlab --command .xlab/ci.sh
+                - CI_TEST_SCOPE=lane CI_TEST_LANE=2 nix develop ./.xlab --command .xlab/ci.sh
+                - CI_TEST_SCOPE=lane CI_TEST_LANE=3 nix develop ./.xlab --command .xlab/ci.sh
+                - CI_TEST_SCOPE=lane CI_TEST_LANE=4 nix develop ./.xlab --command .xlab/ci.sh
+                - CI_TEST_SCOPE=lane CI_TEST_LANE=5 nix develop ./.xlab --command .xlab/ci.sh
         workspaces:
-          - name: nix-cache-export
-            workspace: nix-cache-export
+          - { name: basic-auth, workspace: git-auth }
   workspaces:
-    - name: source
-      volumeClaimTemplate:
-        spec:
-          accessModes: [ReadWriteOnce]
-          storageClassName: scratch-local
-          resources:
-            requests:
-              storage: 20Gi
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
-    # The checks' cache export (store paths the Nix cache lacks, written only
-    # on scheduled runs) for publish-cache. The checks keep their own Nix store.
-    - name: nix-cache-export
-      volumeClaimTemplate:
-        spec:
-          accessModes:
-            - ReadWriteOnce
-          storageClassName: scratch-local
-          resources:
-            requests:
-              storage: 10Gi
