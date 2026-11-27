@@ -36,9 +36,11 @@ import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
 import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
 import {
+  patchSandboxShutdownTime,
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
+import { createShutdownRenewer } from "./shutdown-renewal.js";
 import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
@@ -115,6 +117,29 @@ function getOrCreateUploadInterceptor(leaseId: string): FastUploadInterceptor {
 // On worker restart this resets, which is fine: the first exec on each
 // lease then re-confirms readiness from scratch.
 const readySandboxesByLease = new Set<string>();
+
+// Sandbox leases whose shutdown time follows their activity (see
+// shutdown-renewal.ts). A lease with a caller deadline (a sign-in lease) is
+// never renewed: its attested expiry must hold.
+const shutdownRenewer = createShutdownRenewer();
+
+function holdShutdownRenewal(input: {
+  leaseId: string;
+  metadata: Record<string, unknown> | undefined;
+  config: ReturnType<typeof kubernetesProviderConfigSchema.parse>;
+  clients: ReturnType<typeof makeKubeClients>;
+  namespace: string;
+  shutdownMs?: number;
+}): boolean {
+  if (input.metadata?.backend !== "sandbox-cr" || input.metadata?.renewShutdownTime !== true) return false;
+  shutdownRenewer.hold(input.leaseId, {
+    ttlMs: input.config.podActivityDeadlineSec * 1000,
+    shutdownMs: input.shutdownMs,
+    patchShutdownTime: (shutdownTime) =>
+      patchSandboxShutdownTime(input.clients, input.namespace, input.leaseId, shutdownTime),
+  });
+  return true;
+}
 
 // How long onEnvironmentResumeLease waits for an existing Sandbox pod to
 // report Ready before declaring the lease non-resumable. Deliberately short:
@@ -198,11 +223,17 @@ async function resolveSyncPodExec(
   // from a host file, so neither side buffers the whole payload. The file-sync
   // module bounds the untrusted pod's stdout with its own streamed-bytes disk
   // guard and passes the stderr cap through `io`.
+  const providerLeaseId = lease.providerLeaseId;
+  if (!shutdownRenewer.isHeld(providerLeaseId)) {
+    holdShutdownRenewal({ leaseId: providerLeaseId, metadata: lease.metadata, config, clients, namespace });
+  }
   const exec: PodStreamExec = (command, io) =>
-    execInPodStreaming(kc, namespace, podName, "agent", command, {
-      ...io,
-      timeoutMs: io.timeoutMs ?? timeoutMs,
-    });
+    shutdownRenewer.track(providerLeaseId, () =>
+      execInPodStreaming(kc, namespace, podName, "agent", command, {
+        ...io,
+        timeoutMs: io.timeoutMs ?? timeoutMs,
+      }),
+    );
   return { exec, timeoutMs };
 }
 
@@ -462,11 +493,9 @@ const plugin = definePlugin({
     const jobName = `pc-${newRunUlidDns()}`;
     const secretName = `${jobName}-env`;
 
-    // TODO: use params.runId as stand-in for agentId in labels; future
-    // versions will have a dedicated agentId on AcquireLeaseParams.
     const labels = paperclipLabels({
       runId: params.runId,
-      agentId: params.runId,
+      agentId: params.agentId,
       companyId: params.companyId,
       adapterType: effectiveAdapterType,
     });
@@ -609,7 +638,17 @@ const plugin = definePlugin({
       // exposes one. Flag the job backend so the server keeps the base64 fallback
       // rather than routing its sync to a hook that would reject immediately.
       nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
+      // A Sandbox without a caller deadline lives as long as it is in use.
+      renewShutdownTime: isSandboxCrBackend && !shutdown.requested,
     };
+    holdShutdownRenewal({
+      leaseId: jobName,
+      metadata: leaseMetadata as unknown as Record<string, unknown>,
+      config,
+      clients,
+      namespace,
+      shutdownMs: shutdown.shutdownMs,
+    });
 
     // Only the Sandbox shutdown time is an absolute, controller-enforced
     // deadline. A Job's activeDeadlineSeconds counts from when it starts, so a
@@ -716,7 +755,20 @@ const plugin = definePlugin({
       // See acquireLease: only the sandbox-cr backend has a pod-exec channel for
       // native sync, so a resumed job lease must keep the base64 fallback.
       nativeFileSyncUnsupported: leaseBackend !== "sandbox-cr",
+      renewShutdownTime: leaseBackend === "sandbox-cr" && params.leaseMetadata?.renewShutdownTime === true,
     };
+    // A resumed lease is in use again: give it a full deadline from now.
+    if (
+      holdShutdownRenewal({
+        leaseId: params.providerLeaseId,
+        metadata: leaseMetadata as unknown as Record<string, unknown>,
+        config,
+        clients,
+        namespace,
+      })
+    ) {
+      await shutdownRenewer.touch(params.providerLeaseId);
+    }
 
     return {
       providerLeaseId: params.providerLeaseId,
@@ -783,6 +835,7 @@ const plugin = definePlugin({
     // so unrelated concurrent leases keep their in-flight buffers intact.
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
+    shutdownRenewer.forget(params.providerLeaseId);
     await loginPtySessions.forgetLease(params.providerLeaseId);
 
     try {
@@ -830,6 +883,7 @@ const plugin = definePlugin({
     // cluster says — the lease is dead either way.
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
+    shutdownRenewer.forget(params.providerLeaseId);
     await loginPtySessions.forgetLease(params.providerLeaseId);
 
     const kc = createKubeConfig({
@@ -941,6 +995,12 @@ const plugin = definePlugin({
       // reaching Ready during this worker's lifetime. See readySandboxesByLease
       // declaration for rationale.
       const podAlreadyKnownReady = readySandboxesByLease.has(lease.providerLeaseId);
+
+      // A worker that restarted mid-lease no longer holds it; pick it up again.
+      if (!shutdownRenewer.isHeld(lease.providerLeaseId)) {
+        holdShutdownRenewal({ leaseId: lease.providerLeaseId, metadata: lease.metadata, config, clients, namespace });
+      }
+      const providerLeaseId = lease.providerLeaseId;
 
       // The caller's timeout is a budget for the WHOLE execute call: readiness
       // wait + exec must share it, or the first exec on a fresh lease could
@@ -1055,14 +1115,16 @@ const plugin = definePlugin({
           );
           let flushResult: { exitCode: number; stdout: string; stderr: string };
           try {
-            flushResult = await execInPod(
-              kc,
-              namespace,
-              podName,
-              "agent",
-              ["/bin/sh", "-c", script],
-              base64Body,
-              flushTimeoutMs,
+            flushResult = await shutdownRenewer.track(providerLeaseId, () =>
+              execInPod(
+                kc,
+                namespace,
+                podName,
+                "agent",
+                ["/bin/sh", "-c", script],
+                base64Body,
+                flushTimeoutMs,
+              ),
             );
           } catch (err) {
             return {
@@ -1128,14 +1190,18 @@ const plugin = definePlugin({
 
       let execResult: { exitCode: number; stdout: string; stderr: string };
       try {
-        execResult = await execInPod(
-          kc,
-          namespace,
-          podName,
-          "agent",
-          execWithEnv.command,
-          execWithEnv.stdin,
-          remainingTimeoutMs,
+        // A command can run for longer than the Sandbox deadline (the agent's
+        // own run is one command); keep the deadline ahead while it runs.
+        execResult = await shutdownRenewer.track(providerLeaseId, () =>
+          execInPod(
+            kc,
+            namespace,
+            podName,
+            "agent",
+            execWithEnv.command,
+            execWithEnv.stdin,
+            remainingTimeoutMs,
+          ),
         );
       } catch (err) {
         // Watchdog-fired or WebSocket-setup error. Surface as a timeout so

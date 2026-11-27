@@ -98,7 +98,8 @@ const manifest: PaperclipPluginManifestV1 = {
           podActivityDeadlineSec: {
             type: "integer",
             minimum: 1,
-            description: "Hard ceiling on a single run's wall-clock time (default: 3600).",
+            description:
+              "Sandbox backend: how long a Sandbox outlives its last activity; its shutdown time is renewed while the lease is in use. Job backend: hard ceiling on a run's wall-clock time (default: 3600).",
           },
           adapterType: {
             type: "string",

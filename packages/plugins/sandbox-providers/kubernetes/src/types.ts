@@ -111,4 +111,10 @@ export interface KubernetesLeaseMetadata {
    * sync may be used when the worker advertises the verbs.
    */
   nativeFileSyncUnsupported?: boolean;
+  /**
+   * True when the plugin keeps the Sandbox `shutdownTime` ahead of the lease's
+   * activity (a `sandbox-cr` lease without a caller deadline). A lease with a
+   * caller deadline keeps the attested `shutdownTime` it was created with.
+   */
+  renewShutdownTime?: boolean;
 }

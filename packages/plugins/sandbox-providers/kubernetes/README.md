@@ -38,7 +38,7 @@ The plugin supports two backend modes, selected via the `backend` config field:
 | `sandbox-cr` | Yes | Alpha | Yes | `kubernetes-sigs/agent-sandbox` controller |
 | `job` | No | Stable | No | Nothing beyond k8s 1.27+ |
 
-**`sandbox-cr` (default):** Creates a `Sandbox` CR (`agents.x-k8s.io/v1beta1`) whose controller provisions a long-lived pod running `sleep infinity`. paperclip-server execs individual commands into the running pod — this is the multi-command adapter-install pattern. When you `releaseLease`, the Sandbox CR is deleted and the controller tears down the pod. The CR also sets an absolute `shutdownTime` with `shutdownPolicy: Delete` from `podActivityDeadlineSec`, so the controller can reap it if the server cannot release it. Workspace/home/cache are ephemeral and disappear with the pod; retain important outputs through Paperclip's file sync/storage.
+**`sandbox-cr` (default):** Creates a `Sandbox` CR (`agents.x-k8s.io/v1beta1`) whose controller provisions a long-lived pod running `sleep infinity`. paperclip-server execs individual commands into the running pod — this is the multi-command adapter-install pattern. When you `releaseLease`, the Sandbox CR is deleted and the controller tears down the pod. The CR also sets an absolute `shutdownTime` with `shutdownPolicy: Delete`, `podActivityDeadlineSec` ahead, so the controller can reap it if the server cannot release it. While the lease is in use (a command or file sync running in the pod, or the lease resumed) the plugin moves `shutdownTime` forward, so a run may last longer than `podActivityDeadlineSec`; an idle lease is reaped `podActivityDeadlineSec` after its last use. This needs `patch` on `sandboxes` in the tenant namespace; without it the renewal is logged and the Sandbox keeps its first deadline. Workspace/home/cache are ephemeral and disappear with the pod; retain important outputs through Paperclip's file sync/storage.
 
 **`job` (stable fallback):** Creates a `batch/v1` Job. The container entrypoint runs once and exits — no multi-command exec possible. Use this when you cannot install agent-sandbox, or when you need strictly stable Kubernetes APIs. Note: paperclip-server's adapter-install pattern will not work in job mode.
 
@@ -73,7 +73,7 @@ Common optional fields:
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
-| `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. On `sandbox-cr` this sets the Sandbox `shutdownTime`; a caller's earlier deadline (a sign-in lease) shortens it. |
+| `podActivityDeadlineSec` | `3600` | On `sandbox-cr`, how long a Sandbox outlives its last activity: the Sandbox `shutdownTime` stays this far ahead while the lease is in use. A caller's deadline (a sign-in lease) caps it and is never extended. On `job`, a hard ceiling on the run's wall-clock time. |
 
 Full JSON Schema in `src/manifest.ts`.
 

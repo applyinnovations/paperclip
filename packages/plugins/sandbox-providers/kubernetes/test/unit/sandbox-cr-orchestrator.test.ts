@@ -4,6 +4,7 @@ import {
   deleteSandboxCr,
   getSandboxCrStatus,
   findPodForSandbox,
+  patchSandboxShutdownTime,
   SandboxCrTimeoutError,
   waitForSandboxReady,
 } from "../../src/sandbox-cr-orchestrator.js";
@@ -209,6 +210,22 @@ describe("deleteSandboxCr", () => {
         propagationPolicy: "Foreground",
       }),
     );
+  });
+});
+
+describe("patchSandboxShutdownTime", () => {
+  it("replaces spec.shutdownTime with a JSON Patch", async () => {
+    const patch = vi.fn().mockResolvedValue({});
+    const clients = { custom: { patchNamespacedCustomObject: patch } };
+    await patchSandboxShutdownTime(clients as never, "ns", "pc-abc", "2026-11-24T05:00:00.000Z");
+    expect(patch).toHaveBeenCalledWith({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: "ns",
+      plural: SANDBOX_PLURAL,
+      name: "pc-abc",
+      body: [{ op: "replace", path: "/spec/shutdownTime", value: "2026-11-24T05:00:00.000Z" }],
+    });
   });
 });
 
