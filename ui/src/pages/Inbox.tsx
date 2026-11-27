@@ -138,6 +138,7 @@ import {
   buildGroupedInboxSections,
   buildInboxIssueGroupCreateDefaults,
   buildInboxKeyboardNavEntries,
+  filterIssuesForInboxCategory,
   getAvailableInboxIssueColumns,
   getInboxWorkItemKey,
   getApprovalsForTab,
@@ -1460,8 +1461,6 @@ function StreamlinedInbox({
   }, [approvals, tab, allApprovalFilter, currentUserId, dismissedAtByKey]);
   const showJoinRequestsCategory =
     allCategoryFilter === "everything" || allCategoryFilter === "join_requests";
-  const showTouchedCategory =
-    allCategoryFilter === "everything" || allCategoryFilter === "issues_i_touched";
   const showApprovalsCategory =
     allCategoryFilter === "everything" || allCategoryFilter === "approvals";
   const showFailedRunsCategory =
@@ -1486,12 +1485,30 @@ function StreamlinedInbox({
   const workItemsToRender = useMemo(
     () =>
       getInboxWorkItems({
-        issues: tab === "all" && !showTouchedCategory ? [] : issuesToRender,
+        issues:
+          tab === "all"
+            ? filterIssuesForInboxCategory(
+                issuesToRender,
+                allCategoryFilter,
+                currentUserId,
+                allApprovalFilter,
+              )
+            : issuesToRender,
         approvals: tab === "all" && !showApprovalsCategory ? [] : approvalsToRender,
         failedRuns: failedRunsForTab,
         joinRequests: joinRequestsForTab,
       }),
-    [approvalsToRender, issuesToRender, showApprovalsCategory, showTouchedCategory, tab, failedRunsForTab, joinRequestsForTab],
+    [
+      allApprovalFilter,
+      allCategoryFilter,
+      approvalsToRender,
+      currentUserId,
+      failedRunsForTab,
+      issuesToRender,
+      joinRequestsForTab,
+      showApprovalsCategory,
+      tab,
+    ],
   );
 
   const filteredWorkItems = useMemo(() => {

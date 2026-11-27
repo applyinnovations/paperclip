@@ -16,6 +16,7 @@ import {
   buildInboxIssueGroupCreateDefaults,
   buildInboxKeyboardNavEntries,
   buildInboxDismissedAtByKey,
+  filterIssuesForInboxCategory,
   getArchivedInboxSearchIssues,
   getAvailableInboxIssueColumns,
   getInboxWorkItemKey,
@@ -27,6 +28,7 @@ import {
   getUnreadTouchedIssues,
   groupInboxWorkItems,
   isInboxEntityDismissed,
+  isIssuePendingUserExecutionStage,
   isMineInboxTab,
   loadInboxFilterPreferences,
   loadInboxIssueColumns,
@@ -1463,5 +1465,82 @@ describe("inbox helpers", () => {
     expect(shouldResetInboxWorkspaceGrouping("workspace", false, true)).toBe(true);
     expect(shouldResetInboxWorkspaceGrouping("workspace", true, true)).toBe(false);
     expect(shouldResetInboxWorkspaceGrouping("none", false, true)).toBe(false);
+  });
+
+  it("matches issues awaiting a human execution-policy approval or review stage", () => {
+    const pendingApprovalForMe: Issue = {
+      ...makeIssue("approval-me", true),
+      executionState: {
+        status: "pending",
+        currentStageId: "stage-1",
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", agentId: null, userId: "user-1" },
+        returnAssignee: { type: "agent", agentId: "agent-1", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const pendingReviewForOther: Issue = {
+      ...makeIssue("review-other", true),
+      executionState: {
+        status: "pending",
+        currentStageId: "stage-1",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", agentId: null, userId: "user-2" },
+        returnAssignee: { type: "agent", agentId: "agent-1", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const pendingAgentReview: Issue = {
+      ...makeIssue("review-agent", true),
+      executionState: {
+        status: "pending",
+        currentStageId: "stage-1",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "agent-2", userId: null },
+        returnAssignee: { type: "agent", agentId: "agent-1", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const plainIssue = makeIssue("plain", true);
+
+    expect(isIssuePendingUserExecutionStage(pendingApprovalForMe, "user-1")).toBe(true);
+    expect(isIssuePendingUserExecutionStage(pendingApprovalForMe, "user-2")).toBe(false);
+    expect(isIssuePendingUserExecutionStage(pendingReviewForOther)).toBe(true);
+    expect(isIssuePendingUserExecutionStage(pendingAgentReview, "user-1")).toBe(false);
+    expect(isIssuePendingUserExecutionStage(plainIssue, "user-1")).toBe(false);
+
+    const allIssues = [
+      pendingApprovalForMe,
+      pendingReviewForOther,
+      pendingAgentReview,
+      plainIssue,
+    ];
+    expect(
+      filterIssuesForInboxCategory(allIssues, "approvals", "user-1").map((i) => i.id),
+    ).toEqual(["approval-me"]);
+    expect(
+      filterIssuesForInboxCategory(allIssues, "approvals").map((i) => i.id),
+    ).toEqual(["approval-me", "review-other"]);
+    expect(
+      filterIssuesForInboxCategory(allIssues, "approvals", "user-1", "resolved"),
+    ).toEqual([]);
+    expect(
+      filterIssuesForInboxCategory(allIssues, "everything", "user-1").map((i) => i.id),
+    ).toEqual(["approval-me", "review-other", "review-agent", "plain"]);
+    expect(
+      filterIssuesForInboxCategory(allIssues, "failed_runs", "user-1"),
+    ).toEqual([]);
   });
 });

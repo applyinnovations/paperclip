@@ -791,6 +791,40 @@ export function approvalActivityTimestamp(approval: Approval): number {
   return normalizeTimestamp(approval.createdAt);
 }
 
+export function isIssuePendingUserExecutionStage(
+  issue: Pick<Issue, "executionState">,
+  currentUserId?: string | null,
+): boolean {
+  const state = issue.executionState;
+  if (!state || state.status !== "pending") return false;
+  if (state.currentStageType !== "approval" && state.currentStageType !== "review") {
+    return false;
+  }
+  if (state.currentParticipant?.type !== "user") return false;
+  if (currentUserId) {
+    return state.currentParticipant.userId === currentUserId;
+  }
+  return Boolean(state.currentParticipant.userId);
+}
+
+export function filterIssuesForInboxCategory(
+  issues: Issue[],
+  category: InboxCategoryFilter,
+  currentUserId?: string | null,
+  approvalFilter: InboxApprovalFilter = "all",
+): Issue[] {
+  if (category === "everything" || category === "issues_i_touched") {
+    return issues;
+  }
+  if (category === "approvals") {
+    if (approvalFilter === "resolved") return [];
+    return issues.filter((issue) =>
+      isIssuePendingUserExecutionStage(issue, currentUserId),
+    );
+  }
+  return [];
+}
+
 export function getInboxWorkItems({
   issues,
   approvals,
