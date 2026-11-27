@@ -2027,4 +2027,142 @@ describe("Connectors landing page", () => {
       ),
     ).toBe(true);
   });
+
+  it("still renders an active AI connection and Add account button when its parent tool_application is archived", async () => {
+    const claudeAccount: AiManagedConnectionSummary = {
+      id: "claude-active",
+      grantId: "grant-claude-active",
+      companyId: "company-1",
+      provider: "anthropic",
+      method: "api_key",
+      name: "Shared Claude account",
+      ownership: "shared",
+      isDefault: false,
+      canSetDefault: false,
+      status: "connected",
+    };
+    listGalleryMock.mockResolvedValue({
+      apps: [getAppStoreDefinition("anthropic"), getAppStoreDefinition("openai")],
+    });
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        application({
+          id: "app-anthropic-archived",
+          name: "Claude",
+          status: "archived",
+          applicationKey: "app-gallery:anthropic",
+          metadata: { sourceTemplateKey: "anthropic" },
+        }),
+        application({
+          id: "app-archived-empty",
+          name: "Stale Archived App",
+          status: "archived",
+          applicationKey: "custom:stale-archived",
+          metadata: { source: "link" },
+        }),
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: claudeAccount.id,
+          companyId: "company-1",
+          applicationId: "app-anthropic-archived",
+          connectionPurpose: "ai",
+          transport: "runtime_auth",
+          authKind: "api_key",
+          credentialPolicy: "shared",
+          name: claudeAccount.name,
+          status: "active",
+          enabled: true,
+          config: {
+            sourceTemplateKey: "anthropic",
+            ai: { provider: "anthropic", method: "api_key" },
+          },
+        }),
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [claudeAccount],
+    });
+
+    await renderBrowse();
+
+    const claudeRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(claudeRow).not.toBeNull();
+    expect(claudeRow?.getAttribute("data-connected")).toBe("true");
+    expect(claudeRow?.textContent).toContain("Shared Claude account");
+    const addAccountButton = claudeRow?.querySelector<HTMLButtonElement>(
+      'button[aria-label="Add account Anthropic"]',
+    );
+    expect(addAccountButton).not.toBeNull();
+    expect(addAccountButton?.disabled).toBe(false);
+    expect(container.textContent).not.toContain("Stale Archived App");
+
+    await act(() => void addAccountButton!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith(
+      "/apps/connect?source=anthropic&applicationId=app-anthropic-archived&name=Anthropic&new=1",
+    );
+  });
+
+  it("still renders an active AI connection and enabled Add account button when its parent tool_application is missing", async () => {
+    const claudeAccount: AiManagedConnectionSummary = {
+      id: "claude-orphan",
+      grantId: "grant-claude-orphan",
+      companyId: "company-1",
+      provider: "anthropic",
+      method: "api_key",
+      name: "Orphaned Claude account",
+      ownership: "shared",
+      isDefault: false,
+      canSetDefault: false,
+      status: "connected",
+    };
+    listGalleryMock.mockResolvedValue({
+      apps: [getAppStoreDefinition("anthropic")],
+    });
+    listApplicationsMock.mockResolvedValue({ applications: [] });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: claudeAccount.id,
+          companyId: "company-1",
+          applicationId: "app-missing-id",
+          connectionPurpose: "ai",
+          transport: "runtime_auth",
+          authKind: "api_key",
+          credentialPolicy: "shared",
+          name: claudeAccount.name,
+          status: "active",
+          enabled: true,
+          config: {
+            sourceTemplateKey: "anthropic",
+            ai: { provider: "anthropic", method: "api_key" },
+          },
+        }),
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [claudeAccount],
+    });
+
+    await renderBrowse();
+
+    const claudeRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(claudeRow).not.toBeNull();
+    expect(claudeRow?.getAttribute("data-connected")).toBe("true");
+    expect(claudeRow?.textContent).toContain("Orphaned Claude account");
+    const addAccountButton = claudeRow?.querySelector<HTMLButtonElement>(
+      'button[aria-label="Add account Anthropic"]',
+    );
+    expect(addAccountButton).not.toBeNull();
+    expect(addAccountButton?.disabled).toBe(false);
+
+    await act(() => void addAccountButton!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith("/apps/connect?source=anthropic");
+  });
 });

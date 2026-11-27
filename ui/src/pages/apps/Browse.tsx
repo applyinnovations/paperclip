@@ -325,6 +325,12 @@ function connectorAction(
         href: additionalConnectionHref(row.entry, applicationId),
       };
     }
+    if (row.entry) {
+      return {
+        label: "Add account",
+        href: connectHrefFor(row.entry),
+      };
+    }
     return {
       label: "Add account",
       href: applicationId ? `/apps/app/${applicationId}/permissions` : null,
@@ -603,18 +609,11 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
   const connectionById = useMemo(() => new Map((connectionsQuery.data?.connections ?? []).map(connection => [connection.id, connection])), [connectionsQuery.data]);
 
   const rows = useMemo<ConnectorRowModel[]>(() => {
+    const allApplications = applicationsQuery.data?.applications ?? [];
     const activeConnections = (connectionsQuery.data?.connections ?? []).filter(
       (connection) =>
         connection.status !== "archived" &&
         connection.connectionPurpose !== "channel",
-    );
-    const activeApplications = (
-      applicationsQuery.data?.applications ?? []
-    ).filter(
-      (application) =>
-        application.status !== "archived" &&
-        application.type !== "chat" &&
-        application.metadata?.purpose !== "channel",
     );
     const connectionsByApplicationId = new Map<string, ToolConnection[]>();
     for (const connection of activeConnections) {
@@ -623,6 +622,21 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         connection,
       ]);
     }
+    const excludedChannelApplicationIds = new Set(
+      allApplications
+        .filter(
+          (application) =>
+            application.type === "chat" ||
+            application.metadata?.purpose === "channel",
+        )
+        .map((application) => application.id),
+    );
+    const activeApplications = allApplications.filter(
+      (application) =>
+        !excludedChannelApplicationIds.has(application.id) &&
+        (application.status !== "archived" ||
+          connectionsByApplicationId.has(application.id)),
+    );
 
     const gallerySlugs = new Set(
       gallery.map((entry) => appDefinitionSlug(entry)),
@@ -772,6 +786,59 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         entry: null,
         applications: [application],
         connections: appConnections,
+        chatEndpoints: [],
+      });
+    }
+
+    const knownApplicationIds = new Set(
+      allApplications.map((application) => application.id),
+    );
+    const orphanedConnectionsByApplicationId = new Map<string, ToolConnection[]>();
+    for (const connection of activeConnections) {
+      if (knownApplicationIds.has(connection.applicationId)) continue;
+      const sourceSlug = appConnectionSourceSlug(connection);
+      const configuredSlug =
+        connection.config?.sourceTemplateKey ??
+        connection.transportConfig?.sourceTemplateKey;
+      const endpointMatchedSlug = [
+        connection.config?.url,
+        connection.transportConfig?.url,
+      ]
+        .map((value) =>
+          typeof value === "string"
+            ? appDefinitionSlug(getAppDefinitionForUrl(value, gallery)) || null
+            : null,
+        )
+        .find((value): value is string => Boolean(value));
+      const resolvedSlug =
+        (sourceSlug && rowsBySlug.has(sourceSlug) ? sourceSlug : null) ??
+        (typeof configuredSlug === "string" && gallerySlugs.has(configuredSlug)
+          ? configuredSlug
+          : null) ??
+        endpointMatchedSlug ??
+        null;
+      const galleryRow = resolvedSlug ? rowsBySlug.get(resolvedSlug) : null;
+      if (galleryRow) {
+        galleryRow.connections.push(connection);
+        continue;
+      }
+      orphanedConnectionsByApplicationId.set(connection.applicationId, [
+        ...(orphanedConnectionsByApplicationId.get(connection.applicationId) ?? []),
+        connection,
+      ]);
+    }
+    for (const [applicationId, orphanConnections] of orphanedConnectionsByApplicationId) {
+      const first = orphanConnections[0]!;
+      const fallbackSlug = appConnectionSourceSlug(first) ?? applicationId;
+      customRows.push({
+        key: `application:${applicationId}`,
+        slug: fallbackSlug,
+        name: first.name,
+        description: "A custom connector configured for this organization.",
+        brandKey: fallbackSlug,
+        entry: null,
+        applications: [],
+        connections: orphanConnections,
         chatEndpoints: [],
       });
     }

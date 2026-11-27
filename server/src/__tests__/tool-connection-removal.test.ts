@@ -701,4 +701,43 @@ describeEmbeddedPostgres("tool connection removal", () => {
       .resolves.toHaveLength(1);
     expect(await service.listConnectionInstalls(connectionId, company.id)).toEqual([]);
   });
+
+  it("reactivates an archived tool_application when createConnection adds a new active connection to it", async () => {
+    installMcpFixture(HEADER);
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { service, connectionId } = await connectHeaderApp(company.id, agent.id);
+    const [original] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+
+    await service.archiveConnection(connectionId, company.id, { actorType: "user", actorId: "board-user" });
+    const [archivedApp] = await db
+      .select()
+      .from(toolApplications)
+      .where(eq(toolApplications.id, original!.applicationId));
+    expect(archivedApp?.status).toBe("archived");
+    expect(archivedApp?.archivedAt).not.toBeNull();
+
+    const created = await service.createConnection(company.id, {
+      applicationId: original!.applicationId,
+      name: "Replacement MCP connection",
+      connectionPurpose: "tool",
+      connectionKind: "managed",
+      ownership: "customer",
+      authKind: "none",
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      config: { url: MCP_URL },
+      credentialSecretRefs: [],
+    });
+    expect(created.applicationId).toBe(original!.applicationId);
+    expect(created.status).toBe("active");
+
+    const [reactivatedApp] = await db
+      .select()
+      .from(toolApplications)
+      .where(eq(toolApplications.id, original!.applicationId));
+    expect(reactivatedApp?.status).toBe("active");
+    expect(reactivatedApp?.archivedAt).toBeNull();
+  });
 });

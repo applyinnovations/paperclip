@@ -2932,6 +2932,142 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     }
   }, 30000);
 
+  it("reactivates an archived provider tool_application when a new AI account is connected after all prior connections were archived", async () => {
+    const isolatedCompanyId = randomUUID();
+    const userId = `reactivate-user-${randomUUID()}`;
+    await db.insert(companies).values({
+      id: isolatedCompanyId,
+      name: "Reactivate AI app",
+      issuePrefix: `RA${isolatedCompanyId.slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(companyMemberships).values({
+      companyId: isolatedCompanyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+      membershipRole: "owner",
+    });
+
+    const first = await service.save(
+      isolatedCompanyId,
+      userId,
+      {
+        provider: "anthropic",
+        method: "api_key",
+        ownership: "shared",
+        name: "Initial Claude key",
+        apiKey: "sk-ant-first-fixture",
+        agentIds: [],
+        allAgents: true,
+      },
+      "sk-ant-first-fixture",
+    );
+    const [firstConnection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, first.connectionId));
+    expect(firstConnection).toBeDefined();
+
+    await toolAccessService(db).archiveConnection(first.connectionId, isolatedCompanyId, {
+      actorType: "user",
+      actorId: userId,
+    });
+    const [archivedApp] = await db
+      .select()
+      .from(toolApplications)
+      .where(eq(toolApplications.id, firstConnection!.applicationId));
+    expect(archivedApp?.status).toBe("archived");
+    expect(archivedApp?.archivedAt).not.toBeNull();
+
+    const second = await service.save(
+      isolatedCompanyId,
+      userId,
+      {
+        provider: "anthropic",
+        method: "api_key",
+        ownership: "shared",
+        name: "Replacement Claude key",
+        apiKey: "sk-ant-second-fixture",
+        agentIds: [],
+        allAgents: true,
+      },
+      "sk-ant-second-fixture",
+    );
+    const [secondConnection] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, second.connectionId));
+    expect(secondConnection?.applicationId).toBe(firstConnection!.applicationId);
+    const [reactivatedApp] = await db
+      .select()
+      .from(toolApplications)
+      .where(eq(toolApplications.id, firstConnection!.applicationId));
+    expect(reactivatedApp?.status).toBe("active");
+    expect(reactivatedApp?.archivedAt).toBeNull();
+  });
+
+  it("reactivates an archived parent tool_application when reconnecting an existing AI connection", async () => {
+    const isolatedCompanyId = randomUUID();
+    const userId = `reconnect-reactivate-${randomUUID()}`;
+    await db.insert(companies).values({
+      id: isolatedCompanyId,
+      name: "Reconnect reactivate AI app",
+      issuePrefix: `RR${isolatedCompanyId.slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(companyMemberships).values({
+      companyId: isolatedCompanyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+      membershipRole: "owner",
+    });
+
+    const initial = await service.save(
+      isolatedCompanyId,
+      userId,
+      {
+        provider: "anthropic",
+        method: "api_key",
+        ownership: "shared",
+        name: "Reconnectable Claude key",
+        apiKey: "sk-ant-initial-fixture",
+        agentIds: [],
+        allAgents: true,
+      },
+      "sk-ant-initial-fixture",
+    );
+    const [conn] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, initial.connectionId));
+    await db
+      .update(toolApplications)
+      .set({ status: "archived", archivedAt: new Date(), updatedAt: new Date() })
+      .where(eq(toolApplications.id, conn!.applicationId));
+
+    await service.save(
+      isolatedCompanyId,
+      userId,
+      {
+        connectionId: initial.connectionId,
+        provider: "anthropic",
+        method: "api_key",
+        ownership: "shared",
+        name: "Reconnectable Claude key",
+        apiKey: "sk-ant-rotated-fixture",
+        agentIds: [],
+        allAgents: true,
+      },
+      "sk-ant-rotated-fixture",
+    );
+    const [reactivatedApp] = await db
+      .select()
+      .from(toolApplications)
+      .where(eq(toolApplications.id, conn!.applicationId));
+    expect(reactivatedApp?.status).toBe("active");
+    expect(reactivatedApp?.archivedAt).toBeNull();
+  });
+
 });
 
 

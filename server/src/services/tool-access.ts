@@ -2441,6 +2441,15 @@ export function toolAccessService(
             })
             .where(eq(toolApplications.id, existingApplication.id))
             .returning();
+        } else if (existingApplication.archivedAt !== null) {
+          [applicationRow] = await db
+            .update(toolApplications)
+            .set({
+              archivedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(toolApplications.id, existingApplication.id))
+            .returning();
         } else {
           applicationRow = existingApplication;
         }
@@ -3175,7 +3184,7 @@ export function toolAccessService(
         await notifyToolConnectionHealth(tx, connection);
         const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
           .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId))).returning();
-        await tx.update(toolApplications).set({ status: "active", updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
+        await tx.update(toolApplications).set({ status: "active", archivedAt: null, updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
         return row;
       });
       const details = await profileDetails(profile.id, companyId);
@@ -3551,7 +3560,7 @@ export function toolAccessService(
         .returning();
       await tx
         .update(toolApplications)
-        .set({ status: "active", updatedAt: new Date() })
+        .set({ status: "active", archivedAt: null, updatedAt: new Date() })
         .where(eq(toolApplications.id, connection.applicationId));
 
       return { profileId, profileBindings, policies, updatedConnection };
@@ -4214,12 +4223,19 @@ export function toolAccessService(
         }
       }
       await managementContext?.reauthorize();
+      const nextStatus = input.status ?? existing.status;
       const [row] = await db
         .update(toolApplications)
         .set({
           name: input.name ?? existing.name,
           description: input.description ?? existing.description,
-          status: input.status ?? existing.status,
+          status: nextStatus,
+          archivedAt:
+            input.status === undefined
+              ? existing.archivedAt
+              : nextStatus === "archived"
+                ? (existing.archivedAt ?? new Date())
+                : null,
           pluginId: input.pluginId ?? existing.pluginId,
           ownerAgentId: input.ownerAgentId ?? existing.ownerAgentId,
           ownerUserId: input.ownerUserId ?? existing.ownerUserId,
@@ -4592,7 +4608,42 @@ export function toolAccessService(
       await actor?.managementContext?.reauthorize();
       const connectionId = randomUUID();
       const binding = actorBinding(actor);
+      const nextConnectionStatus = input.status ?? "draft";
       const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
+        if (nextConnectionStatus !== "archived") {
+          const [lockedApp] = await tx
+            .select({
+              id: toolApplications.id,
+              status: toolApplications.status,
+              archivedAt: toolApplications.archivedAt,
+            })
+            .from(toolApplications)
+            .where(
+              and(
+                eq(toolApplications.id, applicationId),
+                eq(toolApplications.companyId, companyId),
+              ),
+            )
+            .for("update");
+          if (
+            lockedApp &&
+            (lockedApp.status === "archived" ||
+              lockedApp.archivedAt !== null ||
+              (nextConnectionStatus === "active" && lockedApp.status !== "active"))
+          ) {
+            await tx
+              .update(toolApplications)
+              .set({
+                status:
+                  lockedApp.status === "active" || nextConnectionStatus === "active"
+                    ? "active"
+                    : "draft",
+                archivedAt: null,
+                updatedAt: new Date(),
+              })
+              .where(eq(toolApplications.id, applicationId));
+          }
+        }
         const [row] = await tx
           .insert(toolConnections)
           .values({
@@ -4608,7 +4659,7 @@ export function toolAccessService(
             credentialPolicy:
               input.credentialPolicy ??
               (input.authKind === "oauth" ? "per_user" : "shared"),
-            status: input.status ?? "draft",
+            status: nextConnectionStatus,
             enabled: input.enabled ?? false,
             agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
               typeof config.sourceTemplateKey === "string" ? getConnectableAppDefinition(config.sourceTemplateKey)?.agentInstructions : null,
@@ -4712,9 +4763,45 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connectionId))
         .returning();
+      const reactivateApplicationIfNeeded = async (tx: Db) => {
+        if (input.status === undefined || input.status === "archived") return;
+        const [lockedApp] = await tx
+          .select({
+            id: toolApplications.id,
+            status: toolApplications.status,
+            archivedAt: toolApplications.archivedAt,
+          })
+          .from(toolApplications)
+          .where(
+            and(
+              eq(toolApplications.id, existing.applicationId),
+              eq(toolApplications.companyId, existing.companyId),
+            ),
+          )
+          .for("update");
+        if (
+          lockedApp &&
+          (lockedApp.status === "archived" ||
+            lockedApp.archivedAt !== null ||
+            (input.status === "active" && lockedApp.status !== "active"))
+        ) {
+          await tx
+            .update(toolApplications)
+            .set({
+              status:
+                lockedApp.status === "active" || input.status === "active"
+                  ? "active"
+                  : "draft",
+              archivedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(toolApplications.id, existing.applicationId));
+        }
+      };
       const [row] = existing.transport === "chat_sdk"
         ? await db.transaction(async tx => {
             await notifyChatEndpointWork(tx, existing.id, existing.companyId);
+            await reactivateApplicationIfNeeded(tx as unknown as Db);
             const rows = await write(tx as unknown as Db);
             // Credential resolution must never observe the binding rebuild's
             // delete/insert gap after a configuration wake.
@@ -4727,6 +4814,7 @@ export function toolAccessService(
               await notifyGitHubCredentialChange(tx, { companyId: existing.companyId, config });
             }
             if (existing.transport === "voice") await notifyVoiceChange(tx, { kind: "connection", id: existing.id });
+            await reactivateApplicationIfNeeded(tx);
             const rows = await write(tx);
             await syncCredentialBindings(rows[0]!, [], tx);
             await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(rows[0]!);

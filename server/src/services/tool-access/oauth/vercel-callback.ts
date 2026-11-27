@@ -206,7 +206,7 @@ export function createVercelOAuthCallback(db: Db, dependencies: Dependencies) {
     );
     await db
       .update(toolApplications)
-      .set({ status: "active", updatedAt: now() })
+      .set({ status: "active", archivedAt: null, updatedAt: now() })
       .where(eq(toolApplications.id, connection.applicationId));
     const sourceTemplateKey =
       typeof connection.config.sourceTemplateKey === "string"
