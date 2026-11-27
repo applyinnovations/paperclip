@@ -24,8 +24,6 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
-      nodeSelector:
-        storage.xlab.now/fast-local: "true"
   timeouts:
     pipeline: 250m
   taskRunSpecs:
@@ -45,10 +43,12 @@ spec:
     params:
       - name: revision
         type: string
+    # source and nix-cache-export are directories of one claim: the checks
+    # hand their export to publish-cache, which runs as another account in
+    # its own pod and mounts only the export.
     workspaces:
-      - name: source
+      - name: work
       - name: git-auth
-      - name: nix-cache-export
     tasks:
       - name: clone
         timeout: 10m
@@ -63,7 +63,7 @@ spec:
           - { name: revision, value: $(params.revision) }
           - { name: expectedCommitSha, value: $(params.revision) }
         workspaces:
-          - { name: output, workspace: source }
+          - { name: output, workspace: work, subPath: source }
           - { name: basic-auth, workspace: git-auth }
       - name: checks
         timeout: 240m
@@ -78,8 +78,8 @@ spec:
           - name: SCRIPT
             value: nix develop ./.xlab --command .xlab/ci.sh
         workspaces:
-          - { name: source, workspace: source }
-          - { name: nix-cache-export, workspace: nix-cache-export }
+          - { name: source, workspace: work, subPath: source }
+          - { name: nix-cache-export, workspace: work, subPath: nix-cache-export }
     # Scheduled runs publish what the checks exported to the shared Nix cache.
     finally:
       - name: publish-cache
@@ -94,27 +94,20 @@ spec:
               value: tekton-pipelines
         workspaces:
           - name: nix-cache-export
-            workspace: nix-cache-export
+            workspace: work
+            subPath: nix-cache-export
   workspaces:
-    - name: source
+    # source (20Gi) and the checks' cache export (store paths the Nix cache
+    # lacks, written only on scheduled runs; 10Gi) in one local-nvme claim.
+    # The checks keep their own Nix store.
+    - name: work
       volumeClaimTemplate:
         spec:
           accessModes: [ReadWriteOnce]
-          storageClassName: scratch-local
+          storageClassName: local-nvme
           resources:
             requests:
-              storage: 20Gi
+              storage: 30Gi
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
-    # The checks' cache export (store paths the Nix cache lacks, written only
-    # on scheduled runs) for publish-cache. The checks keep their own Nix store.
-    - name: nix-cache-export
-      volumeClaimTemplate:
-        spec:
-          accessModes:
-            - ReadWriteOnce
-          storageClassName: scratch-local
-          resources:
-            requests:
-              storage: 10Gi

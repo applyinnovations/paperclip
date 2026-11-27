@@ -5,7 +5,8 @@
 # writes a plan; publish holds the GitHub token and the deploy key and takes
 # every commit it pushes from upstream itself. Its scripts (.xlab/intake-push.sh,
 # .xlab/intake_pr.py) come from clone-trusted, a separate checkout of this run's
-# revision that the plan task never mounts, so nothing plan ran can change them.
+# revision in a subPath of the run's one claim that the plan task never mounts,
+# so nothing plan ran can change them.
 # publish pushes with paperclip-intake-deploy-key, a write deploy key for this
 # fork: upstream changes .github/workflows/, which the PaC GitHub App may not
 # push (no workflows permission, by design), and the "master mirrors upstream"
@@ -32,8 +33,6 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
-      nodeSelector:
-        storage.xlab.now/fast-local: "true"
   taskRunSpecs:
     - pipelineTaskName: plan
       podTemplate:
@@ -44,12 +43,12 @@ spec:
     params:
       - name: revision
         type: string
+    # source, trusted and plan are directories of one claim, and each Task
+    # mounts only its own: plan never sees trusted, publish never sees source.
     workspaces:
-      - name: source
+      - name: work
       - name: git-auth
       - name: intake-deploy-key
-      - name: plan
-      - name: trusted
     tasks:
       - name: clone
         timeout: 10m
@@ -69,10 +68,10 @@ spec:
           - { name: depth, value: "0" }
           - { name: objectFilter, value: none }
         workspaces:
-          - { name: output, workspace: source }
+          - { name: output, workspace: work, subPath: source }
           - { name: basic-auth, workspace: git-auth }
       # The publish task's scripts: the same revision, cloned into a
-      # workspace only publish mounts.
+      # directory only publish mounts.
       - name: clone-trusted
         timeout: 10m
         taskRef:
@@ -87,7 +86,7 @@ spec:
           - { name: expectedCommitSha, value: $(params.revision) }
           - { name: sparseCheckoutPatterns, value: /.xlab/ }
         workspaces:
-          - { name: output, workspace: trusted }
+          - { name: output, workspace: work, subPath: trusted }
           - { name: basic-auth, workspace: git-auth }
       - name: plan
         runAfter: [clone]
@@ -101,13 +100,13 @@ spec:
           - name: SCRIPT
             value: nix develop ./.xlab --command .xlab/upstream-intake.sh "${CI_ARTIFACTS_PATH}/intake"
         workspaces:
-          - { name: source, workspace: source }
-          - { name: artifacts, workspace: plan }
+          - { name: source, workspace: work, subPath: source }
+          - { name: artifacts, workspace: work, subPath: plan }
       - name: publish
         runAfter: [plan, clone-trusted]
         workspaces:
-          - { name: plan, workspace: plan }
-          - { name: trusted, workspace: trusted }
+          - { name: plan, workspace: work, subPath: plan }
+          - { name: trusted, workspace: work, subPath: trusted }
           - { name: git-auth, workspace: git-auth }
           - { name: deploy-key, workspace: intake-deploy-key }
         taskSpec:
@@ -121,14 +120,14 @@ spec:
             - name: deploy-key
               readOnly: true
           volumes:
-            # This pod's own scratch on scratch-local; deleted with the pod and
+            # This pod's own scratch on local-nvme; deleted with the pod and
             # emptied by each step on exit.
             - name: work
               ephemeral:
                 volumeClaimTemplate:
                   spec:
                     accessModes: [ReadWriteOnce]
-                    storageClassName: scratch-local
+                    storageClassName: local-nvme
                     resources:
                       requests:
                         storage: 5Gi
@@ -172,14 +171,17 @@ spec:
                 set -eu
                 exec python3 -I "$(workspaces.trusted.path)/.xlab/intake_pr.py" "$(workspaces.plan.path)/intake" /work/pushed-tag "$(workspaces.git-auth.path)/git-provider-token"
   workspaces:
-    - name: source
+    # source (5Gi), trusted (.xlab/ at this run's revision, for publish only)
+    # and plan (the plan task's few small files for publish) in one local-nvme
+    # claim, so every pod that mounts it follows the first to its node.
+    - name: work
       volumeClaimTemplate:
         spec:
           accessModes: [ReadWriteOnce]
-          storageClassName: scratch-local
+          storageClassName: local-nvme
           resources:
             requests:
-              storage: 5Gi
+              storage: 6Gi
     - name: git-auth
       secret:
         secretName: "{{ git_auth_secret }}"
@@ -187,21 +189,3 @@ spec:
     - name: intake-deploy-key
       secret:
         secretName: paperclip-intake-deploy-key
-    # .xlab/ at this run's revision, for publish only.
-    - name: trusted
-      volumeClaimTemplate:
-        spec:
-          accessModes: [ReadWriteOnce]
-          storageClassName: scratch-local
-          resources:
-            requests:
-              storage: 1Gi
-    # The plan task's output for publish: a few small files.
-    - name: plan
-      volumeClaimTemplate:
-        spec:
-          accessModes: [ReadWriteOnce]
-          storageClassName: scratch-local
-          resources:
-            requests:
-              storage: 1Gi
