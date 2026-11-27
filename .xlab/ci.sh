@@ -46,6 +46,8 @@ step() {
 # The fork's own CI scripts (.xlab/*.py, intake-push.sh).
 step xlab-scripts env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .xlab -p 'test_*.py'
 step install pnpm install --frozen-lockfile
+# The fork's Node CI scripts, which need the installed workspace.
+step xlab-node-scripts node --test .xlab/related-tests.test.mjs
 step typecheck pnpm -r typecheck
 step build pnpm build
 
@@ -90,10 +92,14 @@ if $fhs_ci; then
     HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
 fi
-# Pull requests run the test files they add or change. Import-graph selection
-# (vitest --changed) still picks most of the suite for any server change, and
-# the full suite takes about 2 hours, so it runs weekly from
-# .tekton/full-tests.yaml and before a deploy.
+# Pull requests run the test files they add or change, plus the tests that
+# import the files they change (.xlab/related-tests.mjs, the selection of
+# `vitest related`) while that adds at most CI_RELATED_TEST_CAP files (default
+# 150, about 15 minutes). A change to a hub module (adapter-utils, the
+# heartbeat service, ...) reaches 1,000-2,500 of the ~4,200 test files, and
+# the full suite takes about 2 hours, so above the cap only the changed test
+# files run and the scheduled full run (.tekton/full-tests.yaml) covers the
+# rest.
 if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
   diff_base=$CI_BASE_REF
@@ -115,36 +121,56 @@ if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
       break
     fi
   done
-  # --no-renames: a renamed test counts as added, and the diff never needs a
+  # --no-renames: a renamed file counts as added, and the diff never needs a
   # blob the partial clone lacks.
-  mapfile -t tests < <(git diff --name-only --no-renames --diff-filter=AM "$diff_base" HEAD \
-    | grep -E '\.test\.(ts|tsx|mts|js|mjs)$' || true)
+  mapfile -t changed < <(git diff --name-only --no-renames --diff-filter=AM "$diff_base" HEAD)
   # Packages excluded from the pnpm workspace (sandbox providers) install
   # standalone without a lockfile, as upstream builds them, and run their own
-  # vitest config; the root vitest projects do not include them.
+  # vitest config; the root vitest projects do not include them. Their suites
+  # are small (at most 30 files, seconds), so a code change in one runs all
+  # of it.
   mapfile -t members < <(pnpm m ls --depth -1 --json | jq -r '.[].path')
+  workspace_changed=()
   workspace_tests=()
-  declare -A standalone_tests=()
-  for file in "${tests[@]}"; do
+  declare -A standalone_changed=()
+  for file in "${changed[@]}"; do
     dir=$(dirname "$file")
     while [ "$dir" != . ] && [ ! -f "$dir/package.json" ]; do dir=$(dirname "$dir"); done
     if [ "$dir" != . ] && ! printf '%s\n' "${members[@]}" | grep -qxF "$PWD/$dir"; then
-      standalone_tests[$dir]+="${file#"$dir"/}"$'\n'
+      if [[ $file =~ \.[cm]?[jt]sx?$|(^|/)package\.json$ ]]; then standalone_changed[$dir]=1; fi
     else
-      workspace_tests+=("$file")
+      case $file in .xlab/* | .tekton/*) continue ;; esac # no test imports these
+      workspace_changed+=("$file")
+      if [[ $file =~ \.test\.(ts|tsx|mts|js|mjs)$ ]]; then workspace_tests+=("$file"); fi
     fi
   done
-  if [ ${#workspace_tests[@]} -gt 0 ]; then
-    step test "${as_test_user[@]}" pnpm exec vitest run "${workspace_tests[@]}"
+  related=()
+  if [ ${#workspace_changed[@]} -gt 0 ]; then
+    # Prints its own summary and timing on stderr.
+    related_out=$("${as_test_user[@]}" node .xlab/related-tests.mjs "${workspace_changed[@]}")
+    if [ -n "$related_out" ]; then
+      mapfile -t related < <(comm -23 <(sort -u <<<"$related_out") \
+        <(printf '%s\n' "${workspace_tests[@]}" | sort -u))
+    fi
   fi
-  for dir in "${!standalone_tests[@]}"; do
-    mapfile -t files < <(printf '%s' "${standalone_tests[$dir]}")
+  cap=${CI_RELATED_TEST_CAP:-150}
+  selection=("${workspace_tests[@]}" "${related[@]}")
+  if [ ${#selection[@]} -gt "$cap" ]; then
+    echo "::: related tests skipped: ${#related[@]} test files import the change, more than CI_RELATED_TEST_CAP=${cap} with the ${#workspace_tests[@]} changed; the scheduled full run covers them"
+    selection=("${workspace_tests[@]}")
+  elif [ ${#related[@]} -gt 0 ]; then
+    echo "::: related tests: ${#related[@]} test files import the change, added to the ${#workspace_tests[@]} changed"
+  fi
+  if [ ${#selection[@]} -gt 0 ]; then
+    step test "${as_test_user[@]}" pnpm exec vitest run "${selection[@]}"
+  fi
+  for dir in "${!standalone_changed[@]}"; do
     step "install $dir" "${as_test_user[@]}" pnpm install --dir "$dir" --ignore-workspace --no-lockfile --no-frozen-lockfile
     "${as_test_user[@]}" node scripts/link-plugin-dev-sdk.mjs
-    step "test $dir" "${as_test_user[@]}" pnpm --dir "$dir" exec vitest run "${files[@]}"
+    step "test $dir" "${as_test_user[@]}" pnpm --dir "$dir" exec vitest run
   done
-  if [ ${#tests[@]} -eq 0 ]; then
-    echo "::: test skipped: the change adds or edits no test files"
+  if [ ${#workspace_tests[@]} -eq 0 ] && [ ${#related[@]} -eq 0 ] && [ ${#standalone_changed[@]} -eq 0 ]; then
+    echo "::: test skipped: no test file changed or imports the change"
   fi
 else
   step test "${as_test_user[@]}" pnpm test:run
