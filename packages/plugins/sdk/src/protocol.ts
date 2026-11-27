@@ -94,6 +94,7 @@ import type {
   PluginApiResponse,
   PluginConfigValidationResult,
   PluginWebhookInput,
+  PluginWebhookResult,
 } from "./define-plugin.js";
 
 // ---------------------------------------------------------------------------
@@ -1399,7 +1400,7 @@ export interface HostToWorkerMethods {
   /** @see PLUGIN_SPEC.md §13.6 */
   runJob: [params: RunJobParams, result: void];
   /** @see PLUGIN_SPEC.md §13.7 */
-  handleWebhook: [params: PluginWebhookInput, result: void];
+  handleWebhook: [params: PluginWebhookInput, result: PluginWebhookResult | void];
   /** Scoped plugin API route dispatch. */
   handleApiRequest: [params: PluginApiRequestInput, result: PluginApiResponse];
   /** @see PLUGIN_SPEC.md §13.8 */

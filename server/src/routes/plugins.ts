@@ -495,6 +495,19 @@ interface PluginToolExecuteRequest {
 }
 
 /**
+ * HTTP status for a webhook delivery the worker handled: the status from the
+ * plugin's `onWebhook` result when it is 2xx, 4xx or 5xx, otherwise 200.
+ */
+export function pluginWebhookResponseStatus(result: unknown): number {
+  const status = typeof result === "object" && result !== null
+    ? (result as { status?: unknown }).status
+    : undefined;
+  if (typeof status !== "number" || !Number.isInteger(status)) return 200;
+  if ((status >= 200 && status < 300) || (status >= 400 && status < 600)) return status;
+  return 200;
+}
+
+/**
  * Create Express router for plugin management API.
  *
  * Routes provided:
@@ -2735,7 +2748,8 @@ export function pluginRoutes(
    * endpoints must be publicly accessible for external callers. Signature
    * verification is the plugin's responsibility.
    *
-   * Response: `{ deliveryId: string, status: string }`
+   * Response: `{ deliveryId: string, status: string }`, with the HTTP status
+   * the plugin's `onWebhook` result names (2xx, 4xx or 5xx), else 200.
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
@@ -2826,7 +2840,7 @@ export function pluginRoutes(
 
     // Step 7: Dispatch to the worker via handleWebhook RPC
     try {
-      await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+      const result = await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
         headers: req.headers as Record<string, string | string[]>,
         rawBody,
@@ -2834,21 +2848,24 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 8: Update delivery record to success
+      // Step 8: Update the delivery record with the plugin's outcome
+      const httpStatus = pluginWebhookResponseStatus(result);
+      const rejected = httpStatus >= 400;
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
         .update(pluginWebhookDeliveries)
         .set({
-          status: "success",
+          status: rejected ? "failed" : "success",
           durationMs,
+          error: rejected ? `Plugin rejected the delivery with HTTP ${httpStatus}` : null,
           finishedAt,
         })
         .where(eq(pluginWebhookDeliveries.id, delivery.id));
 
-      res.status(200).json({
+      res.status(httpStatus).json({
         deliveryId: delivery.id,
-        status: "success",
+        status: rejected ? "failed" : "success",
       });
     } catch (err) {
       // Step 8 (error): Update delivery record to failed
