@@ -57,6 +57,7 @@ export function ExecutionStageDecisionCard({
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
   const [note, setNote] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const executionState = issue.executionState;
   const canAct = canActOnPendingExecutionStage(issue, currentUserId);
@@ -79,6 +80,9 @@ export function ExecutionStageDecisionCard({
           (stageType === "approval" ? "Approved." : "Review approved."),
       });
     },
+    onMutate: () => {
+      setErrorMessage(null);
+    },
     onSuccess: (_result, action) => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.issues.detail(issue.id),
@@ -96,6 +100,7 @@ export function ExecutionStageDecisionCard({
         queryKey: queryKeys.attention(issue.companyId),
       });
       setNote("");
+      setErrorMessage(null);
       pushToast({
         title:
           action === "approve"
@@ -108,9 +113,14 @@ export function ExecutionStageDecisionCard({
       onResolved?.(action);
     },
     onError: (error) => {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Could not record decision. Please try again.";
+      setErrorMessage(message);
       pushToast({
         title: "Could not record decision",
-        body: error instanceof Error ? error.message : "Please try again.",
+        body: message,
         tone: "error",
       });
     },
@@ -151,11 +161,6 @@ export function ExecutionStageDecisionCard({
   const pending = decide.isPending;
   const noteEmpty = note.trim().length === 0;
   const runningAction = pending ? decide.variables : null;
-  const errorMessage = decide.isError
-    ? decide.error instanceof Error
-      ? decide.error.message
-      : "Could not record decision. Please try again."
-    : null;
 
   return (
     <div

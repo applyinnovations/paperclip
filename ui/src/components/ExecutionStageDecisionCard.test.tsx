@@ -366,19 +366,19 @@ describe("ExecutionStageDecisionCard", () => {
     )!;
     await act(async () => {
       approveButton.click();
-      await Promise.resolve();
-      await Promise.resolve();
     });
 
-    const alert = container.querySelector('[role="alert"]');
-    expect(alert?.textContent).toContain(
-      "Only the active reviewer can advance the stage.",
-    );
-    expect(pushToastMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        tone: "error",
-        body: "Only the active reviewer can advance the stage.",
-      }),
-    );
+    await vi.waitFor(() => {
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert?.textContent).toContain(
+        "Only the active reviewer can advance the stage.",
+      );
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tone: "error",
+          body: "Only the active reviewer can advance the stage.",
+        }),
+      );
+    });
   });
 });
