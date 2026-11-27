@@ -1,5 +1,6 @@
 import { logger } from "../middleware/logger.js";
 import type { DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
+import { logWakeError } from "./deferred-execution-wait.js";
 
 type WakeupTriggerDetail = "manual" | "ping" | "callback" | "system";
 type WakeupSource = "timer" | "assignment" | "on_demand" | "automation";
@@ -80,8 +81,8 @@ export function queueIssueAssignmentWakeup(input: {
       },
     })
     .catch((err) => {
-      logger.warn(
-        { err, issueId: input.issue.id },
+      logWakeError(logger, err,
+        { issueId: input.issue.id },
         "failed to wake assignee on issue assignment",
       );
       if (input.rethrowOnError) throw err;

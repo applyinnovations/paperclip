@@ -6,6 +6,7 @@ import { deferredWorkIntentWait } from "../work-intent-outbox.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { pauseWakeIntentSql, resumePauseWakeIntents, savePauseWakeIntent } from "./pause-wake-intents.js";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { notifyRunDispatch } from "../run-dispatch-notifications.js";
@@ -1802,6 +1803,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    // Wakes an agent pause refused: one intent per task, delivered once now
+    // that the agent can run (pause-wake-intents.ts).
+    await resumePauseWakeIntents({
+      db, enqueueWakeup: (agentId, opts) => enqueueWakeup(agentId, opts), onError: scope.onError,
+      logWarn: (fields, message) => logger.warn(fields, message),
+    }, { companyId: scope.companyId, requestId: scope.requestId });
     // Work-intent outbox: a message refused by a pause waits for the pause to
     // lift, not behind the run. Lifting the pause is the operator's explicit
     // authorization to send what the pause refused, as Send is after a Stop:
@@ -1828,6 +1835,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // A message the reconciler saved after its wake was lost waits on no
         // hold, so the same explicit wake sends it.
         sql`${agentWakeupRequests.payload}->'executionWait'->>'trigger' in ('pause_lifted', 'reconciler_backstop')`,
+        sql`not ${pauseWakeIntentSql}`,
         sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' in ('company.inactive', 'agent.not_invokable', 'wake_lost')`,
         eq(agentWakeupRequests.requestedByActorType, "user"),
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
@@ -1903,6 +1911,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
         dependencyResolvedWakePayloadSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        // A pause intent is delivered by its own drain above.
+        sql`not ${pauseWakeIntentSql}`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
             AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
@@ -2918,11 +2928,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
     if (!invokability.invokable) {
       if (caseRequest) return null;
-      // Only a pause defers through the release drain (wake-queue policy); a
+      // A pause defers every issue-scoped wake, from anyone, as one intent per
+      // task that resuming the agent delivers once (pause-wake-intents.ts). A
       // pending approval still fails a promoted wake, so it is not saved here.
-      if (invokability.reason === "paused" && (await canSaveDeferredMessage()))
-        throw await saveDeferredMessage("agent.not_invokable", invokability.message,
-          { status: agent.status, reason: invokability.reason });
+      if (invokability.reason === "paused" && !executionWaitRequestId && !receiptRequest && issueId && isUuidLike(issueId))
+        throw await savePauseWakeIntent(db, {
+          companyId: agent.companyId, agentId, issueId, source, triggerDetail, reason, payload,
+          contextSnapshot: enrichedContextSnapshot, wakeCommentId: wakeCommentId ?? null,
+          requestedByActorType: opts.requestedByActorType ?? null, requestedByActorId: opts.requestedByActorId ?? null,
+          message: invokability.message, details: { status: agent.status, reason: invokability.reason },
+        });
       let waitSaved = false;
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
         const wait = await writeSkippedRequest("agent.not_invokable", {

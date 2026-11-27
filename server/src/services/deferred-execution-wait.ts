@@ -1,3 +1,4 @@
+import type { Logger } from "pino";
 import { HttpError } from "../errors.js";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
@@ -30,4 +31,19 @@ export async function writeDeferredExecutionWait(db: Db, scope: { companyId: str
       eq(agentWakeupRequests.status, "deferred_issue_execution"))).returning({ id: agentWakeupRequests.id });
     return Boolean(saved);
   });
+}
+
+/**
+ * Log a wake producer's error. A refusal whose request was saved (for example
+ * a wake refused while its agent is paused) is not a lost wake: it is logged
+ * at info level, never as "failed to wake".
+ */
+export function logWakeError(
+  log: Pick<Logger, "warn" | "info">, err: unknown, fields: Record<string, unknown>, message: string,
+) {
+  if (err instanceof PersistedExecutionWaitRefusal) {
+    log.info({ ...fields, refusal: err.message, details: err.details }, "wake saved until its hold lifts");
+    return;
+  }
+  log.warn({ err, ...fields }, message);
 }

@@ -1,6 +1,7 @@
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
+import { logWakeError } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -2717,9 +2718,8 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       },
     })
     .catch((err) =>
-      logger.warn(
+      logWakeError(logger, err,
         {
-          err,
           issueId: input.issue.id,
           interactionId: input.interaction.id,
           agentId: input.issue.assigneeAgentId,
@@ -10903,9 +10903,8 @@ export function issueRoutes(
             },
           });
         } catch (err) {
-          logger.warn(
+          logWakeError(logger, err,
             {
-              err,
               issueId: result.issue.id,
               agentId: result.issue.assigneeAgentId,
             },
@@ -16966,8 +16965,8 @@ export function issueRoutes(
               });
             })
             .catch((err) =>
-              logger.warn(
-                { err, issueId: issue.id, agentId },
+              logWakeError(logger, err,
+                { issueId: issue.id, agentId },
                 "failed to wake agent on issue update",
               ),
             );
@@ -17182,8 +17181,8 @@ export function issueRoutes(
             contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
           })
           .catch((err) =>
-            logger.warn(
-              { err, issueId: issue.id },
+            logWakeError(logger, err,
+              { issueId: issue.id },
               "failed to wake assignee on issue checkout",
             ),
           );
@@ -18108,9 +18107,8 @@ export function issueRoutes(
             },
           })
           .catch((err) =>
-            logger.warn(
+            logWakeError(logger, err,
               {
-                err,
                 issueId: issue.id,
                 interactionId: interaction.id,
                 agentId: interaction.addresseeAgentId,
@@ -20563,8 +20561,8 @@ export function issueRoutes(
               });
             })
             .catch((err) =>
-              logger.warn(
-                { err, issueId: currentIssue.id, agentId },
+              logWakeError(logger, err,
+                { issueId: currentIssue.id, agentId },
                 "failed to wake agent on issue comment",
               ),
             );

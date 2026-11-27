@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
+import { savePauseStopContinuations } from "./heartbeat/pause-wake-intents.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginHasAgentEnvironments, pluginServesAgentEnvironment } from "./plugin-environment-driver.js";
@@ -78,6 +79,16 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
           }).where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id),
             inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
+          // A manual pause interrupts the task; resuming continues it once.
+          // Saved before the Stop, so a run that ends mid-sweep still has it.
+          const [company] = cause ? [] : await db.select({ pauseReason: companies.pauseReason }).from(companies)
+            .where(eq(companies.id, agent.companyId));
+          await savePauseStopContinuations(db, {
+            companyId: agent.companyId, agentId: agent.id,
+            holds: cause?.holds ?? agent.lifecycleHolds ?? [],
+            companyPauseReason: cause ? cause.companyPauseReason ?? null : company?.pauseReason ?? null,
+            runStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES,
+          });
         }
         if (!await heartbeat.stopInvocationsForAgents(ids, reason,
           { preservePauseDeferred: agent.lifecycleState === "pausing" })) return "pending";
