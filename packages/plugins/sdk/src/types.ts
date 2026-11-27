@@ -1647,10 +1647,20 @@ export interface PluginIssueExecutionDecisionRecordedPayload {
   actorAgentId: string | null;
   actorUserId: string | null;
   /**
-   * The commit the decision names as reviewed: the last
-   * `Reviewed-SHA: <40 lowercase hex>` line of the decision body (see
-   * `parseReviewedSha` in `@paperclipai/shared`), or `null` when the body
-   * has no valid such line.
+   * Every commit the decision names as reviewed: the valid
+   * `Reviewed-SHA: <40 lowercase hex>` lines of the decision body, in order,
+   * without duplicates (see `parseReviewedShas` in `@paperclipai/shared`).
+   * One decision can cover several pull requests by naming each head on its
+   * own line. Empty when the body has no valid such line.
+   */
+  reviewedShas: string[];
+  /**
+   * The single commit the decision names as reviewed: the last
+   * `Reviewed-SHA:` line of the decision body (see `parseReviewedSha` in
+   * `@paperclipai/shared`), or `null` when the body has no such line or that
+   * line's value is not a valid SHA.
+   *
+   * @deprecated Use `reviewedShas`; a decision may name several commits.
    */
   reviewedSha: string | null;
   /** ISO 8601 timestamp of when the decision was recorded. */
@@ -1789,7 +1799,7 @@ export interface PluginIssuesClient {
   /**
    * List the decisions recorded on the issue's execution-policy review and
    * approval stages, oldest first (newest last). Each carries the
-   * `reviewedSha` parsed from its body. Requires `issues.read`. Returns `[]`
+   * `reviewedShas` (and deprecated `reviewedSha`) parsed from its body. Requires `issues.read`. Returns `[]`
    * for an issue outside `companyId` or one the plugin cannot read.
    */
   listExecutionDecisions(issueId: string, companyId: string): Promise<PluginIssueExecutionDecision[]>;

@@ -1189,12 +1189,13 @@ The host emits `issue.execution_decision.recorded` after it commits a decision o
 | `outcome` | `"approved" \| "changes_requested"` | Decision outcome |
 | `actorAgentId` | `string \| null` | Deciding agent, if an agent decided |
 | `actorUserId` | `string \| null` | Deciding user, if a user decided |
-| `reviewedSha` | `string \| null` | Commit the decision names as reviewed (below) |
+| `reviewedShas` | `string[]` | Every commit the decision names as reviewed (below) |
+| `reviewedSha` | `string \| null` | Deprecated: the single commit named by the last trailer line (below) |
 | `createdAt` | `string` | ISO 8601 time the decision was recorded |
 
 The payload also carries the standard activity fields `agentId`, `runId` and `responsibleUserId`. It does not carry the decision body; read it with `ctx.issues.listExecutionDecisions`, which returns the same fields plus `body`.
 
-`reviewedSha` is read from the decision body. A reviewer names the commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. When the body has several such lines the last one governs; if it is not a valid SHA, `reviewedSha` is `null`. The parser is `parseReviewedSha` in `@paperclipai/shared`.
+Both fields are read from the decision body. A reviewer names a commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. One decision can cover several pull requests by naming each head on its own line. `reviewedShas` holds every valid value, in order and without duplicates; lines with an invalid value are skipped, and it is `[]` when none is valid. `reviewedSha` keeps the earlier single-commit reading: the last such line governs, and it is `null` if that line is not a valid SHA. The parsers are `parseReviewedShas` and `parseReviewedSha` in `@paperclipai/shared`.
 
 ## 17. Scheduled Jobs
 

@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { issueExecutionDecisions } from "@paperclipai/db";
 import {
   parseReviewedSha,
+  parseReviewedShas,
   type IssueExecutionDecisionOutcome,
   type IssueExecutionStageType,
 } from "@paperclipai/shared";
@@ -34,6 +35,7 @@ export function toPluginIssueExecutionDecision(
     outcome: row.outcome as IssueExecutionDecisionOutcome,
     actorAgentId: row.actorAgentId ?? null,
     actorUserId: row.actorUserId ?? null,
+    reviewedShas: parseReviewedShas(row.body),
     reviewedSha: parseReviewedSha(row.body),
     createdAt: row.createdAt.toISOString(),
     body: row.body,

@@ -1705,7 +1705,7 @@ export {
   parseIssueReferenceHref,
   type IssueReferenceMatch,
 } from "./issue-references.js";
-export { REVIEWED_SHA_TRAILER_KEY, parseReviewedSha } from "./reviewed-sha.js";
+export { REVIEWED_SHA_TRAILER_KEY, parseReviewedSha, parseReviewedShas } from "./reviewed-sha.js";
 
 export {
   anchorSnapshotToSelector,

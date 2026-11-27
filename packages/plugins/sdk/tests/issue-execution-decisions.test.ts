@@ -11,6 +11,7 @@ import { createTestHarness } from "../src/testing.js";
 import type { PaperclipPluginManifestV1, PluginIssueExecutionDecision } from "../src/types.js";
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
+const SHA_2 = "fedcba9876543210fedcba9876543210fedcba98";
 
 function manifest(capabilities: PaperclipPluginManifestV1["capabilities"]): PaperclipPluginManifestV1 {
   return {
@@ -32,8 +33,8 @@ function issue(id: string, companyId: string): Issue {
 
 function decision(
   input: Partial<PluginIssueExecutionDecision> & Pick<PluginIssueExecutionDecision, "decisionId" | "createdAt" | "body">,
-): Omit<PluginIssueExecutionDecision, "reviewedSha"> & { reviewedSha?: string | null } {
-  const { reviewedSha: _omitted, ...rest } = {
+): Omit<PluginIssueExecutionDecision, "reviewedSha" | "reviewedShas"> & { reviewedSha?: string | null; reviewedShas?: string[] } {
+  const { reviewedSha: _omitted, reviewedShas: _omittedList, ...rest } = {
     issueId: "issue-1",
     issueIdentifier: "ISSUE-1",
     stageId: "stage-1",
@@ -43,7 +44,11 @@ function decision(
     actorUserId: null,
     ...input,
   };
-  return "reviewedSha" in input ? { ...rest, reviewedSha: input.reviewedSha } : rest;
+  return {
+    ...rest,
+    ...("reviewedSha" in input ? { reviewedSha: input.reviewedSha } : {}),
+    ...("reviewedShas" in input ? { reviewedShas: input.reviewedShas } : {}),
+  };
 }
 
 describe("ctx.issues.listExecutionDecisions in the test harness", () => {
@@ -63,22 +68,46 @@ describe("ctx.issues.listExecutionDecisions in the test harness", () => {
     });
 
     const decisions = await harness.ctx.issues.listExecutionDecisions("issue-1", "company-1");
-    expect(decisions.map((row) => [row.decisionId, row.outcome, row.reviewedSha])).toEqual([
-      ["d1", "changes_requested", null],
-      ["d2", "approved", SHA],
+    expect(decisions.map((row) => [row.decisionId, row.outcome, row.reviewedShas, row.reviewedSha])).toEqual([
+      ["d1", "changes_requested", [], null],
+      ["d2", "approved", [SHA], SHA],
     ]);
   });
 
-  it("keeps an explicitly seeded reviewedSha", async () => {
+  it("derives every reviewed SHA when one decision names several heads", async () => {
     const harness = createTestHarness({ manifest: manifest(["issues.read"]) });
     harness.seed({
       issues: [issue("issue-1", "company-1")],
       issueExecutionDecisions: [
-        decision({ decisionId: "d1", createdAt: "2026-11-01T00:00:00.000Z", body: "no trailer", reviewedSha: SHA }),
+        decision({
+          decisionId: "d1",
+          createdAt: "2026-11-01T00:00:00.000Z",
+          body: `Both PRs approved.\nReviewed-SHA: ${SHA}\nReviewed-SHA: ${SHA_2}`,
+        }),
+      ],
+    });
+    const [row] = await harness.ctx.issues.listExecutionDecisions("issue-1", "company-1");
+    expect(row?.reviewedShas).toEqual([SHA, SHA_2]);
+    expect(row?.reviewedSha).toBe(SHA_2);
+  });
+
+  it("keeps explicitly seeded reviewedSha and reviewedShas", async () => {
+    const harness = createTestHarness({ manifest: manifest(["issues.read"]) });
+    harness.seed({
+      issues: [issue("issue-1", "company-1")],
+      issueExecutionDecisions: [
+        decision({
+          decisionId: "d1",
+          createdAt: "2026-11-01T00:00:00.000Z",
+          body: "no trailer",
+          reviewedSha: SHA,
+          reviewedShas: [SHA, SHA_2],
+        }),
       ],
     });
     const [row] = await harness.ctx.issues.listExecutionDecisions("issue-1", "company-1");
     expect(row?.reviewedSha).toBe(SHA);
+    expect(row?.reviewedShas).toEqual([SHA, SHA_2]);
   });
 
   it("returns nothing for another company's issue", async () => {
