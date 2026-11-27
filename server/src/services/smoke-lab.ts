@@ -701,6 +701,7 @@ export function smokeLabService(db: Db, options: {
           description: input.description,
           type: input.type,
           status: "active",
+          archivedAt: null,
           metadata: { smokeLab: true },
           updatedAt: now,
         }).where(eq(toolApplications.id, existing.id)).returning();

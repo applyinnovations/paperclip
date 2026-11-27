@@ -5,7 +5,7 @@ import { mkdir } from "node:fs/promises";
 import { createIsolatedTestHome } from "./helpers/isolated-test-home.js";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { createDb, closeRegisteredClients, companies, agents, authUsers, companyMemberships, connectionGrants, plugins, aiConnectionRouterCursors, aiConnectionTaskPins, toolConnections, companySecrets, heartbeatRuns, issues, dotAgentBindings, grokBotRoutines } from "@paperclipai/db";
+import { createDb, closeRegisteredClients, companies, agents, authUsers, companyMemberships, connectionGrants, plugins, aiConnectionRouterCursors, aiConnectionTaskPins, toolApplications, toolConnections, companySecrets, heartbeatRuns, issues, dotAgentBindings, grokBotRoutines } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import type { AiConnectionPoolMember, AiConnectionRouterRequest, AiConnectionRouterResult, PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, poolMemberRuntimeConfig, applyAiConnectionRouterTaskSettings } from "../services/ai-connection-router.js";
@@ -506,6 +506,32 @@ describe("durable, authorized connection routing", () => {
       const replaced = await prepareManagedAiRuntime(db, input); try { expect(replaced.sessionIdentity).not.toBe(first.sessionIdentity); } finally { await replaced.cleanup(); }
       const [secret] = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.id, ref.secretId))); expect(secret!.aiSessionEpoch).toBeGreaterThan(0);
     } finally { await first.cleanup(); }
+  });
+
+  it("reactivates an archived router tool_application when creating a new pool", async () => {
+    const original = await instanceSettingsService(db).getExperimental();
+    await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+    try {
+      const key = `plugin:${pluginKey}:ai-router`;
+      const first = await makePool();
+      const [conn] = await db.select().from(toolConnections).where(eq(toolConnections.id, first.id));
+      await db
+        .update(toolApplications)
+        .set({ status: "archived", archivedAt: new Date(), updatedAt: new Date() })
+        .where(and(eq(toolApplications.companyId, companyId), eq(toolApplications.applicationKey, key)));
+
+      const second = await makePool();
+      const [secondConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, second.id));
+      expect(secondConn?.applicationId).toBe(conn!.applicationId);
+      const [reactivatedApp] = await db
+        .select()
+        .from(toolApplications)
+        .where(eq(toolApplications.id, conn!.applicationId));
+      expect(reactivatedApp?.status).toBe("active");
+      expect(reactivatedApp?.archivedAt).toBeNull();
+    } finally {
+      await instanceSettingsService(db).updateExperimental(original);
+    }
   });
 });
 

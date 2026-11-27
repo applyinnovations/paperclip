@@ -372,6 +372,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
           .update(toolApplications)
           .set({
             status: "active",
+            archivedAt: null,
             updatedAt: new Date(),
           })
           .where(eq(toolApplications.id, connection.applicationId));
@@ -645,7 +646,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
       connection = updatedConnection;
       await tx
         .update(toolApplications)
-        .set({ status: "active", updatedAt: new Date() })
+        .set({ status: "active", archivedAt: null, updatedAt: new Date() })
         .where(eq(toolApplications.id, connection.applicationId));
       // The organization grant is created before OAuth has any secrets to attach.
       // Synchronize it after every successful callback/rotation so all real tool

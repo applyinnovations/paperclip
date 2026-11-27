@@ -141,8 +141,11 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
       } else {
         const key = `plugin:${pluginKey}:ai-router`;
         await tx.insert(toolApplications).values({ companyId: input.companyId, applicationKey: key, name: plugin.manifestJson.aiConnectionRouter?.name ?? plugin.manifestJson.displayName, metadata: { sourceTemplateKey: aiConnectionRouterSlug(pluginKey) }, type: "paperclip_plugin", pluginId: plugin.id }).onConflictDoNothing();
-        const [application] = await tx.select().from(toolApplications).where(and(eq(toolApplications.companyId, input.companyId), eq(toolApplications.applicationKey, key)));
+        const [application] = await tx.select().from(toolApplications).where(and(eq(toolApplications.companyId, input.companyId), eq(toolApplications.applicationKey, key))).for("update");
         if (!application) throw new Error("Router application could not be created");
+        if (application.status !== "active" || application.archivedAt !== null) {
+          await tx.update(toolApplications).set({ status: "active", archivedAt: null, updatedAt: new Date() }).where(eq(toolApplications.id, application.id));
+        }
         await tx.insert(toolConnections).values({ id, companyId: input.companyId, applicationId: application.id, name: config.name, uid: id, connectionPurpose: "ai", transport: "runtime_auth", enabled: config.enabled, status: "active", healthStatus: "ok", config: { aiRouter: { pluginKey }, sourceTemplateKey: aiConnectionRouterSlug(pluginKey) }, createdByUserId: userId });
         await tx.insert(aiConnectionPools).values({ id, companyId: input.companyId, pluginKey, config });
         await tx.insert(aiConnectionRouterCursors).values({ poolId: id, companyId: input.companyId });

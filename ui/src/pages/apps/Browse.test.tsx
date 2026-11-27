@@ -2027,4 +2027,269 @@ describe("Connectors landing page", () => {
       ),
     ).toBe(true);
   });
+
+  it("still renders an active AI connection and Add account button when its parent tool_application is archived", async () => {
+    const claudeAccount: AiManagedConnectionSummary = {
+      id: "claude-active",
+      grantId: "grant-claude-active",
+      companyId: "company-1",
+      provider: "anthropic",
+      method: "api_key",
+      name: "Shared Claude account",
+      ownership: "shared",
+      isDefault: false,
+      canSetDefault: false,
+      status: "connected",
+    };
+    listGalleryMock.mockResolvedValue({
+      apps: [getAppStoreDefinition("anthropic"), getAppStoreDefinition("openai")],
+    });
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        application({
+          id: "app-anthropic-archived",
+          name: "Claude",
+          status: "archived",
+          applicationKey: "app-gallery:anthropic",
+          metadata: { sourceTemplateKey: "anthropic" },
+        }),
+        application({
+          id: "app-archived-empty",
+          name: "Stale Archived App",
+          status: "archived",
+          applicationKey: "custom:stale-archived",
+          metadata: { source: "link" },
+        }),
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: claudeAccount.id,
+          companyId: "company-1",
+          applicationId: "app-anthropic-archived",
+          connectionPurpose: "ai",
+          transport: "runtime_auth",
+          authKind: "api_key",
+          credentialPolicy: "shared",
+          name: claudeAccount.name,
+          status: "active",
+          enabled: true,
+          config: {
+            sourceTemplateKey: "anthropic",
+            ai: { provider: "anthropic", method: "api_key" },
+          },
+        }),
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [claudeAccount],
+    });
+
+    await renderBrowse();
+
+    const claudeRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(claudeRow).not.toBeNull();
+    expect(claudeRow?.getAttribute("data-connected")).toBe("true");
+    expect(claudeRow?.textContent).toContain("Shared Claude account");
+    const addAccountButton = claudeRow?.querySelector<HTMLButtonElement>(
+      'button[aria-label="Add account Anthropic"]',
+    );
+    expect(addAccountButton).not.toBeNull();
+    expect(addAccountButton?.disabled).toBe(false);
+    expect(container.textContent).not.toContain("Stale Archived App");
+
+    await act(() => void addAccountButton!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith(
+      "/apps/connect?source=anthropic&applicationId=app-anthropic-archived&name=Anthropic&new=1",
+    );
+  });
+
+  it("still renders an active AI connection and enabled Add account button when its parent tool_application is missing", async () => {
+    const claudeAccount: AiManagedConnectionSummary = {
+      id: "claude-orphan",
+      grantId: "grant-claude-orphan",
+      companyId: "company-1",
+      provider: "anthropic",
+      method: "api_key",
+      name: "Orphaned Claude account",
+      ownership: "shared",
+      isDefault: false,
+      canSetDefault: false,
+      status: "connected",
+    };
+    listGalleryMock.mockResolvedValue({
+      apps: [getAppStoreDefinition("anthropic")],
+    });
+    listApplicationsMock.mockResolvedValue({ applications: [] });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        connection({
+          id: claudeAccount.id,
+          companyId: "company-1",
+          applicationId: "app-missing-id",
+          connectionPurpose: "ai",
+          transport: "runtime_auth",
+          authKind: "api_key",
+          credentialPolicy: "shared",
+          name: claudeAccount.name,
+          status: "active",
+          enabled: true,
+          config: {
+            sourceTemplateKey: "anthropic",
+            ai: { provider: "anthropic", method: "api_key" },
+          },
+        }),
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [claudeAccount],
+    });
+
+    await renderBrowse();
+
+    const claudeRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(claudeRow).not.toBeNull();
+    expect(claudeRow?.getAttribute("data-connected")).toBe("true");
+    expect(claudeRow?.textContent).toContain("Orphaned Claude account");
+    const addAccountButton = claudeRow?.querySelector<HTMLButtonElement>(
+      'button[aria-label="Add account Anthropic"]',
+    );
+    expect(addAccountButton).not.toBeNull();
+    expect(addAccountButton?.disabled).toBe(false);
+
+    await act(() => void addAccountButton!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith("/apps/connect?source=anthropic");
+  });
+
+  it("bounds endpoint matching and grouping work for hundreds of orphan connections against the shipped gallery", async () => {
+    const { CONNECTABLE_APP_DEFINITIONS: shippedGallery } = await vi.importActual<
+      typeof import("@paperclipai/shared")
+    >("@paperclipai/shared");
+
+    let urlPatternReads = 0;
+    const urlPatternBudget = shippedGallery.length * 4;
+    const instrumentedGallery = shippedGallery.map((entry) => {
+      const patterns = entry.urlPatterns ?? [];
+      const wrapped = { ...entry };
+      Object.defineProperty(wrapped, "urlPatterns", {
+        enumerable: true,
+        get() {
+          urlPatternReads += 1;
+          if (urlPatternReads > urlPatternBudget) {
+            throw new Error(
+              `Gallery urlPatterns read budget exceeded (${urlPatternReads} > ${urlPatternBudget})`,
+            );
+          }
+          return patterns;
+        },
+      });
+      return wrapped;
+    });
+
+    const knownSlugOrphans = Array.from({ length: 150 }, (_, index) => {
+      const config: Record<string, unknown> = {
+        sourceTemplateKey: "anthropic",
+        ai: { provider: "anthropic", method: "api_key" },
+      };
+      Object.defineProperty(config, "url", {
+        enumerable: true,
+        get() {
+          throw new Error("Known-slug orphan must not read config.url for endpoint fallback");
+        },
+      });
+      return connection({
+        id: `orphan-known-${index}`,
+        applicationId: `missing-known-app-${index}`,
+        connectionPurpose: "ai",
+        transport: "runtime_auth",
+        authKind: "api_key",
+        name: `Known slug orphan ${index}`,
+        config,
+      });
+    });
+
+    const urlMatchedOrphans = [
+      ...Array.from({ length: 50 }, (_, index) =>
+        connection({
+          id: `orphan-exact-url-${index}`,
+          applicationId: `missing-exact-url-app-${index}`,
+          connectionPurpose: "tool",
+          name: `Exact URL orphan ${index}`,
+          config: { url: `https://api.anthropic.com/v1/account-${index}` },
+        }),
+      ),
+      ...Array.from({ length: 50 }, (_, index) =>
+        connection({
+          id: `orphan-wildcard-url-${index}`,
+          applicationId: `missing-wildcard-url-app-${index}`,
+          connectionPurpose: "tool",
+          name: `Wildcard URL orphan ${index}`,
+          config: { url: `https://tenant-${index}.make.com/mcp` },
+        }),
+      ),
+    ];
+
+    const repeatedParentCount = 250;
+    let repeatedParentIdReads = 0;
+    const repeatedParentReadBudget = repeatedParentCount * 20;
+    const repeatedParentOrphans = Array.from({ length: repeatedParentCount }, (_, index) => {
+      const item = connection({
+        id: `orphan-custom-${index}`,
+        applicationId: "missing-shared-custom-app",
+        connectionPurpose: "tool",
+        name: `Custom orphan ${index}`,
+        config: { url: `https://unmatched-${index}.internal.example/mcp` },
+      });
+      Object.defineProperty(item, "id", {
+        enumerable: true,
+        get() {
+          repeatedParentIdReads += 1;
+          if (repeatedParentIdReads > repeatedParentReadBudget) {
+            throw new Error(
+              `Orphan grouping/render work exceeded linear budget (${repeatedParentIdReads} > ${repeatedParentReadBudget})`,
+            );
+          }
+          return `orphan-custom-${index}`;
+        },
+      });
+      return item;
+    });
+
+    listGalleryMock.mockResolvedValue({ apps: instrumentedGallery });
+    listApplicationsMock.mockResolvedValue({ applications: [] });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        ...knownSlugOrphans,
+        ...urlMatchedOrphans,
+        ...repeatedParentOrphans,
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [],
+    });
+
+    await renderBrowse();
+
+    expect(urlPatternReads).toBeLessThanOrEqual(shippedGallery.length);
+    expect(repeatedParentIdReads).toBeLessThanOrEqual(repeatedParentReadBudget);
+
+    const anthropicRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(anthropicRow?.getAttribute("data-connected")).toBe("true");
+    expect(anthropicRow?.textContent).toContain("200 connections");
+
+    const makeRow = container.querySelector('[data-app-slug="make"]');
+    expect(makeRow?.getAttribute("data-connected")).toBe("true");
+    expect(makeRow?.textContent).toContain("50 connections");
+
+    const customRow = container.querySelector('[data-app-slug="missing-shared-custom-app"]');
+    expect(customRow?.getAttribute("data-connected")).toBe("true");
+    expect(customRow?.textContent).toContain(`${repeatedParentCount} connections`);
+  });
 });

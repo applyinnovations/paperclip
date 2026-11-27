@@ -411,6 +411,7 @@ export function createCloudOAuthCallback(db: Db, dependencies: Dependencies) {
         .update(toolApplications)
         .set({
           status: shouldFinalizeManagedDefaults ? "draft" : "active",
+          archivedAt: null,
           updatedAt: now(),
         })
         .where(eq(toolApplications.id, connection.applicationId));

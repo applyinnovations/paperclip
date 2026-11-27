@@ -823,8 +823,30 @@ export function aiConnectionService(db: Db) {
               ),
             ),
           ),
-        );
+        )
+        .orderBy(toolApplications.id)
+        .for("update");
       if (!app) throw unprocessable("Could not find the provider application");
+      let targetApp = app;
+      if (reconnect && reconnect.connection.applicationId !== app.id) {
+        const [reconnectedApp] = await tx
+          .select()
+          .from(toolApplications)
+          .where(
+            and(
+              eq(toolApplications.id, reconnect.connection.applicationId),
+              eq(toolApplications.companyId, companyId),
+            ),
+          )
+          .for("update");
+        if (reconnectedApp) targetApp = reconnectedApp;
+      }
+      if (targetApp.status !== "active" || targetApp.archivedAt !== null) {
+        await tx
+          .update(toolApplications)
+          .set({ status: "active", archivedAt: null, updatedAt: new Date() })
+          .where(eq(toolApplications.id, targetApp.id));
+      }
       if (reconnect)
         await tx
           .update(toolConnections)
