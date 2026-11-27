@@ -32,6 +32,7 @@ const mockIssueService = vi.hoisted(() => ({
   listReviewAttention: vi.fn(),
 }));
 
+const mockRouteLogActivity = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => undefined));
 const mockPauseGate = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 const mockExecutionBlocker = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 vi.mock("../services/execution-blocker.js", () => ({ getExecutionBlocker: mockExecutionBlocker }));
@@ -212,7 +213,7 @@ function registerModuleMocks() {
     issueTreeControlService: () => ({ getActivePauseHoldGate: mockPauseGate }),
   issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: vi.fn(async () => undefined),
+    logActivity: mockRouteLogActivity,
     projectService: () => ({}),
     questionResponseDeliveryService: () => ({
       deliver: vi.fn(async () => undefined),
@@ -231,13 +232,15 @@ async function loadAppModules() {
   ]);
 }
 
+let actorOverride: Record<string, unknown> | null = null;
+
 async function createApp(transaction: (callback: (tx: Record<string, never>) => Promise<unknown>) => Promise<unknown> =
   async (callback) => callback({ select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [{ id: "comment-3" }] }) }) }) } as any)) {
   const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actorOverride ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -287,6 +290,7 @@ describe("issue update comment wakeups", () => {
   });
 
   beforeEach(() => {
+    actorOverride = null;
     vi.resetAllMocks();
     mockAccessDecide.mockImplementation(async (input) => ({ allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "Allowed by test grant." }));
     mockPauseGate.mockResolvedValue(null);
@@ -1031,5 +1035,89 @@ describe("issue update comment wakeups", () => {
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
       reason: "execution_review_requested",
     }));
+  });
+  describe("board administrative close (skipExecutionPolicy)", () => {
+    const REVIEWER_AGENT_ID = MENTIONED_AGENT_ID;
+    const policy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{
+        id: "66666666-6666-4666-8666-666666666666",
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ id: "77777777-7777-4777-8777-777777777777", type: "agent", agentId: REVIEWER_AGENT_ID, userId: null }],
+      }],
+    };
+    const shipped = () => makeIssue({
+      status: "in_progress", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, executionPolicy: policy,
+    });
+    const echoUpdate = (existing: Record<string, unknown>) =>
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...existing, ...patch }));
+    const mockComment = (existing: Record<string, unknown>) => mockIssueService.addComment.mockResolvedValue({
+      id: "comment-close", issueId: existing.id, companyId: existing.companyId, body: "Already shipped",
+    });
+
+    it("keeps the default: a board done on a policy issue goes to review and wakes the reviewer", async () => {
+      const existing = shipped();
+      mockIssueService.getById.mockResolvedValue(existing);
+      echoUpdate(existing);
+
+      const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({ status: "done" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update.mock.calls[0]![1]).toMatchObject({ status: "in_review", assigneeAgentId: REVIEWER_AGENT_ID });
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(REVIEWER_AGENT_ID,
+        expect.objectContaining({ reason: "execution_review_requested" })));
+    });
+
+    it.each(["done", "cancelled"])("closes to %s directly, clears executionState, wakes no reviewer and records the bypass", async (status) => {
+      const existing = shipped();
+      mockIssueService.getById.mockResolvedValue(existing);
+      echoUpdate(existing);
+      mockComment(existing);
+
+      const res = await request(await createApp()).patch(`/api/issues/${existing.id}`)
+        .send({ status, skipExecutionPolicy: true, comment: "Already shipped in PR 12" });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]![1] as Record<string, unknown>;
+      expect(patch).toMatchObject({ status, executionState: null });
+      expect(patch).not.toHaveProperty("skipExecutionPolicy");
+      expect(patch.assigneeAgentId).toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(REVIEWER_AGENT_ID, expect.anything());
+      expect(mockRouteLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.execution_policy_bypassed",
+        actorType: "user",
+        actorId: "local-board",
+        details: expect.objectContaining({ status, previousStatus: "in_progress" }),
+      }));
+    });
+
+    it("requires a comment and a terminal status", async () => {
+      const existing = shipped();
+      mockIssueService.getById.mockResolvedValue(existing);
+      const app = await createApp();
+
+      const noComment = await request(app).patch(`/api/issues/${existing.id}`).send({ status: "done", skipExecutionPolicy: true });
+      expect(noComment.status).toBe(422);
+      const notTerminal = await request(app).patch(`/api/issues/${existing.id}`)
+        .send({ status: "in_progress", skipExecutionPolicy: true, comment: "x" });
+      expect(notTerminal.status).toBe(422);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects an agent sending the flag with 403", async () => {
+      const existing = shipped();
+      actorOverride = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", source: "agent_key", runId: null };
+      mockIssueService.getById.mockResolvedValue(existing);
+
+      const res = await request(await createApp()).patch(`/api/issues/${existing.id}`)
+        .send({ status: "done", skipExecutionPolicy: true, comment: "Done" });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
   });
 });

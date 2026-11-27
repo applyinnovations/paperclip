@@ -14471,6 +14471,23 @@ export function issueRoutes(
       )) {
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
+      // Administrative close is a board decision; the policy's stages exist to
+      // gate agent completion, so no agent (or delegated MCP client) may skip them.
+      if (req.body.skipExecutionPolicy === true) {
+        if (req.actor.type !== "board" || req.actor.source === "mcp_oauth") {
+          throw forbidden("Only a board user can close a task without its execution policy");
+        }
+        if (req.body.status !== "done" && req.body.status !== "cancelled") {
+          throw unprocessable('skipExecutionPolicy requires status "done" or "cancelled"', {
+            code: "administrative_close_status_required",
+          });
+        }
+        if (typeof req.body.comment !== "string" || !req.body.comment.trim()) {
+          throw unprocessable("skipExecutionPolicy requires a comment explaining the administrative close", {
+            code: "administrative_close_comment_required",
+          });
+        }
+      }
       const id = req.params.id as string;
       const existing = await getAccessibleResource(
         req,
@@ -14565,6 +14582,7 @@ export function issueRoutes(
         resume: resumeRequested,
         interrupt: interruptRequested,
         deferWakeForGoal,
+        skipExecutionPolicy,
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
@@ -15055,6 +15073,7 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
+        administrativeClose: skipExecutionPolicy === true,
       });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -16001,6 +16020,26 @@ export function issueRoutes(
           ...issueResponse,
           activeRecoveryAction: null,
         };
+      }
+      if (skipExecutionPolicy === true) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.execution_policy_bypassed",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            status: issue.status,
+            previousStatus: existing.status,
+            previousExecutionStateStatus: existingExecutionState?.status ?? null,
+            previousStageId: existingExecutionState?.currentStageId ?? null,
+          },
+        });
       }
       if (!persistReviewActivityTransactionally)
         await logActivity(db, {

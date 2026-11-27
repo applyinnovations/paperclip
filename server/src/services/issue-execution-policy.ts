@@ -60,6 +60,12 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * Board administrative close (`skipExecutionPolicy`): close directly to the
+   * requested terminal status without starting or advancing any stage. The
+   * caller owns authorization; this only defines the transition.
+   */
+  administrativeClose?: boolean;
 };
 
 export type ExecutionPolicyDecisionLike = {
@@ -1623,6 +1629,23 @@ export function buildIssueMonitorClearedPatch(input: {
 }
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
+  if (input.administrativeClose) {
+    if (input.requestedStatus !== "done" && input.requestedStatus !== "cancelled") {
+      throw unprocessable('skipExecutionPolicy requires status "done" or "cancelled"', {
+        code: "administrative_close_status_required",
+      });
+    }
+    if (input.decision !== undefined) {
+      throw unprocessable("skipExecutionPolicy cannot be combined with a review decision", {
+        code: "conflicting_execution_decision",
+      });
+    }
+    // Monitor bookkeeping still runs (a closed task keeps no wait), but no
+    // stage state survives: the close is not a review outcome.
+    const patch = applyMonitorTransition(input, { executionState: null });
+    patch.executionState = null;
+    return { patch };
+  }
   const stageResult = applyIssueExecutionStageTransition(input);
   const monitorPatch = applyMonitorTransition(input, stageResult.patch);
   Object.assign(stageResult.patch, monitorPatch);

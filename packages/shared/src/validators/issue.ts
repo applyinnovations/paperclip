@@ -1016,6 +1016,13 @@ export const updateIssueSchema = objectWithoutDefaults(
     interrupt: z.boolean().optional(),
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
+    /**
+     * Board-only administrative close. With `status: "done"` or `"cancelled"`
+     * and a comment, closes directly without starting or waiting for the
+     * execution policy's review/approval stages, clears `executionState` and
+     * wakes no reviewer. Agents get 403.
+     */
+    skipExecutionPolicy: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
   });
 
