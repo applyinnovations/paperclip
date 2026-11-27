@@ -4581,7 +4581,11 @@ export function issueRoutes(
       outcome: "cancelled",
       resolutionNote,
     });
-    if (!resolved) return activeRecoveryAction;
+    // Another writer (e.g. the terminal-transition settlement) may have
+    // settled it first; report what is active now, not the stale snapshot.
+    if (!resolved) {
+      return recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+    }
 
     await logActivity(db, {
       companyId: input.issue.companyId,
