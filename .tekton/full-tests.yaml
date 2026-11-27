@@ -1,7 +1,8 @@
-# Weekly full test suite on xlab (about 2 hours on one pod; upstream spreads
-# it over ~25 jobs), triggered on Sundays (UTC) through the PaC incoming
-# webhook by deployments' nightly-cron-trigger. Not a required check;
-# failures show on the xlab commit. Pull requests, including upstream
+# Nightly full test suite on xlab (about 2 hours on one pod; upstream spreads
+# it over ~25 jobs), triggered at 00:00 UTC through the PaC incoming webhook
+# by deployments' nightly-cron-trigger. Pull requests run only the test files
+# they change, so this is the run that catches a test broken through an
+# import (APP-229). Not a required check; failures show on the xlab commit. Pull requests, including upstream
 # intake ones, test only what differs from tested source (.xlab/ci.sh).
 apiVersion: tekton.dev/v1
 kind: PipelineRun

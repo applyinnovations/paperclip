@@ -90,10 +90,12 @@ if $fhs_ci; then
     HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
 fi
-# Pull requests run the test files they add or change. Import-graph selection
-# (vitest --changed) still picks most of the suite for any server change, and
-# the full suite takes about 2 hours, so it runs weekly from
-# .tekton/full-tests.yaml and before a deploy.
+# Pull requests run the test files they add or change, not the tests that
+# import what they change: a PR that edits only a service runs none of that
+# service's other tests (APP-229). Import-graph selection would reach a third
+# to two thirds of the suite for about half of our PRs, and the full suite
+# takes about 2 hours, so it runs every night from .tekton/full-tests.yaml
+# and catches those tests within a day. Check its latest run before a deploy.
 if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   : "${CI_BASE_REF:?set CI_BASE_REF to the target branch ref}"
   diff_base=$CI_BASE_REF
