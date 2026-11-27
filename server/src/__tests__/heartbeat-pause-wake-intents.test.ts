@@ -87,7 +87,7 @@ describePostgres("wakes refused during an agent pause", () => {
   async function resume(f: Fixture) {
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
     const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    await driver.onReady(agent as never);
+    await driver.onReady!(agent as never);
     for (let pass = 0; pass < 3; pass += 1) {
       await heartbeat.resumeQueuedRuns();
       await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });

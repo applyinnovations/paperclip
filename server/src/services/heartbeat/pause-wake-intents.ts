@@ -75,7 +75,7 @@ function wakeRank(actorType: string | null, payload: Record<string, unknown>, co
  * wake producers can tell a saved wake from a lost one.
  */
 export async function savePauseWakeIntent(db: Db, input: PauseWakeIntentInput): Promise<PersistedExecutionWaitRefusal> {
-  const incomingContext = { ...input.contextSnapshot, issueId: input.issueId };
+  const incomingContext: Record<string, unknown> = { ...input.contextSnapshot, issueId: input.issueId };
   const incomingPayload = { ...(input.payload ?? {}), issueId: input.issueId };
   const incomingComments = [...new Set([
     ...queuedCommentIdsFromRunContext(incomingContext),
