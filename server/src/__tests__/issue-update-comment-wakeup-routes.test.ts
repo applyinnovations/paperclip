@@ -988,4 +988,48 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it.each(["todo", "in_progress", "in_review"])("wakes the unchanged assignee once when a board moves blocked -> %s", async (status) => {
+    const existing = makeIssue({ status: "blocked", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({ ...existing, status });
+
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({ status });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
+      reason: "issue_status_changed",
+      payload: expect.objectContaining({ issueId: existing.id, mutation: "update" }),
+      contextSnapshot: expect.objectContaining({ issueId: existing.id, source: "issue.status_change" }),
+    }));
+  });
+
+  it("leaves the review-stage wake as the only wake when blocked -> in_review starts a stage", async () => {
+    const existing = makeIssue({ status: "blocked", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    const executionState = {
+      status: "pending",
+      currentStageId: "55555555-5555-4555-8555-555555555555",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: ASSIGNEE_AGENT_ID },
+      returnAssignee: { type: "agent", agentId: PREVIOUS_AGENT_ID },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({ ...existing, status: "in_review", executionState });
+
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
+      reason: "execution_review_requested",
+    }));
+  });
 });

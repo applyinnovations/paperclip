@@ -52,6 +52,7 @@ import { deliverConversationComments, isConversation } from "../services/agent-c
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { shouldWakeAssigneeLeavingBlocked } from "../services/issue-unblock-wake.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -16532,6 +16533,13 @@ export function issueRoutes(
         existing.status === "in_review" &&
         issue.status === "todo" &&
         req.body.status !== undefined;
+      const statusChangedFromBlockedToActive = shouldWakeAssigneeLeavingBlocked({
+        previousStatus: existing.status,
+        nextStatus: issue.status,
+        statusRequested: req.body.status !== undefined,
+        actorAgentId: actor.actorType === "agent" ? actor.agentId : null,
+        assigneeAgentId: issue.assigneeAgentId ?? null,
+      });
       const previousExecutionState = parseIssueExecutionState(
         existing.executionState,
       );
@@ -16673,6 +16681,8 @@ export function issueRoutes(
           !assigneeChanged &&
           (statusChangedFromBacklog ||
             statusChangedFromBlockedToTodo ||
+            // A review stage that just started already wakes its participant.
+            (statusChangedFromBlockedToActive && !executionStageWakeup) ||
             statusChangedFromClosedToTodo ||
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
