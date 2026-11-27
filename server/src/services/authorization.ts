@@ -1885,6 +1885,34 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       return broadDecision;
     }
 
+    /**
+     * An agent that holds tasks:assign_scope but not tasks:assign is confined
+     * to that scope for every assignment target, protected or not (APP-738).
+     * Returns a denial when the target is outside the scope, or null when the
+     * agent is not confined or the target is in scope (the caller's normal
+     * rules then still apply on top).
+     */
+    async function denyOutsideAssignScopeIfConfined(agentId: string): Promise<AuthorizationDecision | null> {
+      if (await findGrant(companyId, "agent", agentId, "tasks:assign")) return null;
+      if (!(await findGrant(companyId, "agent", agentId, "tasks:assign_scope"))) return null;
+      const scoped = await decidePrincipalGrant({
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        action: input.action,
+        permissionKey: "tasks:assign_scope",
+        scope: input.scope,
+      });
+      if (scoped.allowed) return null;
+      return deny({
+        action: input.action,
+        reason: scoped.reason === "deny_missing_membership" ? scoped.reason : "deny_scope",
+        explanation:
+          "Assignment denied: this agent holds only tasks:assign_scope, and the target assignee is outside that scope.",
+        grant: scoped.grant,
+      });
+    }
+
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,
@@ -2574,6 +2602,10 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
         if (grantDecision.allowed) return grantDecision;
         return denyRestrictedAssignmentPolicy(policyEffect);
+      }
+      if (input.action === "tasks:assign") {
+        const scopeDeny = await denyOutsideAssignScopeIfConfined(actorAgentId);
+        if (scopeDeny) return scopeDeny;
       }
       if (trustResolution.kind === "standard") return decideVisibleIssueWrite();
       return allow({

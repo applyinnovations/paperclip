@@ -1353,6 +1353,108 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  describe("tasks:assign_scope without tasks:assign confines every target (APP-738)", () => {
+    const protectedPolicy = { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } };
+    const privatePolicy = {
+      authorizationPolicy: {
+        agentVisibility: { mode: "private", hiddenFromDefaultDirectory: true },
+        assignmentPolicy: { mode: "company_default", protectedAgentRequiresApproval: false },
+        protectedAgent: { requiresApproval: false },
+        managedBy: "permissions-extension",
+      },
+    };
+
+    async function assign(companyId: string, actorAgentId: string, targetAgentId: string, issueId?: string) {
+      return authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId, source: "agent_key" },
+        action: "tasks:assign",
+        resource: { type: "issue", companyId, issueId: issueId ?? null, assigneeAgentId: targetAgentId },
+        scope: { issueId: issueId ?? null, assigneeAgentId: targetAgentId },
+      });
+    }
+
+    it("allows the allowlisted agent and denies unprotected, protected and private others with a clear reason", async () => {
+      const company = await createCompany(db, "ScopeOnlyAllowlist");
+      const actorAgent = await createAgent(db, company.id);
+      const reliability = await createAgent(db, company.id);
+      const unprotected = await createAgent(db, company.id);
+      const protectedTarget = await createAgent(db, company.id, { permissions: protectedPolicy });
+      const privateTarget = await createAgent(db, company.id, { permissions: privatePolicy });
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign_scope", {
+        assigneeAgentIds: [reliability.id],
+      });
+
+      expect(await assign(company.id, actorAgent.id, reliability.id)).toMatchObject({ allowed: true });
+
+      const deniedUnprotected = await assign(company.id, actorAgent.id, unprotected.id);
+      expect(deniedUnprotected).toMatchObject({
+        allowed: false,
+        reason: "deny_scope",
+        grant: { permissionKey: "tasks:assign_scope" },
+      });
+      expect(deniedUnprotected.explanation).toContain("holds only tasks:assign_scope");
+      expect(deniedUnprotected.explanation).not.toContain("not visible");
+
+      expect(await assign(company.id, actorAgent.id, protectedTarget.id)).toMatchObject({ allowed: false });
+      expect(await assign(company.id, actorAgent.id, privateTarget.id)).toMatchObject({ allowed: false });
+    });
+
+    it("applies the same confinement when reassigning an existing issue", async () => {
+      const company = await createCompany(db, "ScopeOnlyReassign");
+      const actorAgent = await createAgent(db, company.id);
+      const reliability = await createAgent(db, company.id);
+      const other = await createAgent(db, company.id);
+      const issue = await createIssue(db, company.id, { title: "Alert", assigneeAgentId: actorAgent.id });
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign_scope", {
+        assigneeAgentIds: [reliability.id],
+      });
+
+      expect(await assign(company.id, actorAgent.id, reliability.id, issue.id)).toMatchObject({ allowed: true });
+      expect(await assign(company.id, actorAgent.id, other.id, issue.id)).toMatchObject({
+        allowed: false,
+        reason: "deny_scope",
+      });
+    });
+
+    it("allows targets inside a subtree scope and denies targets outside it", async () => {
+      const company = await createCompany(db, "ScopeOnlySubtree");
+      const actorAgent = await createAgent(db, company.id);
+      const root = await createAgent(db, company.id);
+      const child = await createAgent(db, company.id, { reportsTo: root.id });
+      const outside = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign_scope", {
+        subtreeRootAgentId: root.id,
+      });
+
+      expect(await assign(company.id, actorAgent.id, child.id)).toMatchObject({ allowed: true });
+      expect(await assign(company.id, actorAgent.id, outside.id)).toMatchObject({
+        allowed: false,
+        reason: "deny_scope",
+      });
+    });
+
+    it("leaves agents that also hold tasks:assign default-open for unprotected targets", async () => {
+      const company = await createCompany(db, "ScopeAndBroad");
+      const actorAgent = await createAgent(db, company.id);
+      const reliability = await createAgent(db, company.id);
+      const other = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: actorAgent.id,
+        permissionKey: "tasks:assign_scope",
+        scope: { assigneeAgentIds: [reliability.id] },
+        grantedByUserId: null,
+      });
+
+      expect(await assign(company.id, actorAgent.id, other.id)).toMatchObject({
+        allowed: true,
+        reason: "allow_visible_issue_write",
+      });
+    });
+  });
+
   it("allows simple-mode task assignment for active same-company board operators without explicit grants", async () => {
     const company = await createCompany(db, "BoardAssignmentDefault");
     const userId = `user-${randomUUID()}`;
