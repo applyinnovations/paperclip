@@ -60,6 +60,24 @@ still "Not yet offered" when the change merges is a follow-up to offer it.
    upstream ships it, the next intake merge carries upstream's version; remove
    ours and its row.
 
+## The PR checks' toolchain cache
+
+`ci.sh` runs in `nix develop ./.xlab`, and the devshell carries
+paperclip-runner's Cargo dependencies prebuilt for the current `Cargo.lock`
+([runner-cargo-deps.nix](runner-cargo-deps.nix): the dependencies of the
+`cargo check` in its typecheck and the release `cargo build` in its build).
+`ci.sh` seeds `packages/paperclip-runner/runner/target` with them and points
+cargo at the same vendored sources, so cargo compiles only the Runner's own
+crates. The derivation reads only the Cargo manifests and the lockfile, so
+source edits do not invalidate it.
+
+On each push to `xlab`, `.tekton/nix-cache-warm.yaml` runs
+[warm-cache.sh](warm-cache.sh): it builds the devshell's whole closure
+(`.#ci-toolchain`) unless the shared Nix cache (niks3) already holds it, and
+the run publishes what the cache lacked. A PR that changes `Cargo.lock`, the
+runner's `Cargo.toml` files or the flake builds the new dependencies inside
+its own check, as before, until it merges.
+
 ## fork-guard: patches stay generic
 
 Every carried patch must be something upstream could merge: generic,

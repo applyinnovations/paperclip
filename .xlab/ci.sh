@@ -46,6 +46,27 @@ step() {
 # The fork's own CI scripts (.xlab/*.py, intake-push.sh).
 step xlab-scripts env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .xlab -p 'test_*.py'
 step install pnpm install --frozen-lockfile
+
+# paperclip-runner's typecheck and build compile its Cargo dependencies (the
+# AWS SDK, reqwest, rustls...) twice, debug check and release build, about 5
+# minutes. The devshell carries them prebuilt for this Cargo.lock
+# (runner-cargo-deps.nix, from the Nix cache): seed cargo's target directory
+# with them and read crates from the same vendored sources, so cargo finds
+# them fresh and compiles only the Runner's own crates. The copies keep the
+# store's single mtime: cargo rebuilds a unit when a dependency's output is
+# newer than its own, and fresh copy-order mtimes would make that true at
+# random (every crate with a build script, and all above it, recompiled).
+seed_runner_cargo_deps() {
+  local target=packages/paperclip-runner/runner/target
+  export CARGO_HOME="$PWD/.xlab/.cache/cargo-home"
+  mkdir -p "$CARGO_HOME" "$target"
+  install -m 644 "$XLAB_RUNNER_CARGO_DEPS/cargo-config.toml" "$CARGO_HOME/config.toml"
+  cp -r --preserve=timestamps "$XLAB_RUNNER_CARGO_DEPS/target/." "$target/"
+  chmod -R u+w "$target"
+}
+if [ -n "${XLAB_RUNNER_CARGO_DEPS:-}" ]; then
+  step runner-cargo-deps seed_runner_cargo_deps
+fi
 step typecheck pnpm -r typecheck
 step build pnpm build
 
