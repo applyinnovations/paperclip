@@ -761,6 +761,13 @@ export interface IssueExecutionStage {
   type: IssueExecutionStageType;
   approvalsNeeded: 1;
   participants: IssueExecutionStageParticipant[];
+  /**
+   * Review stages only. When true, an approval of this stage must name the
+   * reviewed commit with a `Reviewed-SHA: <40-hex>` line in its decision
+   * comment (see `parseReviewedSha`); otherwise it is rejected with HTTP 422
+   * `reviewed_sha_required` and nothing is recorded.
+   */
+  requireReviewedSha?: boolean;
 }
 
 export interface IssueExecutionMonitorPolicy {

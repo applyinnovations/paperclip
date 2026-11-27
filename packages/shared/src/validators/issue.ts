@@ -402,6 +402,15 @@ export const issueExecutionStageSchema = z.object({
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  requireReviewedSha: z.boolean().optional(),
+}).superRefine((value, ctx) => {
+  if (value.requireReviewedSha && value.type !== "review") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "requireReviewedSha is only supported on review stages",
+      path: ["requireReviewedSha"],
+    });
+  }
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({

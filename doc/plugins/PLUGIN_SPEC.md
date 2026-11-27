@@ -1196,6 +1196,14 @@ The payload also carries the standard activity fields `agentId`, `runId` and `re
 
 `reviewedSha` is read from the decision body. A reviewer names the commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. When the body has several such lines the last one governs; if it is not a valid SHA, `reviewedSha` is `null`. The parser is `parseReviewedSha` in `@paperclipai/shared`.
 
+A review stage can require the line. Set `requireReviewedSha: true` on the stage in `executionPolicy.stages[]` (issue or project default policy):
+
+```json
+{ "type": "review", "requireReviewedSha": true, "participants": [{ "type": "agent", "agentId": "<code-reviewer-agent-id>" }] }
+```
+
+The host then rejects an approval of that stage (`decision: "approve"`, `status: "done"`, or an approving review comment) whose comment has no valid `Reviewed-SHA` line, as `parseReviewedSha` reads it. The response is HTTP 422 with `details.code` `reviewed_sha_required` (plus `stageId` and `stageType`), and the error tells the reviewer the line format. Nothing is recorded: no decision, no comment, no event, and the stage stays pending. Requesting changes never needs the line. The flag is valid only on `review` stages; an `approval` stage with it is an invalid policy. An agent cannot drop the flag from an unsatisfied stage, for the same reason it cannot remove the stage. Set it on code review stages whose decisions gate a pull request, so a missing commit is refused when the reviewer submits instead of being found later by the gate.
+
 ## 17. Scheduled Jobs
 
 Plugins may declare scheduled jobs in their manifest.

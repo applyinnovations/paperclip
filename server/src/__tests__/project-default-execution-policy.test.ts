@@ -63,6 +63,18 @@ describe("normalizeProjectDefaultExecutionPolicy", () => {
 });
 
 describe("applyProjectDefaultExecutionPolicy", () => {
+  it("carries requireReviewedSha from the project default to the issue's review stage", () => {
+    const flaggedDefault = normalizeProjectDefaultExecutionPolicy({
+      stages: [{ type: "review", requireReviewedSha: true, participants: [{ type: "agent", agentId: reviewerId }] }],
+    })!;
+    expect(flaggedDefault.stages[0]).toMatchObject({ requireReviewedSha: true });
+    expect(applyProjectDefaultExecutionPolicy(null, flaggedDefault)?.stages[0]).toMatchObject({
+      type: "review",
+      requireReviewedSha: true,
+    });
+    expect(applyProjectDefaultExecutionPolicy(null, projectDefault)?.stages[0]).not.toHaveProperty("requireReviewedSha");
+  });
+
   it("gives an issue without a policy the project's stages, with fresh ids", () => {
     const applied = applyProjectDefaultExecutionPolicy(null, projectDefault);
     expect(applied).toMatchObject({

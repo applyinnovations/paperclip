@@ -109,6 +109,7 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
     implementerAgentId: string;
     reviewerAgentId: string;
     identifier: string;
+    requireReviewedSha?: boolean;
   }) {
     const issueId = randomUUID();
     const stageId = randomUUID();
@@ -128,6 +129,7 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
           type: "review",
           approvalsNeeded: 1,
           participants: [{ id: randomUUID(), type: "agent", agentId: input.reviewerAgentId }],
+          ...(input.requireReviewedSha ? { requireReviewedSha: true } : {}),
         }],
       },
       executionState: {
@@ -237,6 +239,46 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       createdAt: row!.createdAt.toISOString(),
       body,
     }]);
+  });
+
+  describe("review stage with requireReviewedSha", () => {
+    it.each([
+      { name: "decision approve without the line", via: "patch", send: { decision: "approve", comment: "LGTM" }, ok: false },
+      { name: "status done without the line", via: "patch", send: { status: "done", comment: "LGTM" }, ok: false },
+      { name: "decision approve with an invalid line", via: "patch", send: { decision: "approve", comment: "LGTM\nReviewed-SHA: abc123" }, ok: false },
+      { name: "approving review comment without the line", via: "comment", send: { body: "## Review: APPROVED" }, ok: false },
+      { name: "decision approve with a valid line", via: "patch", send: { decision: "approve", comment: `LGTM\n\nReviewed-SHA: ${REVIEWED_SHA}` }, ok: true },
+      { name: "status done with a valid line", via: "patch", send: { status: "done", comment: `LGTM\nReviewed-SHA: ${REVIEWED_SHA}` }, ok: true },
+      { name: "approving review comment with a valid line", via: "comment", send: { body: `## Review: APPROVED\n\nReviewed-SHA: ${REVIEWED_SHA}` }, ok: true },
+    ])("$name → recorded: $ok", async ({ via, send, ok }) => {
+      const seeded = await seedCompany("XRS");
+      const { issueId, stageId } = await seedPendingReview({ ...seeded, identifier: "XRS-1", requireReviewedSha: true });
+      const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+      const client = request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)));
+      const res = via === "patch"
+        ? await client.patch(`/api/issues/${issueId}`).send(send)
+        : await client.post(`/api/issues/${issueId}/comments`).send(send);
+
+      const rows = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      if (ok) {
+        expect(res.status, JSON.stringify(res.body)).toBe(via === "patch" ? 200 : 201);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ stageId, outcome: "approved" });
+        const [event] = await waitForDecisionEvents(1);
+        expect(event!.payload).toMatchObject({ stageId, outcome: "approved", reviewedSha: REVIEWED_SHA });
+        return;
+      }
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({ code: "reviewed_sha_required", stageId, stageType: "review" });
+      expect(res.body.error).toContain("Reviewed-SHA: <sha>");
+      expect(rows).toHaveLength(0);
+      expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: seeded.reviewerAgentId });
+      expect(issue!.executionState).toMatchObject({ status: "pending", currentStageId: stageId });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+      expect(decisionEvents()).toHaveLength(0);
+    });
   });
 
   it("emits the event with a null reviewed SHA when a reviewer requests changes", async () => {

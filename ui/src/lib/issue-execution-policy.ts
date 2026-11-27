@@ -78,6 +78,7 @@ export function buildExecutionPolicy(input: {
       type: "review" as const,
       approvalsNeeded: 1 as const,
       participants: reviewParticipants,
+      ...(existingReviewStage?.requireReviewedSha ? { requireReviewedSha: true } : {}),
     });
   }
 
