@@ -165,7 +165,9 @@ export async function savePauseStopContinuations(db: Db, input: {
       source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
       payload: { issueId: issue.id },
       contextSnapshot: { issueId: issue.id, taskId: issue.id, wakeReason: "issue_continuation_needed",
-        source: "agent.pause_lifted", pauseStoppedRunId: run.runId },
+        // The continuation names the run it continues: dispatch walks that
+        // ancestry before an automatic continuation may start.
+        source: "agent.pause_lifted", retryOfRunId: run.runId, pauseStoppedRunId: run.runId },
       wakeCommentId: null, requestedByActorType: "system", requestedByActorId: null,
       message: "The agent was paused while working on this task.",
     });
