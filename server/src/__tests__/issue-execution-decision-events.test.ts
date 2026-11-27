@@ -944,4 +944,134 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
     expect(postReopenStripRes.status, JSON.stringify(postReopenStripRes.body)).toBe(422);
     expect(postReopenStripRes.body.details).toMatchObject({ code: "execution_policy_stages_protected" });
   });
+
+  it("lets a reviewer request changes on a direct review issue with no return assignee, then re-pends it on a plugin head-SHA sync", async () => {
+    // Mirrors the GitHub plugin's unlinked-PR review issue: created straight
+    // into in_review on the reviewer with returnAssignee null.
+    const seeded = await seedCompany("XDN");
+    const issueId = randomUUID();
+    const firstStageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      identifier: "XDN-1",
+      title: "Review unlinked PR",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: seeded.reviewerAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: firstStageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerAgentId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: firstStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId, userId: null },
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    // 1. Reviewer requests changes: decision recorded, issue unassigned todo.
+    const reviewerRun1 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const changesRes = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun1)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ decision: "request_changes", comment: "The migration is missing a down step." });
+    expect(changesRes.status, JSON.stringify(changesRes.body)).toBe(200);
+    expect(changesRes.body).toMatchObject({ status: "todo", assigneeAgentId: null, assigneeUserId: null });
+    expect(changesRes.body.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: firstStageId,
+      returnAssignee: null,
+      lastDecisionOutcome: "changes_requested",
+      lastDecisionId: expect.any(String),
+      changesRequestedCount: 1,
+    });
+    const [changesEvent] = await waitForDecisionEvents(1);
+    expect(changesEvent!.payload).toMatchObject({ issueId, stageId: firstStageId, outcome: "changes_requested" });
+    const decisionRows = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisionRows).toEqual([
+      expect.objectContaining({
+        id: changesRes.body.executionState.lastDecisionId,
+        outcome: "changes_requested",
+        actorAgentId: seeded.reviewerAgentId,
+        body: "The migration is missing a down step.",
+      }),
+    ]);
+    // No executor to bounce back to, so nobody is woken for the changes.
+    const changesWakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "execution_changes_requested"));
+    expect(changesWakes).toEqual([]);
+
+    // 2. A new head SHA arrives: the plugin resets the issue to a fresh pending
+    // review on the reviewer, the way syncReviewIssue does.
+    const services = buildHostServices(db, "plugin-record-id", "test.execution-decisions", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+    } as any);
+    const secondStageId = randomUUID();
+    const repended = await services.issues.update({
+      issueId,
+      companyId: seeded.companyId,
+      patch: {
+        status: "in_review",
+        assigneeAgentId: seeded.reviewerAgentId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: secondStageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerAgentId, userId: null }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: secondStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId, userId: null },
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      } as any,
+    });
+    expect(repended).toMatchObject({ status: "in_review", assigneeAgentId: seeded.reviewerAgentId });
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persisted).toMatchObject({ status: "in_review", assigneeAgentId: seeded.reviewerAgentId, assigneeUserId: null });
+    expect(persisted?.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: secondStageId,
+      currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId },
+      returnAssignee: null,
+      lastDecisionOutcome: null,
+    });
+
+    // 3. The re-pended review is live again: the reviewer can decide on it.
+    const reviewerRun2 = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const secondChangesRes = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRun2)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ decision: "request_changes", comment: "Down step still missing." });
+    expect(secondChangesRes.status, JSON.stringify(secondChangesRes.body)).toBe(200);
+    expect(secondChangesRes.body).toMatchObject({ status: "todo", assigneeAgentId: null });
+    expect(secondChangesRes.body.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: secondStageId,
+      changesRequestedCount: 1,
+    });
+  });
 });

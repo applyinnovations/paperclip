@@ -1696,35 +1696,145 @@ describe("issue execution policy transitions", () => {
   });
 
   describe("changes requested with no return assignee", () => {
-    it("throws when requesting changes with no return assignee", () => {
-      const policy = twoStagePolicy();
+    // Integrations (e.g. the GitHub plugin's unlinked-PR review issues) can
+    // create an issue directly in review with no executor to bounce back to.
+    function directReviewIssue(stateOverrides: Partial<IssueExecutionState> = {}, issueOverrides: Record<string, unknown> = {}) {
+      const policy = reviewOnlyPolicy();
       const reviewStageId = policy.stages[0].id;
+      return {
+        policy,
+        reviewStageId,
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            ...stateOverrides,
+          },
+          ...issueOverrides,
+        },
+      };
+    }
+
+    it("records the decision and returns the issue to unassigned todo", () => {
+      const { policy, reviewStageId, issue } = directReviewIssue();
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        decision: "request_changes",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Changes needed",
+      });
+
+      expect(result.decision).toEqual({
+        stageId: reviewStageId,
+        stageType: "review",
+        outcome: "changes_requested",
+        body: "Changes needed",
+      });
+      expect(result.patch.status).toBe("todo");
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+        returnAssignee: null,
+        lastDecisionOutcome: "changes_requested",
+        changesRequestedCount: 1,
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("increments an existing round count", () => {
+      const { policy, issue } = directReviewIssue({ changesRequestedCount: 1 });
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Still needs work",
+      });
+
+      expect(result.patch.status).toBe("todo");
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        changesRequestedCount: 2,
+      });
+    });
+
+    it("still requires a comment", () => {
+      const { policy, issue } = directReviewIssue();
       expect(() =>
         applyIssueExecutionPolicyTransition({
-          issue: {
-            status: "in_review",
-            assigneeAgentId: qaAgentId,
-            assigneeUserId: null,
-            executionPolicy: policy,
-            executionState: {
-              status: "pending",
-              currentStageId: reviewStageId,
-              currentStageIndex: 0,
-              currentStageType: "review",
-              currentParticipant: { type: "agent", agentId: qaAgentId },
-              returnAssignee: null,
-              completedStageIds: [],
-              lastDecisionId: null,
-              lastDecisionOutcome: null,
-            },
-          },
+          issue,
           policy,
-          requestedStatus: "in_progress",
+          decision: "request_changes",
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
-          commentBody: "Changes needed",
+          commentBody: "  ",
         }),
-      ).toThrow("no return assignee");
+      ).toThrow("Requesting changes requires a comment");
+    });
+
+    it("escalates to the responsible human at the round cap", () => {
+      const { policy, reviewStageId, issue } = directReviewIssue(
+        { changesRequestedCount: 2 },
+        { responsibleUserId: boardUserId },
+      );
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        decision: "request_changes",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Round three — not converging",
+      });
+
+      expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.assigneeUserId).toBe(boardUserId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentParticipant: { type: "user", userId: boardUserId },
+        returnAssignee: null,
+        changesRequestedCount: 3,
+      });
+    });
+
+    it("falls back to unassigned todo at the round cap when no human can take the hold", () => {
+      const { policy, issue } = directReviewIssue({ changesRequestedCount: 2 });
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        decision: "request_changes",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Round three",
+      });
+
+      expect(result.patch.status).toBe("todo");
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        changesRequestedCount: 3,
+      });
     });
   });
 

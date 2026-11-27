@@ -1223,9 +1223,15 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
           );
         }
-        if (!existingState?.returnAssignee) {
-          throw unprocessable("This execution stage has no return assignee");
+        if (!existingState) {
+          throw unprocessable("This execution stage has no execution state to request changes on");
         }
+        // returnAssignee may be null: issues created directly in review (for
+        // example, review issues opened by an integration for an unlinked PR)
+        // have no executor to bounce back to. The decision is still recorded
+        // and the issue goes back to unassigned `todo`, matching approval with
+        // no return assignee.
+        const returnAssignee = existingState.returnAssignee ?? null;
         const decision = {
           stageId: activeStage.id,
           stageType: activeStage.type,
@@ -1253,7 +1259,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               policy: input.policy,
               stage: activeStage,
               participant: { type: "user", agentId: null, userId: escalationUserId },
-              returnAssignee: existingState.returnAssignee,
+              returnAssignee,
               reviewRequest: effectiveReviewRequest,
               changesRequestedCount: nextRounds,
             });
@@ -1264,8 +1270,8 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             };
           }
         }
-        patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
+        patch.status = returnAssignee ? "in_progress" : "todo";
+        Object.assign(patch, patchForPrincipal(returnAssignee));
         patch.executionState = buildChangesRequestedState(existingState, activeStage, nextRounds);
         return {
           patch,
