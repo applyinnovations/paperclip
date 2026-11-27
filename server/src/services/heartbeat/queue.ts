@@ -2931,7 +2931,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // A pause defers every issue-scoped wake, from anyone, as one intent per
       // task that resuming the agent delivers once (pause-wake-intents.ts). A
       // pending approval still fails a promoted wake, so it is not saved here.
-      if (invokability.reason === "paused" && !executionWaitRequestId && !receiptRequest && issueId && isUuidLike(issueId))
+      // Timer and monitor wakes (an issue-state guard) recur on their own and
+      // are only valid against the state they were raised for.
+      if (invokability.reason === "paused" && !executionWaitRequestId && !receiptRequest && issueId && isUuidLike(issueId) &&
+          source !== "timer" && !opts.issueStateGuard)
         throw await savePauseWakeIntent(db, {
           companyId: agent.companyId, agentId, issueId, source, triggerDetail, reason, payload,
           contextSnapshot: enrichedContextSnapshot, wakeCommentId: wakeCommentId ?? null,

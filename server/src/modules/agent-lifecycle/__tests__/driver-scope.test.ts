@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 
 const stop = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("../../../services/heartbeat.js", () => ({ heartbeatService: () => ({ stopInvocationsForAgents: stop }) }));
+const saveContinuations = vi.hoisted(() => vi.fn(async () => 0));
+vi.mock("../../../services/heartbeat/pause-wake-intents.js", () => ({ savePauseStopContinuations: saveContinuations }));
 vi.mock("../../../services/agent-harness-verification.js", () => ({ agentHarnessVerificationService: () => ({ verify: vi.fn() }) }));
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
 
@@ -17,6 +19,9 @@ describe("lifecycle host stop scope", () => {
     expect(update).toHaveBeenCalledOnce();
     // A pause keeps the messages it deferred (work-intent outbox).
     expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", { preservePauseDeferred: true });
+    // Resuming continues only this agent's own stopped runs.
+    expect(saveContinuations).toHaveBeenCalledWith(db, expect.objectContaining({ companyId: "company", agentId: "target",
+      holds: ["manual"] }));
     expect(db.select).not.toHaveBeenCalled();
   });
 });

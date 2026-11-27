@@ -142,10 +142,17 @@ export async function savePauseWakeIntent(db: Db, input: PauseWakeIntentInput): 
  * budget resume (budget-resume-continuation.ts), never here.
  */
 export async function savePauseStopContinuations(db: Db, input: {
-  companyId: string; agentId: string; holds: readonly string[]; companyPauseReason: string | null;
+  companyId: string; agentId: string; holds: readonly string[];
+  /** The company pause reason the pause recorded; undefined reads the current one. */
+  companyPauseReason: string | null | undefined;
   runStatuses: readonly string[];
 }) {
-  if (input.holds.includes("budget") || (input.holds.includes("company_paused") && input.companyPauseReason === "budget")) return 0;
+  if (input.holds.includes("budget")) return 0;
+  if (input.holds.includes("company_paused")) {
+    const companyPauseReason = input.companyPauseReason !== undefined ? input.companyPauseReason
+      : (await db.select({ pauseReason: companies.pauseReason }).from(companies).where(eq(companies.id, input.companyId)))[0]?.pauseReason;
+    if (companyPauseReason === "budget") return 0;
+  }
   const runIssueId = sql<string | null>`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
     ${heartbeatRuns.contextSnapshot}->>'issueId')`;
   const stopped = await db.select({ runId: heartbeatRuns.id, issueId: runIssueId }).from(heartbeatRuns).where(and(
@@ -189,7 +196,7 @@ export type PauseWakeIntentDrainDeps = {
  * hold-release events never deliver it twice.
  */
 export async function resumePauseWakeIntents(deps: PauseWakeIntentDrainDeps, scope: {
-  companyId?: string; requestId?: string; cutoff?: Date | null;
+  companyId?: string; requestId?: string;
 } = {}) {
   const { db } = deps;
   const candidates = await db.select({ wake: agentWakeupRequests }).from(agentWakeupRequests)

@@ -81,12 +81,11 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
           // A manual pause interrupts the task; resuming continues it once.
           // Saved before the Stop, so a run that ends mid-sweep still has it.
-          const [company] = cause ? [] : await db.select({ pauseReason: companies.pauseReason }).from(companies)
-            .where(eq(companies.id, agent.companyId));
           await savePauseStopContinuations(db, {
             companyId: agent.companyId, agentId: agent.id,
             holds: cause?.holds ?? agent.lifecycleHolds ?? [],
-            companyPauseReason: cause ? cause.companyPauseReason ?? null : company?.pauseReason ?? null,
+            // undefined: read the company's current pause reason.
+            companyPauseReason: cause ? cause.companyPauseReason ?? null : undefined,
             runStatuses: CANCELLABLE_HEARTBEAT_RUN_STATUSES,
           });
         }
