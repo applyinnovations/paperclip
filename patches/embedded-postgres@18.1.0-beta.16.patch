@@ -1,7 +1,7 @@
 diff --git a/dist/index.js b/dist/index.js
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -23,7 +23,7 @@
+@@ -23,7 +23,7 @@ const { Client } = pg;
   * for a particular string, we need to force that string into the right locale.
   * @see https://github.com/leinelissen/embedded-postgres/issues/15
   */
@@ -10,7 +10,7 @@ diff --git a/dist/index.js b/dist/index.js
  // The default configuration options for the class
  const defaults = {
      databaseDir: path.join(process.cwd(), 'data', 'db'),
-@@ -133,7 +133,7 @@
+@@ -133,13 +133,16 @@ class EmbeddedPostgres {
                      `--pwfile=${passwordFile}`,
                      `--lc-messages=${LC_MESSAGES_LOCALE}`,
                      ...this.options.initdbFlags,
@@ -19,7 +19,16 @@ diff --git a/dist/index.js b/dist/index.js
                  // Connect to stderr, as that is where the messages get sent
                  (_a = process.stdout) === null || _a === void 0 ? void 0 : _a.on('data', (chunk) => {
                      // Parse the data as a string and log it
-@@ -177,7 +177,7 @@
+                     const message = chunk.toString('utf-8');
+                     this.options.onLog(message);
+                 });
++                // A spawn that fails (ENOENT when the binary or its dynamic
++                // loader is missing) emits 'error' and never 'exit'.
++                process.on('error', reject);
+                 process.on('exit', (code) => {
+                     if (code === 0) {
+                         resolve();
+@@ -177,7 +180,7 @@ class EmbeddedPostgres {
                      '-p',
                      this.options.port.toString(),
                      ...this.options.postgresFlags,
@@ -28,3 +37,13 @@ diff --git a/dist/index.js b/dist/index.js
                  // Connect to stderr, as that is where the messages get sent
                  (_a = this.process.stderr) === null || _a === void 0 ? void 0 : _a.on('data', (chunk) => {
                      // Parse the data as a string and log it
+@@ -188,6 +191,9 @@ class EmbeddedPostgres {
+                         resolve();
+                     }
+                 });
++                // A failed spawn emits 'error' (then 'close'); without a
++                // listener, 'error' is thrown as an uncaught exception.
++                this.process.on('error', reject);
+                 // In case the process exits early, the promise is rejected.
+                 this.process.on('close', () => {
+                     reject();
