@@ -1,5 +1,12 @@
 import type { AgentPublicIdentity } from "@paperclipai/shared";
 import type { AgentProjectAccess } from "@paperclipai/shared";
+import type { PrincipalPermissionGrant } from "@paperclipai/shared";
+
+export interface AgentGrants {
+  agentId: string;
+  companyId: string;
+  grants: PrincipalPermissionGrant[];
+}
 import type {
   Agent,
   EnvironmentProbeResult,
@@ -171,6 +178,10 @@ export const agentsApi = {
     api.patch<Agent & import("@paperclipai/shared").AgentConfigurationResponse>(agentPath(id, companyId), data),
   updatePermissions: (id: string, data: AgentPermissionUpdate, companyId?: string) =>
     api.patch<AgentDetail>(agentPath(id, companyId, "/permissions"), data),
+  grants: (id: string, companyId?: string) =>
+    api.get<AgentGrants>(agentPath(id, companyId, "/grants")),
+  replaceGrants: (id: string, data: import("@paperclipai/shared").UpdateMemberPermissions, companyId?: string) =>
+    api.put<AgentGrants>(agentPath(id, companyId, "/grants"), data),
   instructionsBundle: (id: string, companyId?: string) =>
     api.get<AgentInstructionsBundle>(agentPath(id, companyId, "/instructions-bundle")),
   updateInstructionsBundle: (
