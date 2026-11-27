@@ -34,7 +34,6 @@ import {
 } from "lucide-react";
 import type { ComposioAppSnapshot, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import {
-  getAppDefinitionForUrl,
   getAppDefinitionForApplicationKey,
   isMemoryConnectorId,
   getAppStoreDefinition,
@@ -167,6 +166,110 @@ const BUILT_IN_GOOGLE_CONNECTOR_SLUGS = new Set([...LEGACY_GOOGLE_CONNECTOR_SLUG
  * Returns the previous array while every item is identical (`Object.is`), so a memo keyed
  * on values derived from `useQueries` results survives renders that change nothing.
  */
+type CompiledEndpointRule = {
+  order: number;
+  slug: string;
+  regex: RegExp;
+};
+
+function wildcardPatternToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+function createGalleryEndpointSlugMatcher(
+  gallery: readonly AppGalleryDisplayEntry[],
+): (rawUrl: unknown) => string | null {
+  const byExactHost = new Map<string, CompiledEndpointRule[]>();
+  const byHostSuffix = new Map<string, CompiledEndpointRule[]>();
+  const fallbackRules: CompiledEndpointRule[] = [];
+
+  const pushRule = (
+    index: Map<string, CompiledEndpointRule[]>,
+    key: string,
+    rule: CompiledEndpointRule,
+  ) => {
+    const list = index.get(key);
+    if (list) list.push(rule);
+    else index.set(key, [rule]);
+  };
+
+  for (let order = 0; order < gallery.length; order += 1) {
+    const entry = gallery[order]!;
+    const slug = appDefinitionSlug(entry);
+    if (!slug) continue;
+    const urlPatterns = entry.urlPatterns ?? [];
+    for (const pattern of urlPatterns) {
+      const rule: CompiledEndpointRule = {
+        order,
+        slug,
+        regex: wildcardPatternToRegExp(pattern),
+      };
+      const hostMatch = /^https?:\/\/([^/]+)/i.exec(pattern.trim());
+      const patternHost = hostMatch?.[1]?.toLowerCase() ?? "";
+      if (patternHost && !patternHost.includes("*")) {
+        pushRule(byExactHost, patternHost, rule);
+      } else {
+        const wildcardSuffix = /^\*\.([^/*]+)$/.exec(patternHost)?.[1];
+        if (wildcardSuffix) {
+          pushRule(byHostSuffix, wildcardSuffix, rule);
+        } else {
+          fallbackRules.push(rule);
+        }
+      }
+    }
+  }
+
+  const cache = new Map<string, string | null>();
+  return (rawUrl: unknown): string | null => {
+    if (typeof rawUrl !== "string") return null;
+    const trimmed = rawUrl.trim();
+    if (!trimmed) return null;
+    const cached = cache.get(trimmed);
+    if (cached !== undefined) return cached;
+
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      if (cache.size >= 2000) cache.clear();
+      cache.set(trimmed, null);
+      return null;
+    }
+    const normalized = parsed.toString();
+    const host = parsed.host.toLowerCase();
+    let bestOrder = Number.POSITIVE_INFINITY;
+    let bestSlug: string | null = null;
+
+    const checkRules = (rules: CompiledEndpointRule[] | undefined) => {
+      if (!rules) return;
+      for (const rule of rules) {
+        if (rule.order >= bestOrder) break;
+        if (rule.regex.test(normalized)) {
+          bestOrder = rule.order;
+          bestSlug = rule.slug;
+          break;
+        }
+      }
+    };
+
+    checkRules(byExactHost.get(host));
+    let dotIndex = host.indexOf(".");
+    while (dotIndex !== -1) {
+      const suffix = host.slice(dotIndex + 1);
+      checkRules(byHostSuffix.get(suffix));
+      dotIndex = host.indexOf(".", dotIndex + 1);
+    }
+    checkRules(fallbackRules);
+
+    if (cache.size >= 2000) cache.clear();
+    cache.set(trimmed, bestSlug);
+    return bestSlug;
+  };
+}
+
 function useShallowStableItems<T>(items: T[]): T[] {
   const previous = useRef(items);
   const current = previous.current;
@@ -602,6 +705,10 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
       appSupportsToolCatalogSetup(definition)
     );
   }), [galleryQuery.data, memoryConnectorsEnabled, connectorEnabled, chatConnectorsEnabled, githubEnabled]);
+  const matchGalleryEndpointSlug = useMemo(
+    () => createGalleryEndpointSlugMatcher(gallery),
+    [gallery],
+  );
   const userProfileById = useMemo(
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
@@ -617,10 +724,9 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     );
     const connectionsByApplicationId = new Map<string, ToolConnection[]>();
     for (const connection of activeConnections) {
-      connectionsByApplicationId.set(connection.applicationId, [
-        ...(connectionsByApplicationId.get(connection.applicationId) ?? []),
-        connection,
-      ]);
+      const list = connectionsByApplicationId.get(connection.applicationId);
+      if (list) list.push(connection);
+      else connectionsByApplicationId.set(connection.applicationId, [connection]);
     }
     const excludedChannelApplicationIds = new Set(
       allApplications
@@ -736,38 +842,40 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         return false;
       });
       if (ungroupedCount > 0 && appConnections.length === 0) continue;
-      const configuredConnectionSlug = appConnections
-        .map(
-          (connection) =>
-            connection.config?.sourceTemplateKey ??
-            connection.transportConfig?.sourceTemplateKey,
-        )
-        .find(
-          (value): value is string =>
-            typeof value === "string" && gallerySlugs.has(value),
-        );
-      const endpointMatchedSlug = appConnections
-        .flatMap((connection) => [
-          connection.config?.url,
-          connection.transportConfig?.url,
-        ])
-        .map((value) =>
-          typeof value === "string"
-            ? appDefinitionSlug(getAppDefinitionForUrl(value, gallery)) || null
-            : null,
-        )
-        .find((value): value is string => Boolean(value));
-      const resolvedSlug =
+      let resolvedSlug: string | null =
         applicationSlug &&
         applicationSlug !== "link" &&
         gallerySlugs.has(applicationSlug)
           ? applicationSlug
-          : (configuredConnectionSlug ??
-            endpointMatchedSlug ??
-            gallerySlugByName.get(
-              application.name.trim().toLocaleLowerCase(),
-            ) ??
-            null);
+          : null;
+      if (!resolvedSlug) {
+        for (const connection of appConnections) {
+          const configured =
+            connection.config?.sourceTemplateKey ??
+            connection.transportConfig?.sourceTemplateKey;
+          if (typeof configured === "string" && gallerySlugs.has(configured)) {
+            resolvedSlug = configured;
+            break;
+          }
+        }
+      }
+      if (!resolvedSlug) {
+        for (const connection of appConnections) {
+          const matched =
+            matchGalleryEndpointSlug(connection.config?.url) ??
+            matchGalleryEndpointSlug(connection.transportConfig?.url);
+          if (matched) {
+            resolvedSlug = matched;
+            break;
+          }
+        }
+      }
+      if (!resolvedSlug) {
+        resolvedSlug =
+          gallerySlugByName.get(
+            application.name.trim().toLocaleLowerCase(),
+          ) ?? null;
+      }
       const galleryRow = resolvedSlug ? rowsBySlug.get(resolvedSlug) : null;
       if (galleryRow) {
         galleryRow.applications.push(application);
@@ -797,35 +905,31 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     for (const connection of activeConnections) {
       if (knownApplicationIds.has(connection.applicationId)) continue;
       const sourceSlug = appConnectionSourceSlug(connection);
-      const configuredSlug =
-        connection.config?.sourceTemplateKey ??
-        connection.transportConfig?.sourceTemplateKey;
-      const endpointMatchedSlug = [
-        connection.config?.url,
-        connection.transportConfig?.url,
-      ]
-        .map((value) =>
-          typeof value === "string"
-            ? appDefinitionSlug(getAppDefinitionForUrl(value, gallery)) || null
-            : null,
-        )
-        .find((value): value is string => Boolean(value));
-      const resolvedSlug =
-        (sourceSlug && rowsBySlug.has(sourceSlug) ? sourceSlug : null) ??
-        (typeof configuredSlug === "string" && gallerySlugs.has(configuredSlug)
-          ? configuredSlug
-          : null) ??
-        endpointMatchedSlug ??
-        null;
+      let resolvedSlug: string | null =
+        sourceSlug && rowsBySlug.has(sourceSlug) ? sourceSlug : null;
+      if (!resolvedSlug) {
+        const configuredSlug =
+          connection.config?.sourceTemplateKey ??
+          connection.transportConfig?.sourceTemplateKey;
+        if (typeof configuredSlug === "string" && gallerySlugs.has(configuredSlug)) {
+          resolvedSlug = configuredSlug;
+        }
+      }
+      if (!resolvedSlug) {
+        resolvedSlug =
+          matchGalleryEndpointSlug(connection.config?.url) ??
+          matchGalleryEndpointSlug(connection.transportConfig?.url);
+      }
       const galleryRow = resolvedSlug ? rowsBySlug.get(resolvedSlug) : null;
       if (galleryRow) {
         galleryRow.connections.push(connection);
         continue;
       }
-      orphanedConnectionsByApplicationId.set(connection.applicationId, [
-        ...(orphanedConnectionsByApplicationId.get(connection.applicationId) ?? []),
-        connection,
-      ]);
+      const orphanGroup = orphanedConnectionsByApplicationId.get(
+        connection.applicationId,
+      );
+      if (orphanGroup) orphanGroup.push(connection);
+      else orphanedConnectionsByApplicationId.set(connection.applicationId, [connection]);
     }
     for (const [applicationId, orphanConnections] of orphanedConnectionsByApplicationId) {
       const first = orphanConnections[0]!;
@@ -968,6 +1072,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     connectionsQuery.data,
     gallery,
     galleryQuery.data,
+    matchGalleryEndpointSlug,
     googleWorkspaceConnectorEnabled,
     cloudManaged,
     managedCatalog,

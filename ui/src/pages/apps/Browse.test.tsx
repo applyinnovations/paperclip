@@ -2165,4 +2165,131 @@ describe("Connectors landing page", () => {
     await act(() => void addAccountButton!.click());
     expect(navigateMock).toHaveBeenLastCalledWith("/apps/connect?source=anthropic");
   });
+
+  it("bounds endpoint matching and grouping work for hundreds of orphan connections against the shipped gallery", async () => {
+    const { CONNECTABLE_APP_DEFINITIONS: shippedGallery } = await vi.importActual<
+      typeof import("@paperclipai/shared")
+    >("@paperclipai/shared");
+
+    let urlPatternReads = 0;
+    const urlPatternBudget = shippedGallery.length * 4;
+    const instrumentedGallery = shippedGallery.map((entry) => {
+      const patterns = entry.urlPatterns ?? [];
+      const wrapped = { ...entry };
+      Object.defineProperty(wrapped, "urlPatterns", {
+        enumerable: true,
+        get() {
+          urlPatternReads += 1;
+          if (urlPatternReads > urlPatternBudget) {
+            throw new Error(
+              `Gallery urlPatterns read budget exceeded (${urlPatternReads} > ${urlPatternBudget})`,
+            );
+          }
+          return patterns;
+        },
+      });
+      return wrapped;
+    });
+
+    const knownSlugOrphans = Array.from({ length: 150 }, (_, index) => {
+      const config: Record<string, unknown> = {
+        sourceTemplateKey: "anthropic",
+        ai: { provider: "anthropic", method: "api_key" },
+      };
+      Object.defineProperty(config, "url", {
+        enumerable: true,
+        get() {
+          throw new Error("Known-slug orphan must not read config.url for endpoint fallback");
+        },
+      });
+      return connection({
+        id: `orphan-known-${index}`,
+        applicationId: `missing-known-app-${index}`,
+        connectionPurpose: "ai",
+        transport: "runtime_auth",
+        authKind: "api_key",
+        name: `Known slug orphan ${index}`,
+        config,
+      });
+    });
+
+    const urlMatchedOrphans = [
+      ...Array.from({ length: 50 }, (_, index) =>
+        connection({
+          id: `orphan-exact-url-${index}`,
+          applicationId: `missing-exact-url-app-${index}`,
+          connectionPurpose: "tool",
+          name: `Exact URL orphan ${index}`,
+          config: { url: `https://api.anthropic.com/v1/account-${index}` },
+        }),
+      ),
+      ...Array.from({ length: 50 }, (_, index) =>
+        connection({
+          id: `orphan-wildcard-url-${index}`,
+          applicationId: `missing-wildcard-url-app-${index}`,
+          connectionPurpose: "tool",
+          name: `Wildcard URL orphan ${index}`,
+          config: { url: `https://tenant-${index}.make.com/mcp` },
+        }),
+      ),
+    ];
+
+    const repeatedParentCount = 250;
+    let repeatedParentIdReads = 0;
+    const repeatedParentReadBudget = repeatedParentCount * 20;
+    const repeatedParentOrphans = Array.from({ length: repeatedParentCount }, (_, index) => {
+      const item = connection({
+        id: `orphan-custom-${index}`,
+        applicationId: "missing-shared-custom-app",
+        connectionPurpose: "tool",
+        name: `Custom orphan ${index}`,
+        config: { url: `https://unmatched-${index}.internal.example/mcp` },
+      });
+      Object.defineProperty(item, "id", {
+        enumerable: true,
+        get() {
+          repeatedParentIdReads += 1;
+          if (repeatedParentIdReads > repeatedParentReadBudget) {
+            throw new Error(
+              `Orphan grouping/render work exceeded linear budget (${repeatedParentIdReads} > ${repeatedParentReadBudget})`,
+            );
+          }
+          return `orphan-custom-${index}`;
+        },
+      });
+      return item;
+    });
+
+    listGalleryMock.mockResolvedValue({ apps: instrumentedGallery });
+    listApplicationsMock.mockResolvedValue({ applications: [] });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        ...knownSlugOrphans,
+        ...urlMatchedOrphans,
+        ...repeatedParentOrphans,
+      ],
+    });
+    listAiConnectionsMock.mockResolvedValue({
+      currentUserId: "board-user",
+      canManageConnections: true,
+      connections: [],
+    });
+
+    await renderBrowse();
+
+    expect(urlPatternReads).toBeLessThanOrEqual(shippedGallery.length);
+    expect(repeatedParentIdReads).toBeLessThanOrEqual(repeatedParentReadBudget);
+
+    const anthropicRow = container.querySelector('[data-app-slug="anthropic"]');
+    expect(anthropicRow?.getAttribute("data-connected")).toBe("true");
+    expect(anthropicRow?.textContent).toContain("200 connections");
+
+    const makeRow = container.querySelector('[data-app-slug="make"]');
+    expect(makeRow?.getAttribute("data-connected")).toBe("true");
+    expect(makeRow?.textContent).toContain("50 connections");
+
+    const customRow = container.querySelector('[data-app-slug="missing-shared-custom-app"]');
+    expect(customRow?.getAttribute("data-connected")).toBe("true");
+    expect(customRow?.textContent).toContain(`${repeatedParentCount} connections`);
+  });
 });
