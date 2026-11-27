@@ -44,9 +44,12 @@ still "Not yet offered" when the change merges is a follow-up to offer it.
    branch.
 2. Open a PR into `xlab`. `.tekton/pull-request.yaml` runs `.xlab/ci.sh`
    (frozen install, typecheck, build, and the test files the PR adds or
-   changes). The full suite takes about 2 hours on one pod, so
-   `.tekton/full-tests.yaml` runs it weekly (Sundays, UTC) on `xlab`; check
-   its latest run before shipping. Run the
+   changes). The full suite takes hours on one pod, so
+   `.tekton/full-tests.yaml` runs it nightly on `xlab`, as upstream's CI
+   shards packed into the parallel lanes of
+   [full-test-lanes.txt](full-test-lanes.txt) (one pod each; run one with
+   `CI_TEST_SCOPE=lane CI_TEST_LANE=<n>`); check its latest run before
+   shipping. Run the
    PR checks locally with
    `CI_TEST_SCOPE=changed CI_BASE_REF=origin/xlab nix develop ./.xlab --command .xlab/ci.sh`.
    In Tekton, `ci.sh` first makes the nixos/nix image look like upstream's
@@ -148,7 +151,7 @@ Upstream runs its full test suite on its own runners and verifies a
 release's exact source before publishing it, so the intake trusts those
 results (its checks on the release commit) rather than re-running them.
 The intake PR's own check runs only the test files that differ from the
-release (our patches and the merge resolution; `.xlab/ci.sh`). The weekly
+release (our patches and the merge resolution; `.xlab/ci.sh`). The nightly
 `test-full` run catches what our patches and our CI environment change
 elsewhere.
 
