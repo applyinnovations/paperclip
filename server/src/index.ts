@@ -1456,7 +1456,7 @@ async function startServerWithDatabaseTeardown(
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement, onSettled: () => invalidateNativeReplacementDiscovery(db), settleEmptyWhilePaused: true },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
-        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
         await deliverPendingPauseResumes(db, heartbeat.wakeup);
         await deliverBudgetResumeContinuations(db, { ...budgetResumeDelivery,
           resumeTaskRetry: (companyId, requestId) => heartbeat.resumeTaskRetry(companyId, requestId) });

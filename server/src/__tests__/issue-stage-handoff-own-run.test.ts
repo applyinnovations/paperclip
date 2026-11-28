@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -326,6 +326,114 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     expect(await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.agentId, s.executorAgentId), eq(heartbeatRuns.companyId, s.companyId),
     ))).toHaveLength(1);
+  });
+
+  // The executor's run was stopped after the handoff and left a hold. The
+  // handoff's stage wake for the reviewer is saved behind that hold.
+  async function holdStageWakeBehindReconciliation(prefix: string) {
+    const s = await seed(prefix);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), errorCode: "issue_reassigned" })
+      .where(eq(heartbeatRuns.id, s.executorRunId));
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: s.reviewerAgentId,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      checkoutRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: s.stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: s.reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: s.executorAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, s.issueId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId: s.companyId,
+      sourceIssueId: s.issueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: s.executorAgentId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${s.executorRunId}`,
+      status: "active",
+      nextAction: "Reconcile the stopped run",
+      evidence: { runId: s.executorRunId },
+    }).returning();
+    const heartbeat = heartbeatService(db);
+    const deferred = await heartbeat.wakeup(s.reviewerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: { issueId: s.issueId, mutation: "update" },
+      requestedByActorType: "agent",
+      requestedByActorId: s.executorAgentId,
+      contextSnapshot: { issueId: s.issueId, taskId: s.issueId, wakeReason: "execution_review_requested", source: "issue.execution_stage" },
+    });
+    expect(deferred).toBeNull();
+    const saved = await reviewerWakes(s);
+    expect(saved.map(wake => wake.status)).toEqual(["deferred_issue_execution"]);
+    // The operator reconciles the stopped run.
+    await db.update(issueRecoveryActions).set({
+      status: "resolved",
+      resolvedAt: new Date(),
+      evidence: {
+        runId: s.executorRunId,
+        executionReconciliation: { runId: s.executorRunId, outcome: "verified" },
+        continuationDelivery: "pending",
+      },
+    }).where(eq(issueRecoveryActions.id, hold!.id));
+    return { s, heartbeat, holdId: hold!.id, savedWakeId: saved[0]!.id };
+  }
+
+  const holdEvidence = async (holdId: string) =>
+    (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, holdId)))[0]!.evidence;
+
+  it("delivers the saved stage wake itself when the hold is reconciled, so the reviewer runs once", async () => {
+    const { s, heartbeat, holdId, savedWakeId } = await holdStageWakeBehindReconciliation("SHD");
+
+    await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
+
+    const [run] = await reviewerRuns(s);
+    expect(run).toBeDefined();
+    expect(run!.wakeupRequestId).toBe(savedWakeId);
+    expect(await holdEvidence(holdId)).toMatchObject({ continuationDelivery: "delivered", continuationRunId: run!.id });
+    // The reviewer's run releases without a decision; nothing is left to promote.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    await heartbeat.releaseIssueExecutionAndPromote(run!, { suppressImmediateRecovery: true, resumeStrandedQueue: true });
+    await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
+    const wakes = await reviewerWakes(s);
+    expect(wakes.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+    expect(wakes.filter(wake => wake.reason === "execution_review_requested")).toHaveLength(1);
+    expect((await reviewerRuns(s)).filter(r => !r.retryOfRunId)).toHaveLength(1);
+  });
+
+  it("adopts the admitted stage run on retry after a failure before delivery was recorded", async () => {
+    const { s, heartbeat, holdId, savedWakeId } = await holdStageWakeBehindReconciliation("SHF");
+    const crashAfterAdmission: typeof heartbeat.releaseIssueExecutionAndPromote = async (...args) => {
+      await heartbeat.releaseIssueExecutionAndPromote(...args);
+      throw new Error("process exited after admission");
+    };
+
+    await deliverReconciledExecutions(db, heartbeat.wakeup, crashAfterAdmission);
+    const [run] = await reviewerRuns(s);
+    expect(run!.wakeupRequestId).toBe(savedWakeId);
+    expect(await holdEvidence(holdId)).toMatchObject({ continuationDelivery: "pending" });
+
+    // The admitted run finishes before the retry.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, run!.id), sql`${heartbeatRuns.finishedAt} is null`));
+
+    await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
+    expect(await holdEvidence(holdId)).toMatchObject({ continuationDelivery: "delivered", continuationRunId: run!.id });
+    expect((await reviewerWakes(s)).filter(wake => wake.reason === "execution_review_requested")).toHaveLength(1);
+    expect((await reviewerRuns(s)).filter(r => !r.retryOfRunId)).toHaveLength(1);
   });
 
   it("still cancels an agent's active run when the board reassigns the issue away", async () => {
