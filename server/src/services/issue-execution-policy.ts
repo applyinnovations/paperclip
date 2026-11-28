@@ -1047,6 +1047,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   }
 
   if (activeStage) {
+    // While a stage is active the issue is held by a stage participant, so
+    // the current assignee and the actor are reviewers/approvers, never the
+    // executor. Every re-pend or stage advance in this block therefore keeps
+    // the stored returnAssignee as-is — including null, for issues created
+    // directly in review — instead of falling back to `currentAssignee` or
+    // `actor`, which would record a reviewer as the executor and hand the
+    // issue back to (and wake) them on final approval.
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
@@ -1116,7 +1123,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         policy: input.policy,
         stage: activeStage,
         participant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: existingState?.returnAssignee ?? null,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -1156,6 +1163,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             if (requestedStatus === undefined) {
               patch.status = "done";
             }
+            if (!existingState.returnAssignee) {
+              // No executor to hand back to: don't leave the closed issue
+              // assigned to the final reviewer.
+              Object.assign(patch, patchForPrincipal(null));
+              return { patch, decision, workflowControlledAssignment: true };
+            }
             return { patch, decision };
           }
           // The executor only asked for review; delivery (merge, release,
@@ -1182,7 +1195,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           policy: input.policy,
           stage: nextStage,
           participant,
-          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: existingState?.returnAssignee ?? null,
           reviewRequest: input.reviewRequest ?? null,
         });
         return {
@@ -1309,7 +1322,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           policy: input.policy,
           stage: activeStage,
           participant: explicitAssignee,
-          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: existingState?.returnAssignee ?? null,
           reviewRequest: effectiveReviewRequest,
         });
         return { patch };
@@ -1335,7 +1348,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         policy: input.policy,
         stage: activeStage,
         participant: currentParticipant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: existingState?.returnAssignee ?? null,
         reviewRequest: effectiveReviewRequest,
       });
       return {

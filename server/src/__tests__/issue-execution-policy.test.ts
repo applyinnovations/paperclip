@@ -1838,6 +1838,150 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("multi-stage review with no return assignee", () => {
+    // A two-stage review created directly in review (no executor). The stage
+    // participants must never be recorded as the return assignee.
+    function directTwoStageIssue(stateOverrides: Partial<IssueExecutionState> = {}, issueOverrides: Record<string, unknown> = {}) {
+      const policy = twoStagePolicy();
+      const [reviewStage, approvalStage] = policy.stages;
+      return {
+        policy,
+        reviewStageId: reviewStage.id,
+        approvalStageId: approvalStage.id,
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStage.id,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            ...stateOverrides,
+          },
+          ...issueOverrides,
+        },
+      };
+    }
+
+    function approveBothStages(stateOverrides: Partial<IssueExecutionState> = {}) {
+      const { policy, reviewStageId, approvalStageId, issue } = directTwoStageIssue(stateOverrides);
+      const stage1 = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        decision: "approve",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Review looks good",
+      });
+      const afterStage1 = { ...issue, ...stage1.patch } as typeof issue;
+      const stage2 = applyIssueExecutionPolicyTransition({
+        issue: afterStage1,
+        policy,
+        decision: "approve",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId },
+        commentBody: "Approved",
+      });
+      return { reviewStageId, approvalStageId, stage1, stage2 };
+    }
+
+    it("keeps returnAssignee null when Stage 1 approval advances to Stage 2", () => {
+      const { reviewStageId, approvalStageId, stage1 } = approveBothStages();
+
+      expect(stage1.patch).toMatchObject({ status: "in_review", assigneeAgentId: null, assigneeUserId: ctoUserId });
+      expect(stage1.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentParticipant: { type: "user", userId: ctoUserId },
+        returnAssignee: null,
+        completedStageIds: [reviewStageId],
+      });
+    });
+
+    it("hands the issue to unassigned todo on final approval instead of the Stage 1 reviewer", () => {
+      const { reviewStageId, approvalStageId, stage2 } = approveBothStages();
+
+      expect(stage2.decision).toMatchObject({ stageId: approvalStageId, outcome: "approved" });
+      expect(stage2.patch).toMatchObject({ status: "todo", assigneeAgentId: null, assigneeUserId: null });
+      expect(stage2.patch.executionState).toMatchObject({
+        status: "completed",
+        returnAssignee: null,
+        completedStageIds: [reviewStageId, approvalStageId],
+      });
+    });
+
+    it("closes the issue unassigned on final approval when completion was requested", () => {
+      const { stage2 } = approveBothStages({ completionRequested: true });
+
+      expect(stage2.patch).toMatchObject({ status: "done", assigneeAgentId: null, assigneeUserId: null });
+      expect(stage2.patch.executionState).toMatchObject({ status: "completed", returnAssignee: null });
+      expect(stage2.workflowControlledAssignment).toBe(true);
+    });
+
+    it("keeps returnAssignee null when a drifted assignee is re-pended onto the stage", () => {
+      const { policy, issue } = directTwoStageIssue({}, { assigneeAgentId: coderAgentId });
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+      expect(result.patch.executionState).toMatchObject({ status: "pending", returnAssignee: null });
+    });
+
+    it("keeps returnAssignee null when a stored non-participant is replaced", () => {
+      const { policy, issue } = directTwoStageIssue({ currentParticipant: { type: "agent", agentId: ctoAgentId } });
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      });
+
+      expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+      expect(result.patch.executionState).toMatchObject({
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: null,
+      });
+    });
+
+    it("keeps returnAssignee null on a board reassignment to a stage participant", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }, { type: "agent", agentId: ctoAgentId }] },
+      ]);
+      const { issue } = directTwoStageIssue({ currentStageId: policy.stages[0].id }, { executionPolicy: policy });
+      const result = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        requestedAssigneePatch: { assigneeAgentId: ctoAgentId, assigneeUserId: null },
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentParticipant: { type: "agent", agentId: ctoAgentId },
+        returnAssignee: null,
+      });
+    });
+
+    it("still preserves a real return assignee through a stage advance", () => {
+      const { stage1, stage2 } = approveBothStages({ returnAssignee: { type: "agent", agentId: coderAgentId } });
+
+      expect(stage1.patch.executionState).toMatchObject({ returnAssignee: { type: "agent", agentId: coderAgentId } });
+      expect(stage2.patch).toMatchObject({ status: "in_progress", assigneeAgentId: coderAgentId });
+    });
+  });
+
   describe("approval stage changes requested → bounces back to executor", () => {
     it("approver requests changes during approval stage", () => {
       const policy = twoStagePolicy();
