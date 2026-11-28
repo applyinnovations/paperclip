@@ -152,7 +152,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `issue.created`, `issue.updated`, `issue.comment.created` | issue |
 | `issue.document.created`, `issue.document.updated`, `issue.document.deleted` | issue |
 | `issue.relations.updated`, `issue.checked_out`, `issue.released`, `issue.assignment_wakeup_requested` | issue |
-| `issue.execution_decision.recorded` | issue |
+| `issue.execution_decision.recorded`, `issue.execution_decision.amended` | issue |
 | `agent.created`, `agent.updated`, `agent.status_changed` | agent |
 | `agent.run.started`, `agent.run.finished`, `agent.run.failed`, `agent.run.cancelled` | run |
 | `goal.created`, `goal.updated` | goal |
@@ -700,14 +700,18 @@ board user's comment does in the web app.
 
 When a participant approves an issue's execution-policy review or approval stage, or requests changes, the host emits `issue.execution_decision.recorded` with a `PluginIssueExecutionDecisionRecordedPayload`: `issueId`, `issueIdentifier`, `decisionId`, `stageId`, `stageType` (`"review" | "approval"`), `outcome` (`"approved" | "changes_requested"`), `actorAgentId`, `actorUserId`, `reviewedSha` and `createdAt`. `ctx.issues.listExecutionDecisions(issueId, companyId)` returns every decision on the issue, oldest first, as `PluginIssueExecutionDecision` (the same fields plus `body`).
 
-`reviewedSha` is the commit the reviewer names in the decision body with a `Reviewed-SHA: <40 lowercase hex>` line (case-insensitive key; the last such line governs; `null` when absent or invalid). Use `parseReviewedSha` from `@paperclipai/shared` to apply the same rule elsewhere.
+`reviewedSha` is the commit the reviewer names in the decision body with a `Reviewed-SHA: <40 lowercase hex>` line (case-insensitive key; the last such line governs; `null` when absent or invalid). Use `parseReviewedSha` from `@paperclipai/shared` to apply the same rule elsewhere. In that case `reviewedShaSource` is `"body"`.
+
+If an approval was recorded without a valid line, its own actor can attest the SHA later (`POST /api/issues/:issueId/execution-decisions/:decisionId/reviewed-sha`, once, never replacing an existing SHA). The host then emits `issue.execution_decision.amended` with a `PluginIssueExecutionDecisionAmendedPayload`: the same fields, now with `reviewedShaSource: "attestation"` and `reviewedShaAttestedAt`, plus `amendment: "reviewed_sha_attested"` and `attestationComment`. The decision's body and `createdAt` are unchanged, and `recorded` is not sent again. `listExecutionDecisions` reports the effective SHA the same way.
 
 ```ts
-ctx.events.on("issue.execution_decision.recorded", async (event) => {
+const onDecision = async (event: PluginEvent) => {
   const decision = event.payload as PluginIssueExecutionDecisionRecordedPayload;
   if (decision.stageType !== "review" || decision.outcome !== "approved" || !decision.reviewedSha) return;
   await approveCommit(decision.issueId, decision.reviewedSha);
-});
+};
+ctx.events.on("issue.execution_decision.recorded", onDecision);
+ctx.events.on("issue.execution_decision.amended", onDecision);
 ```
 
 Required capabilities:

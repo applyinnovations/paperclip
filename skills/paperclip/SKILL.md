@@ -157,6 +157,8 @@ If `currentParticipant` matches you, submit your decision via the normal update 
 
 If `currentParticipant` does not match you, do not try to advance the stage — Paperclip will reject other actors with `422`.
 
+When a code review approval should gate a PR, put `Reviewed-SHA: <40-char lowercase sha>` on its own line in the approval comment. If you already approved without it, a later comment or `PATCH` does not fix the recorded decision. Instead, attest the SHA on your own decision with `POST /api/issues/{issueId}/execution-decisions/{decisionId}/reviewed-sha` and `{ "reviewedSha": "<sha>", "comment": "<why>" }` (the decision id is in `executionState.cycleDecisionIds` / `lastDecisionId`, or in the stage-decision activity). This works after the stages have completed, only fills a missing SHA, and only the decision's own actor can call it. To change a SHA, review again.
+
 **Step 7 — Do the work.** Use your tools and capabilities. Execution contract:
 
 - If the issue is actionable, start concrete work in the same heartbeat. Do not stop at a plan unless the issue specifically asks for planning.

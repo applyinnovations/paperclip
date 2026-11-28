@@ -1121,6 +1121,7 @@ Minimum event set:
 - `issue.released`
 - `issue.assignment_wakeup_requested`
 - `issue.execution_decision.recorded`
+- `issue.execution_decision.amended`
 - `agent.created`
 - `agent.updated`
 - `agent.status_changed`
@@ -1190,11 +1191,17 @@ The host emits `issue.execution_decision.recorded` after it commits a decision o
 | `actorAgentId` | `string \| null` | Deciding agent, if an agent decided |
 | `actorUserId` | `string \| null` | Deciding user, if a user decided |
 | `reviewedSha` | `string \| null` | Commit the decision names as reviewed (below) |
+| `reviewedShaSource` | `"body" \| "attestation" \| null` | Where `reviewedSha` came from (below) |
+| `reviewedShaAttestedAt` | `string \| null` | ISO 8601 time of the attestation, when `reviewedShaSource` is `"attestation"` |
 | `createdAt` | `string` | ISO 8601 time the decision was recorded |
 
 The payload also carries the standard activity fields `agentId`, `runId` and `responsibleUserId`. It does not carry the decision body; read it with `ctx.issues.listExecutionDecisions`, which returns the same fields plus `body`.
 
-`reviewedSha` is read from the decision body. A reviewer names the commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. When the body has several such lines the last one governs; if it is not a valid SHA, `reviewedSha` is `null`. The parser is `parseReviewedSha` in `@paperclipai/shared`.
+`reviewedSha` is read from the decision body. A reviewer names the commit they reviewed with a line `Reviewed-SHA: <sha>`: the key is case-insensitive, whitespace around the line and value is ignored, and the value must be a full 40-character lowercase hexadecimal commit id. When the body has several such lines the last one governs; if it is not a valid SHA, `reviewedSha` is `null`. The parser is `parseReviewedSha` in `@paperclipai/shared`. In that case `reviewedShaSource` is `"body"`.
+
+When the body names no valid SHA, the decision's own actor can attest one afterwards with `POST /api/issues/:issueId/execution-decisions/:decisionId/reviewed-sha` and body `{ reviewedSha, comment }`. Only the agent or user who recorded the decision may call it (403 `not_decision_actor` for anyone else, with no board override), only on an `approved` decision (422 `decision_not_approved`), and only once, while the decision has no valid SHA (409 `reviewed_sha_already_present`). The attestation works after the stages have completed. It does not change the decision's body, `createdAt` or stage state, and it does not re-emit `recorded`. The host stores who attested, when, the run and the comment, writes an `issue.execution_decision_amended` activity, and emits `issue.execution_decision.amended`. From then on `reviewedSha` is the attested SHA, `reviewedShaSource` is `"attestation"`, and `reviewedShaAttestedAt` is set. A body SHA always takes precedence, and an attestation is never accepted while one exists.
+
+`issue.execution_decision.amended` carries the same decision fields as `recorded`, after the amendment, plus `amendment` (`"reviewed_sha_attested"`) and `attestationComment`. A gate that checks the reviewed SHA against a PR head should handle both events. An attestation is made later than the decision, so if a gate's rule is "the PR head did not move after the approval", it should apply that rule against `reviewedShaAttestedAt` too.
 
 A review stage can require the line. Set `requireReviewedSha: true` on the stage in `executionPolicy.stages[]` (issue or project default policy):
 

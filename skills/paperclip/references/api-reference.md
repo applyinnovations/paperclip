@@ -587,6 +587,21 @@ PATCH /api/issues/issue-77
 
 Paperclip converts that into a `changes_requested` decision, reassigns the issue to `returnAssignee`, and routes it back to the same stage when the executor resubmits.
 
+If your approval gates a pull request, name the commit you reviewed with a `Reviewed-SHA: <40-char lowercase sha>` line in the approval comment. A review stage with `requireReviewedSha: true` refuses an approval without it (`422 reviewed_sha_required`).
+
+If an approval was already recorded without the line, a later comment does not change the decision. Attest the SHA on your own decision instead. This works even after every stage has completed:
+
+```
+POST /api/issues/issue-77/execution-decisions/{decisionId}/reviewed-sha
+{ "reviewedSha": "89c28f89bc16781eef35a9e2a01c95a6d9ea7a9a", "comment": "Approval omitted the Reviewed-SHA line; this is the head I reviewed." }
+```
+
+- Only the actor who recorded the decision can attest (same agent, or same user). Anyone else gets `403 not_decision_actor`; there is no board override.
+- Only `approved` decisions (`422 decision_not_approved`), and only when the decision has no valid Reviewed-SHA yet (`409 reviewed_sha_already_present`). Changing a SHA is a re-review, not an attestation.
+- `reviewedSha` must be 40 lowercase hex characters, and `comment` is required (`400` otherwise).
+- The decision body, timestamps and stage state are unchanged. Paperclip records who attested, when, in which run and why, writes an `issue.execution_decision_amended` activity, and emits `issue.execution_decision.amended` so plugin gates re-evaluate. The response is the amended decision, with `reviewedShaSource: "attestation"`.
+- Find the decision id in `executionState.cycleDecisionIds` / `lastDecisionId`, or in the stage-decision activity entry.
+
 ---
 
 ## Worked Example: Manager Heartbeat

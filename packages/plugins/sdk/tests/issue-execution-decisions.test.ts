@@ -32,7 +32,9 @@ function issue(id: string, companyId: string): Issue {
 
 function decision(
   input: Partial<PluginIssueExecutionDecision> & Pick<PluginIssueExecutionDecision, "decisionId" | "createdAt" | "body">,
-): Omit<PluginIssueExecutionDecision, "reviewedSha"> & { reviewedSha?: string | null } {
+): Omit<PluginIssueExecutionDecision, "reviewedSha" | "reviewedShaSource" | "reviewedShaAttestedAt"> & {
+  reviewedSha?: string | null;
+} {
   const { reviewedSha: _omitted, ...rest } = {
     issueId: "issue-1",
     issueIdentifier: "ISSUE-1",
@@ -63,9 +65,9 @@ describe("ctx.issues.listExecutionDecisions in the test harness", () => {
     });
 
     const decisions = await harness.ctx.issues.listExecutionDecisions("issue-1", "company-1");
-    expect(decisions.map((row) => [row.decisionId, row.outcome, row.reviewedSha])).toEqual([
-      ["d1", "changes_requested", null],
-      ["d2", "approved", SHA],
+    expect(decisions.map((row) => [row.decisionId, row.outcome, row.reviewedSha, row.reviewedShaSource])).toEqual([
+      ["d1", "changes_requested", null, null],
+      ["d2", "approved", SHA, "body"],
     ]);
   });
 
@@ -79,6 +81,8 @@ describe("ctx.issues.listExecutionDecisions in the test harness", () => {
     });
     const [row] = await harness.ctx.issues.listExecutionDecisions("issue-1", "company-1");
     expect(row?.reviewedSha).toBe(SHA);
+    // A seeded SHA the body does not name reads as an attestation.
+    expect(row?.reviewedShaSource).toBe("attestation");
   });
 
   it("returns nothing for another company's issue", async () => {

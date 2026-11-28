@@ -77,8 +77,18 @@ interface IssueExecutionDecision {
   body: string;              // required comment explaining the decision
   createdByRunId: string | null;
   createdAt: Date;
+  // Reviewed-SHA attestation, set at most once by the decision's own actor
+  // when `body` has no valid `Reviewed-SHA:` line. `body` is never rewritten.
+  reviewedShaAttested: string | null;
+  reviewedShaAttestedAt: Date | null;
+  reviewedShaAttestedByAgentId: string | null;
+  reviewedShaAttestedByUserId: string | null;
+  reviewedShaAttestedByRunId: string | null;
+  reviewedShaAttestationComment: string | null;
 }
 ```
+
+See `POST /api/issues/:issueId/execution-decisions/:decisionId/reviewed-sha` in `doc/plugins/PLUGIN_SPEC.md` §16.3.
 
 ## Workflow
 
