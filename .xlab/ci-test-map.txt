@@ -1,0 +1,20 @@
+# Extra test files for pull request checks, read by .xlab/ci_test_map.py
+# from .xlab/ci.sh (CI_TEST_SCOPE=changed).
+#
+# Pull requests run the test files they add or change. A few source files
+# decide behaviour that suites far from them depend on, and import-graph
+# selection is no help there: `vitest --related server/src/services/authorization.ts`
+# picks 1,222 of the 1,855 server test files (about 3.9 h). When a pull request
+# changes a source on the left of a rule, the test files on the right run too
+# (APP-818: PR #136 changed authorization.ts and broke muse-control.test.ts,
+# which nothing selected).
+#
+# Rule: `source... -> test...`, paths and git-style globs relative to the
+# repository root (`*` stays within a directory, `**/` spans any number of
+# them). A rule whose source is not in the tree, or whose glob matches no test
+# file, fails the check, so the map cannot quietly go stale after a rename.
+# Keep a rule to the suites that exercise the decision and mind the cost:
+# the rule below adds 37 files, about 4 minutes (upstream timings).
+
+# Authorization decisions and the grants they read.
+server/src/services/authorization.ts server/src/services/access.ts -> server/src/**/*authoriz*.test.ts server/src/**/*authz*.test.ts server/src/**/*permission*.test.ts server/src/**/*access-grant*.test.ts server/src/**/*assign*-routes.test.ts server/src/__tests__/heartbeat-refused-assignment-wake.test.ts server/src/__tests__/muse-control.test.ts

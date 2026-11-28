@@ -119,6 +119,12 @@ if [ "${CI_TEST_SCOPE:-full}" = changed ]; then
   # blob the partial clone lacks.
   mapfile -t tests < <(git diff --name-only --no-renames --diff-filter=AM "$diff_base" HEAD \
     | grep -E '\.test\.(ts|tsx|mts|js|mjs)$' || true)
+  # A few sources decide behaviour that distant suites depend on; changing
+  # one also runs the tests .xlab/ci-test-map.txt lists for it. A stale map
+  # fails here rather than selecting fewer tests.
+  # (An assignment, not a process substitution: set -e sees its exit status.)
+  mapped=$(python3 .xlab/ci_test_map.py "$diff_base")
+  mapfile -t tests < <(printf '%s\n' "${tests[@]}" "$mapped" | grep -v '^$' | sort -u || true)
   # Packages excluded from the pnpm workspace (sandbox providers) install
   # standalone without a lockfile, as upstream builds them, and run their own
   # vitest config; the root vitest projects do not include them.
