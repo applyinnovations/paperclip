@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueRelations, issues, type Db,
+  activityLog, agents, agentWakeupRequests, authUsers, companies, createDb, heartbeatRuns, issueRelations, issues, type Db,
 } from "@paperclipai/db";
 import { ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON } from "@paperclipai/shared";
 import { attentionService } from "../services/attention.js";
@@ -153,6 +153,7 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
     deps.getAgent.mockImplementation(async (id: string) =>
       (await owner.select().from(agents).where(eq(agents.id, id)))[0] ?? null as never);
     deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "task_drain" });
+    deps.instanceSettings.getExperimental.mockResolvedValue({} as never);
     const admission = createWakeQueue(owner, {
       resolveResponsibleUserId: async () => null,
       getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
@@ -165,12 +166,33 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
     deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
     return { deps, queue: createHeartbeatQueue(owner, deps) };
   }
+  /** Real admission dispatches on behalf of the blocker's responsible user. */
+  async function withResponsibleUser(f: Awaited<ReturnType<typeof fixture>>) {
+    const userId = `owner-${f.companyId}`;
+    await db.insert(authUsers).values({ id: userId, name: "Owner", email: `${userId}@paperclip.test`,
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, f.companyId));
+    // Keep the quiet window: updatedAt is what the gate measures.
+    await db.update(issues).set({ responsibleUserId: userId, updatedAt: f.terminal.updatedAt }).where(eq(issues.id, f.terminal.id));
+  }
+  /** Surface a real enqueue error in the test output; the sweep only logs it. */
+  function surfacing(enqueue: (agentId: string, input: Record<string, any>) => Promise<unknown>) {
+    const errors: string[] = [];
+    const wrapped = async (agentId: string, input: Record<string, any>) => {
+      try { return await enqueue(agentId, input); } catch (err) {
+        errors.push(err instanceof Error ? `${err.name}: ${err.message}\n${err.stack}` : String(err)); throw err;
+      }
+    };
+    return { errors, wrapped };
+  }
   const wakeRows = (companyId: string) => db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON)));
 
   it("admits one wake when concurrent sweeps reach the real queue's admission for the same attempt together", async () => {
     const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    await withResponsibleUser(f);
     const { queue, deps } = realQueue(db);
+    const real = surfacing((agentId, input) => queue.enqueueWakeup(agentId, input as never));
     // Both sweeps pass the "already sent?" pre-check and enter the real
     // enqueue together. The blocker's issue row lock decides: the second
     // admission waits for the first, then sees its row and admits nothing.
@@ -181,9 +203,10 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
       keys.push(input.idempotencyKey);
       if (keys.length === 2) release();
       await bothArrived;
-      return queue.enqueueWakeup(agentId, input as never);
+      return real.wrapped(agentId, input);
     });
     const results = await Promise.all([sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1)]);
+    expect(real.errors).toEqual([]);
     expect(keys).toHaveLength(2);
     expect(keys[0]).toBe(keys[1]);
     const rows = await wakeRows(f.companyId);
@@ -205,18 +228,20 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
     // DATABASE_POOL_MAX=1 is supported. The sweep must not hold a connection
     // (lock or transaction) while the queue needs one for the enqueue.
     const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    await withResponsibleUser(f);
     const single = createDb(external ?? temporary!.connectionString, { maxConnections: 1 });
     single.$client.options.onnotice = () => {};
     try {
       const { queue } = realQueue(single);
-      const enqueueWakeup = (agentId: string, input: Record<string, any>) => queue.enqueueWakeup(agentId, input as never);
-      const run = (index: number) => wakeStrandedTerminalBlocker(single, enqueueWakeup as never,
+      const real = surfacing((agentId, input) => queue.enqueueWakeup(agentId, input as never));
+      const run = (index: number) => wakeStrandedTerminalBlocker(single, real.wrapped as never,
         { companyId: f.companyId, blockedIssueId: f.dependents[index]!.id });
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("sweep hung on a one-connection pool")), 15_000); });
       try {
         // Two sweeps for the same blocker share the single connection.
         const results = await Promise.race([Promise.all([run(0), run(1)]), timeout]);
+        expect(real.errors).toEqual([]);
         expect(results.filter(result => result.failed)).toHaveLength(0);
         expect(results.filter(result => result.woken)).toHaveLength(1);
       } finally { clearTimeout(timer); }
