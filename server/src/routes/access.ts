@@ -50,7 +50,7 @@ import {
   PERMISSION_KEYS,
   isUuidLike,
 } from "@paperclipai/shared";
-import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole, PrincipalType } from "@paperclipai/shared";
 import {
   forbidden,
   conflict,
@@ -4606,7 +4606,11 @@ export function accessRoutes(
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
       const grantsBefore = summarizeAssignmentGrants(
-        await access.listPrincipalGrants(companyId, memberToUpdate.principalType, memberToUpdate.principalId),
+        await access.listPrincipalGrants(
+          companyId,
+          memberToUpdate.principalType as PrincipalType,
+          memberToUpdate.principalId,
+        ),
       );
       const updated = await access.setMemberPermissions(
         companyId,
@@ -4616,7 +4620,7 @@ export function accessRoutes(
       );
       if (!updated) throw notFound("Member not found");
       const grantsAfter = summarizeAssignmentGrants(
-        await access.listPrincipalGrants(companyId, updated.principalType, updated.principalId),
+        await access.listPrincipalGrants(companyId, updated.principalType as PrincipalType, updated.principalId),
       );
       const activityActor = {
         companyId,
