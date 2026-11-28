@@ -11303,7 +11303,14 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        /**
+         * The recovery action this caller resolves itself in the same
+         * transaction; the terminal-close settlement leaves it to the caller.
+         */
+        callerResolvesRecoveryActionId?: string | null;
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -12150,6 +12157,24 @@ export function issueService(db: Db) {
                 }
               }
             }
+            // Settle the open recovery action in this transaction, so the
+            // action resolved is the one open at the close and its resolution
+            // rolls back with the status change.
+            const { settleRecoveryActionsForTerminalIssue } =
+              await import("./terminal-issue-recovery-settlement.js");
+            await settleRecoveryActionsForTerminalIssue(
+              tx as unknown as Db,
+              updated,
+              {
+                agentId: actorAgentId ?? null,
+                userId: actorUserId ?? null,
+                runId: actorRunId ?? null,
+              },
+              {
+                callerResolvesActionId: options.callerResolvesRecoveryActionId ?? null,
+                publications: activityPublications,
+              },
+            );
             for (const interaction of expiredInteractions) {
               await logActivity(tx as unknown as Db, {
                 companyId: updated.companyId,

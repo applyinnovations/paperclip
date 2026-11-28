@@ -3244,3 +3244,48 @@ describe("mandatory structured review decisions", () => {
     });
   });
 });
+
+describe("administrative close (skipExecutionPolicy)", () => {
+  it("still routes a default done on a policy issue to review", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+      policy: reviewOnlyPolicy(), requestedStatus: "done", requestedAssigneePatch: {},
+      actor: { userId: boardUserId }, allowBoardOverride: true, commentBody: "Shipped already",
+    });
+    expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+  });
+
+  it.each(["done", "cancelled"])("closes to %s directly and clears executionState, even mid-review", (status) => {
+    const pending = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+      policy: twoStagePolicy(), requestedStatus: "in_review", requestedAssigneePatch: {}, actor: { agentId: coderAgentId },
+    }).patch;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_review", assigneeAgentId: qaAgentId, assigneeUserId: null, executionState: pending.executionState as Record<string, unknown> },
+      policy: twoStagePolicy(), requestedStatus: status, requestedAssigneePatch: {},
+      actor: { userId: boardUserId }, allowBoardOverride: true, commentBody: "Superseded", administrativeClose: true,
+    });
+    expect(result).toEqual({ patch: { executionState: null } });
+  });
+
+  it("rejects a non-terminal status or a review decision", () => {
+    const base = {
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+      policy: reviewOnlyPolicy(), requestedAssigneePatch: {}, actor: { userId: boardUserId }, administrativeClose: true,
+    };
+    expect(() => applyIssueExecutionPolicyTransition({ ...base, requestedStatus: "in_review" }))
+      .toThrow('skipExecutionPolicy requires status "done" or "cancelled"');
+    expect(() => applyIssueExecutionPolicyTransition({ ...base, requestedStatus: "done", decision: "approve" }))
+      .toThrow("cannot be combined with a review decision");
+  });
+
+  it("lets a board cancel bypass the policy without the flag", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+      policy: reviewOnlyPolicy(), requestedStatus: "cancelled", requestedAssigneePatch: {},
+      actor: { userId: boardUserId }, allowBoardOverride: true,
+    });
+    expect(result.patch.status).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBeUndefined();
+  });
+});

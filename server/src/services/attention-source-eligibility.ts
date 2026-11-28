@@ -1,12 +1,46 @@
 import { and, eq, gt, inArray, sql, type SQL } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { NATIVE_WORKSPACE_OWNER_UNVERIFIED } from "./native-runtime/native-workspace-finalization-recovery-state.js";
+import { OWNER_UNPROVABLE_CAUSE } from "./recovery/owner-gone-attestation.js";
 
 export const HUMAN_RECOVERY_OWNER_TYPES = ["user", "board"] as const;
 const OPEN_RECOVERY_ATTENTION_STATUSES = ["active", "escalated"] as const;
 
+/**
+ * Recovery causes that a terminal source issue does not settle: the board's
+ * stop confirmation or a resumed save is still the only way out, so closing the
+ * task leaves them open on their own record. The attention feed still hides
+ * them once the task is done or cancelled.
+ */
+export const TERMINAL_SOURCE_RETAINED_RECOVERY_CAUSES = [OWNER_UNPROVABLE_CAUSE, NATIVE_WORKSPACE_OWNER_UNVERIFIED] as const;
+
 export function recoveryActionAttentionCondition() {
   return and(inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_ATTENTION_STATUSES]),
     inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]))!;
+}
+
+/**
+ * Nothing on a done or cancelled task belongs in `/attention`. The terminal
+ * transition settles what it can at the source; this hides what it leaves open
+ * on purpose and rows an older close left behind. The rows themselves stay
+ * untouched, so answer history and open resource obligations remain on their
+ * owning task and recovery records.
+ */
+export function recoveryActionSourceOpenCondition() {
+  return sql<boolean>`not exists (
+    select 1 from ${issues} terminal_source
+    where terminal_source.id = ${issueRecoveryActions.sourceIssueId}
+      and terminal_source.company_id = ${issueRecoveryActions.companyId}
+      and terminal_source.status in ('done', 'cancelled'))`;
+}
+
+/** See `recoveryActionSourceOpenCondition`; the same rule for pending cards. */
+export function interactionAttentionIssueCondition() {
+  return sql<boolean>`not exists (
+    select 1 from ${issues} terminal_issue
+    where terminal_issue.id = ${issueThreadInteractions.issueId}
+      and terminal_issue.company_id = ${issueThreadInteractions.companyId}
+      and terminal_issue.status in ('done', 'cancelled'))`;
 }
 export const ATTENTION_BUDGET_WARNING_PERCENT = 85;
 export const ATTENTION_AGENT_ERROR_STATUS = "error";

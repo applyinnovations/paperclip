@@ -52,6 +52,7 @@ import { deliverConversationComments, isConversation } from "../services/agent-c
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { shouldWakeAssigneeLeavingBlocked } from "../services/issue-unblock-wake.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -4581,7 +4582,11 @@ export function issueRoutes(
       outcome: "cancelled",
       resolutionNote,
     });
-    if (!resolved) return activeRecoveryAction;
+    // Another writer (e.g. the terminal-transition settlement) may have
+    // settled it first; report what is active now, not the stale snapshot.
+    if (!resolved) {
+      return recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+    }
 
     await logActivity(db, {
       companyId: input.issue.companyId,
@@ -10767,6 +10772,8 @@ export function issueRoutes(
                   tx,
                   postCommitActivityPublications,
                   postCommitIssueActions,
+                  // This route records its own outcome for the action below.
+                  { callerResolvesRecoveryActionId: activeRecoveryAction.id },
                 )
               : await svc.update(
                   id,
@@ -14466,6 +14473,23 @@ export function issueRoutes(
       )) {
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
+      // Administrative close is a board decision; the policy's stages exist to
+      // gate agent completion, so no agent (or delegated MCP client) may skip them.
+      if (req.body.skipExecutionPolicy === true) {
+        if (req.actor.type !== "board" || req.actor.source === "mcp_oauth") {
+          throw forbidden("Only a board user can close a task without its execution policy");
+        }
+        if (req.body.status !== "done" && req.body.status !== "cancelled") {
+          throw unprocessable('skipExecutionPolicy requires status "done" or "cancelled"', {
+            code: "administrative_close_status_required",
+          });
+        }
+        if (typeof req.body.comment !== "string" || !req.body.comment.trim()) {
+          throw unprocessable("skipExecutionPolicy requires a comment explaining the administrative close", {
+            code: "administrative_close_comment_required",
+          });
+        }
+      }
       const id = req.params.id as string;
       const existing = await getAccessibleResource(
         req,
@@ -14560,6 +14584,7 @@ export function issueRoutes(
         resume: resumeRequested,
         interrupt: interruptRequested,
         deferWakeForGoal,
+        skipExecutionPolicy,
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
@@ -15050,6 +15075,7 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
+        administrativeClose: skipExecutionPolicy === true,
       });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -15997,6 +16023,26 @@ export function issueRoutes(
           activeRecoveryAction: null,
         };
       }
+      if (skipExecutionPolicy === true) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.execution_policy_bypassed",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            status: issue.status,
+            previousStatus: existing.status,
+            previousExecutionStateStatus: existingExecutionState?.status ?? null,
+            previousStageId: existingExecutionState?.currentStageId ?? null,
+          },
+        });
+      }
       if (!persistReviewActivityTransactionally)
         await logActivity(db, {
           companyId: issue.companyId,
@@ -16528,6 +16574,13 @@ export function issueRoutes(
         existing.status === "in_review" &&
         issue.status === "todo" &&
         req.body.status !== undefined;
+      const wakeAssigneeLeavingBlocked = shouldWakeAssigneeLeavingBlocked({
+        previousStatus: existing.status,
+        nextStatus: issue.status,
+        statusRequested: req.body.status !== undefined || reopened,
+        actorAgentId: actor.actorType === "agent" ? actor.agentId : null,
+        assigneeAgentId: issue.assigneeAgentId ?? null,
+      });
       const previousExecutionState = parseIssueExecutionState(
         existing.executionState,
       );
@@ -16668,7 +16721,9 @@ export function issueRoutes(
         if (
           !assigneeChanged &&
           (statusChangedFromBacklog ||
-            statusChangedFromBlockedToTodo ||
+            // A review stage that just started already wakes its participant.
+            (wakeAssigneeLeavingBlocked &&
+              (issue.status === "todo" || !executionStageWakeup)) ||
             statusChangedFromClosedToTodo ||
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
