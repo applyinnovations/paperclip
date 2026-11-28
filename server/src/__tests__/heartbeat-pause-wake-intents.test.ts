@@ -10,6 +10,9 @@ import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
+import { resumePauseWakeIntents, savePauseWakeIntent } from "../services/heartbeat/pause-wake-intents.js";
+import { logger } from "../middleware/logger.js";
+import { queuedCommentIdsFromWakePayload } from "../services/issue-queued-comment-queue.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
 const describePostgres = recoveryPostgresSupport.supported ? describe : describe.skip;
@@ -224,5 +227,144 @@ describePostgres("wakes refused during an agent pause", () => {
       lifecycleOperation: { id: randomUUID(), pauseCause: { holds: ["budget"], companyPauseReason: null } } };
     expect(await driver.runHost(pausing as never)).toBe("complete");
     expect(await savedIntents(f)).toEqual([]);
+  }, 180_000);
+
+  /** A comment from the board while the agent is paused, refused and saved. */
+  async function pausedComment(f: Fixture, body: string) {
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorUserId: f.userId, body }).returning();
+    await expect(heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, commentId: comment!.id, mutation: "comment" },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+        source: "issue.comment", wakeReason: "issue_commented" },
+      requestedByActorType: "user", requestedByActorId: f.userId })).rejects.toMatchObject({ status: 409 });
+    return comment!;
+  }
+  /** The producer path for a comment that races a drain (what `pausedComment` saves). */
+  const mergeComment = async (f: Fixture, body: string) => {
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorUserId: f.userId, body }).returning();
+    await savePauseWakeIntent(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, commentId: comment!.id, mutation: "comment" },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+        source: "issue.comment", wakeReason: "issue_commented" },
+      wakeCommentId: comment!.id, requestedByActorType: "user", requestedByActorId: f.userId,
+      message: "Agent is not invokable in its current state" });
+    return comment!;
+  };
+  /** A succeeded run of the agent on the task that received the given comments. */
+  const finishedRun = (f: Fixture, wakeCommentIds: string[] = []) => db.insert(heartbeatRuns).values({
+    companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment", triggerDetail: "system",
+    status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+    contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", wakeCommentIds },
+  }).returning().then(rows => rows[0]!);
+  const turnsWith = (commentId: string) => dispatched.filter(turn =>
+    Array.isArray(turn.context.wakeCommentIds) && (turn.context.wakeCommentIds as unknown[]).includes(commentId));
+  const drainDeps = (overrides: Partial<Parameters<typeof resumePauseWakeIntents>[0]> = {}) => ({
+    db, enqueueWakeup: (agentId: string, opts: Parameters<typeof heartbeat.wakeup>[1]) => heartbeat.wakeup(agentId, opts),
+    logWarn: (fields: Record<string, unknown>, message: string) => logger.warn(fields, message),
+    onError: (err: unknown) => { throw err; }, ...overrides,
+  });
+
+  it("does not count a run cancelled before it started as delivery of the saved assignment", async () => {
+    const f = await seed();
+    await pause(f);
+    await boardAssigns(f, f.agentId);
+    // Admission raced the pause: a run was created after the intent was
+    // saved, and the pause cancelled it before its first turn.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment",
+      triggerDetail: "system", status: "cancelled", errorCode: "agent_paused", finishedAt: new Date(),
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_assigned" } });
+    await resume(f);
+    const runs = await newRuns(f);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe("succeeded");
+    expect(await savedIntents(f)).toEqual([]);
+  }, 180_000);
+
+  it("delivers a signal merged after a run that started after the intent was first saved", async () => {
+    const f = await seed();
+    await assign(f, f.agentId);
+    await pause(f);
+    await expect(heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      payload: { issueId: f.issueId, mutation: "blockers_resolved", resolvedBlockerIssueId: randomUUID() },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_blockers_resolved", source: "issue.blockers_resolved" },
+      requestedByActorType: "system" })).rejects.toMatchObject({ status: 409 });
+    // A run received the first signal, then a second signal merged into the
+    // same intent (requestedAt still names the first).
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const prior = await finishedRun(f);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await expect(heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      payload: { issueId: f.issueId, mutation: "blockers_resolved", resolvedBlockerIssueId: randomUUID() },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_blockers_resolved", source: "issue.blockers_resolved" },
+      requestedByActorType: "system" })).rejects.toMatchObject({ status: 409 });
+    const [intent] = await savedIntents(f);
+    expect(intent).toBeDefined();
+    await resume(f);
+    const runs = (await newRuns(f)).filter(run => run.id !== prior.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe("succeeded");
+    // The intent itself delivered the newest signal; it was not settled
+    // against the run that only saw the first one.
+    const [settled] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
+    expect(settled!.runId).not.toBe(prior.id);
+    expect(settled!.error).toBeNull();
+  }, 180_000);
+
+  it("delivers a comment merged between the drain's candidate read and its decision, once", async () => {
+    const f = await seed();
+    await assign(f, f.agentId);
+    await pause(f);
+    const first = await pausedComment(f, "Delivered elsewhere.");
+    // A run already received the first comment, so the snapshot read by the
+    // drain holds nothing left to deliver.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await finishedRun(f, [first.id]);
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    let fresh: { id: string } | null = null;
+    await resumePauseWakeIntents(drainDeps({
+      afterCandidateRead: async ids => {
+        expect(ids).toHaveLength(1);
+        fresh = await mergeComment(f, "Merged while the drain decides.");
+      },
+    }), { companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(fresh).not.toBeNull();
+    // Before the fix, the drain settled the stale snapshot (nothing left)
+    // and the merged comment never reached a run.
+    expect(turnsWith(fresh!.id)).toHaveLength(1);
+    expect(await savedIntents(f)).toEqual([]);
+    // Another drain never delivers it again.
+    await resume(f);
+    expect(turnsWith(fresh!.id)).toHaveLength(1);
+  }, 180_000);
+
+  it("keeps a comment merged while the drain delivers pending, never settled by that delivery", async () => {
+    const f = await seed();
+    await pause(f);
+    await boardAssigns(f, f.agentId);
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    let fresh: { id: string } | null = null;
+    await resumePauseWakeIntents(drainDeps({
+      enqueueWakeup: async (agentId, opts) => {
+        // The producer runs while this drain holds its claim.
+        fresh = await mergeComment(f, "Merged during delivery.");
+        return heartbeat.wakeup(agentId, opts);
+      },
+    }), { companyId: f.companyId });
+    expect(fresh).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    // The fresh comment either reached the delivered run (admission adopts
+    // saved comments) or still waits in its own intent: never both, never lost.
+    const pending = (await savedIntents(f)).filter(intent =>
+      queuedCommentIdsFromWakePayload(intent.payload).includes(fresh!.id));
+    expect(turnsWith(fresh!.id).length + pending.length).toBe(1);
+    // The assignment itself was delivered exactly once (the fresh comment
+    // may get its own run from its own intent).
+    const freshTurnRuns = new Set(turnsWith(fresh!.id).map(turn => turn.runId));
+    expect((await newRuns(f)).filter(run => !freshTurnRuns.has(run.id))).toHaveLength(1);
   }, 180_000);
 });
