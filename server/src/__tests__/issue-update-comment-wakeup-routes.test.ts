@@ -55,6 +55,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   ): Promise<Record<string, unknown> | null> => null),
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
+  listForIssue: vi.fn(async (): Promise<Array<Record<string, unknown>>> => []),
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async (): Promise<Array<Record<string, unknown>>> => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -1036,6 +1037,41 @@ describe("issue update comment wakeups", () => {
       reason: "execution_review_requested",
     }));
   });
+
+  it.each(["todo", "in_progress", "in_review"])("does not wake the assignee agent for its own blocked -> %s move", async (status) => {
+    const existing = makeIssue({
+      status: "blocked", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null,
+      checkoutRunId: SOURCE_RUN_ID, executionRunId: SOURCE_RUN_ID,
+    });
+    actorOverride = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", source: "agent_key", runId: SOURCE_RUN_ID };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({ ...existing, status });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID, companyId: existing.companyId, status: "running", agentId: ASSIGNEE_AGENT_ID,
+      contextSnapshot: { issueId: existing.id },
+    });
+    // The blockers are resolved; the assignee picks its own work back up.
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
+    // An agent's own in_review needs a review path: a pending question to the board.
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue(status === "in_review"
+      ? [{ id: "review-card", kind: "request_confirmation", status: "pending", payload: {} }]
+      : []);
+
+    // The run row the cross-issue check locks: this agent's run on this issue.
+    const runRow = { id: SOURCE_RUN_ID, companyId: existing.companyId, agentId: ASSIGNEE_AGENT_ID, contextSnapshot: { issueId: existing.id } };
+    const app = await createApp(async (callback) => callback({
+      select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [runRow] }) }) }),
+    } as any));
+    const res = await request(app).patch(`/api/issues/${existing.id}`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID).send({ status });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   describe("board administrative close (skipExecutionPolicy)", () => {
     const REVIEWER_AGENT_ID = MENTIONED_AGENT_ID;
     const policy = {

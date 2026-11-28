@@ -16574,10 +16574,10 @@ export function issueRoutes(
         existing.status === "in_review" &&
         issue.status === "todo" &&
         req.body.status !== undefined;
-      const statusChangedFromBlockedToActive = shouldWakeAssigneeLeavingBlocked({
+      const wakeAssigneeLeavingBlocked = shouldWakeAssigneeLeavingBlocked({
         previousStatus: existing.status,
         nextStatus: issue.status,
-        statusRequested: req.body.status !== undefined,
+        statusRequested: req.body.status !== undefined || reopened,
         actorAgentId: actor.actorType === "agent" ? actor.agentId : null,
         assigneeAgentId: issue.assigneeAgentId ?? null,
       });
@@ -16721,9 +16721,9 @@ export function issueRoutes(
         if (
           !assigneeChanged &&
           (statusChangedFromBacklog ||
-            statusChangedFromBlockedToTodo ||
             // A review stage that just started already wakes its participant.
-            (statusChangedFromBlockedToActive && !executionStageWakeup) ||
+            (wakeAssigneeLeavingBlocked &&
+              (issue.status === "todo" || !executionStageWakeup)) ||
             statusChangedFromClosedToTodo ||
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId

@@ -5,19 +5,19 @@ const assignee = "11111111-1111-4111-8111-111111111111";
 const base = { previousStatus: "blocked", statusRequested: true, actorAgentId: null, assigneeAgentId: assignee };
 
 describe("shouldWakeAssigneeLeavingBlocked", () => {
-  it.each(["in_progress", "in_review"])("wakes on blocked -> %s by another actor", (nextStatus) => {
+  it.each(["todo", "in_progress", "in_review"])("wakes on blocked -> %s by another actor", (nextStatus) => {
     expect(shouldWakeAssigneeLeavingBlocked({ ...base, nextStatus })).toBe(true);
     expect(shouldWakeAssigneeLeavingBlocked({ ...base, nextStatus, actorAgentId: "other-agent" })).toBe(true);
   });
 
-  it("does not wake the assignee for its own move", () => {
-    expect(shouldWakeAssigneeLeavingBlocked({ ...base, nextStatus: "in_progress", actorAgentId: assignee })).toBe(false);
+  it.each(["todo", "in_progress", "in_review"])("does not wake the assignee for its own move to %s", (nextStatus) => {
+    expect(shouldWakeAssigneeLeavingBlocked({ ...base, nextStatus, actorAgentId: assignee })).toBe(false);
   });
 
   it.each([
     { previousStatus: "todo", nextStatus: "in_progress" },
     { previousStatus: "blocked", nextStatus: "done" },
-    { previousStatus: "blocked", nextStatus: "todo" },
+    { previousStatus: "blocked", nextStatus: "backlog" },
   ])("ignores $previousStatus -> $nextStatus", (statuses) => {
     expect(shouldWakeAssigneeLeavingBlocked({ ...base, ...statuses })).toBe(false);
   });
