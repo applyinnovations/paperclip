@@ -32,6 +32,8 @@ import {
 import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
+import { logger } from "../middleware/logger.js";
+import type { AuthorizationDecision } from "../services/authorization.js";
 import { accessService, projectService, logActivity, workspaceOperationService } from "../services/index.js";
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { externalObjectService } from "../services/external-objects.js";
@@ -59,6 +61,46 @@ import { secretService } from "../services/secrets.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
+
+// APP-827: one structured security event per denied project workspace write,
+// so Loki can alert on an actor that keeps writing outside its grants. Field
+// names follow authz.tasks_assign.denied (APP-790/APP-799). Every field is an
+// id or an enum picked explicitly: never the request body, a path, the
+// decision explanation or any other free text. Allowed writes log nothing.
+export const PROJECT_WORKSPACE_WRITE_DENIED_EVENT = "authz.project_write_workspace.denied";
+
+// actor.runId is not always server-issued: API-key auth copies it verbatim
+// from the X-Paperclip-Run-Id header. Only a well-formed run id (a UUID, with
+// no surrounding whitespace) enters the security event; anything else is null.
+export function loggableRunId(runId: string | null | undefined): string | null {
+  if (typeof runId !== "string" || runId !== runId.trim() || !isUuidLike(runId)) return null;
+  return runId;
+}
+
+function logProjectWorkspaceWriteDenied(
+  actor: Request["actor"],
+  project: { id: string; companyId: string },
+  decision: AuthorizationDecision,
+) {
+  const actorAgentId = actor.type === "agent" ? actor.agentId ?? null : null;
+  const actorUserId = actor.type === "board" ? actor.userId ?? null : null;
+  logger.warn({
+    event: PROJECT_WORKSPACE_WRITE_DENIED_EVENT,
+    action: "project:write_workspace",
+    companyId: project.companyId,
+    actorType: actor.type,
+    actorId: actorAgentId ?? actorUserId,
+    actorAgentId,
+    actorUserId,
+    runId: loggableRunId(actor.runId),
+    projectId: project.id,
+    reason: decision.reason,
+    code: decision.code ?? null,
+    // The requested scope is { projectId, assigneeAgentId: actorAgentId }, both
+    // above. The grant scope itself stays in the database, not the log.
+    grantPermissionKey: decision.grant?.permissionKey ?? null,
+  }, "project workspace write denied");
+}
 
 export function projectRoutes(db: Db) {
   const router = Router();
@@ -178,6 +220,7 @@ export function projectRoutes(db: Db) {
       resource: { type: "issue", companyId: project.companyId, projectId: project.id, assigneeAgentId },
       scope: { projectId: project.id, assigneeAgentId } });
     if (decision.allowed) return true;
+    logProjectWorkspaceWriteDenied(req.actor, project, decision);
     res.status(403).json({ error: decision.explanation });
     return false;
   }
