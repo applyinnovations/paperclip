@@ -39,7 +39,7 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
+import { describeExecError, execInPod, execInPodStreaming, openPodPty, wrapCommandWithEnv } from "./pod-exec.js";
 import { openKubernetesLoginPtySession, type LoginPodExec } from "./login-pty.js";
 import { createLoginPtySessions, type LoginLeaseTarget } from "./login-pty-sessions.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
@@ -1069,7 +1069,7 @@ const plugin = definePlugin({
               exitCode: null,
               timedOut: true,
               stdout: "",
-              stderr: `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`,
+              stderr: `fast-upload flush failed: ${describeExecError(err)}`,
               metadata: {
                 provider: "kubernetes",
                 backend: "sandbox-cr",
@@ -1144,7 +1144,7 @@ const plugin = definePlugin({
           exitCode: null,
           timedOut: true,
           stdout: "",
-          stderr: appendNetworkEgressDenyHint(err instanceof Error ? err.message : String(err), scopedNetworkEgress),
+          stderr: appendNetworkEgressDenyHint(describeExecError(err), scopedNetworkEgress),
           metadata: {
             provider: "kubernetes",
             backend: "sandbox-cr",

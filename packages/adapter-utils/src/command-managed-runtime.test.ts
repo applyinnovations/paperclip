@@ -1061,3 +1061,43 @@ describe("command managed runtime", () => {
     expect(Array.from(received[0] ?? [])).toEqual(Array.from({ length: 256 }, (_, value) => value));
   });
 });
+
+describe("command failure reporting (APP-762)", () => {
+  function fakeResult(overrides: Partial<RunProcessResult>): RunProcessResult {
+    return {
+      exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "",
+      pid: null, startedAt: null, ...overrides,
+    };
+  }
+
+  it("bounds a timed-out command by the caller timeout and reports the timeout", async () => {
+    const seen: Array<number | undefined> = [];
+    const runner: CommandManagedRuntimeRunner = {
+      execute: async (input) => {
+        seen.push(input.timeoutMs);
+        return fakeResult({ exitCode: null, timedOut: true, stderr: "execInPod timed out" });
+      },
+    };
+    const client = createCommandManagedRuntimeClient({ runner, commandCwd: "/", timeoutMs: 3_600_000 });
+    const failure = await client.run("git bundle create x", { timeoutMs: 600_000 }).then(() => null, (e: unknown) => e);
+    expect(seen).toEqual([600_000]);
+    expect(failure).toMatchObject({ timedOut: true, exitCode: null });
+    expect((failure as Error).message).toContain("git bundle create x timed out after 600000ms");
+    expect((failure as Error).message).not.toContain("exit code null");
+  });
+
+  it.each([
+    ["a plain object", { type: "error", message: "socket hang up" }, "socket hang up"],
+    ["an object without a message", { code: 1006 }, '{"code":1006}'],
+    ["a Buffer", Buffer.from("fatal: index.lock exists"), "fatal: index.lock exists"],
+    ["an Error", new Error("channel closed"), "channel closed"],
+  ])("decodes %s stderr instead of rendering [object Object]", async (_label, stderr, expected) => {
+    const runner: CommandManagedRuntimeRunner = {
+      execute: async () => fakeResult({ exitCode: 1, stderr: stderr as unknown as string }),
+    };
+    const client = createCommandManagedRuntimeClient({ runner, commandCwd: "/", timeoutMs: 5_000 });
+    const failure = await client.run("true", { timeoutMs: 5_000 }).then(() => null, (e: unknown) => e);
+    expect((failure as Error).message).toContain(`stderr: ${expected}`);
+    expect((failure as Error).message).not.toContain("[object Object]");
+  });
+});

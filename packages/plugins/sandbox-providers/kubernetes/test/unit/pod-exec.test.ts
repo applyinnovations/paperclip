@@ -23,6 +23,10 @@ let scriptedExec: (
 // Frames the streaming exec sends on the fake WebSocket (channel byte first).
 let sentFrames: Buffer[] = [];
 
+// When set, the fake `Exec.exec` rejects with this value instead of opening a
+// socket, the way the real client rejects a failed WebSocket upgrade.
+let execRejection: unknown = undefined;
+
 vi.mock("@kubernetes/client-node", () => {
   class Exec {
     constructor(_kc: unknown) {}
@@ -37,6 +41,7 @@ vi.mock("@kubernetes/client-node", () => {
       _tty: boolean,
       statusCb: StatusCb,
     ) {
+      if (execRejection !== undefined) throw execRejection;
       // Defer so the caller has wired its stream listeners first.
       setImmediate(() => scriptedExec(stdout, stderr, statusCb, stdin));
       return {
@@ -53,7 +58,7 @@ vi.mock("@kubernetes/client-node", () => {
   return { Exec };
 });
 
-const { execInPod, execInPodStreaming } = await import("../../src/pod-exec.js");
+const { describeExecError, execInPod, execInPodStreaming } = await import("../../src/pod-exec.js");
 
 const KC = {} as never;
 
@@ -274,5 +279,39 @@ describe("execInPodStreaming", () => {
         timeoutMs: 5_000,
       }),
     ).rejects.toThrow(/disk guard/i);
+  });
+});
+
+describe("execInPod non-Error rejections (APP-762)", () => {
+  it("rejects with a readable Error when the client rejects with a ws ErrorEvent", async () => {
+    execRejection = {
+      type: "error",
+      message: "Unexpected server response: 404",
+      error: new Error("Unexpected server response: 404"),
+      target: { readyState: 3 },
+    };
+    try {
+      const failure = await execInPod(KC, "ns", "pod", "agent", ["/bin/sh", "-c", ":"], undefined, 5_000)
+        .then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe("Unexpected server response: 404");
+      expect(String(failure)).not.toContain("[object Object]");
+    } finally {
+      execRejection = undefined;
+    }
+  });
+
+  it("describes a V1Status-shaped rejection by status, code, reason and message", () => {
+    expect(describeExecError({ status: "Failure", code: 404, reason: "NotFound", message: 'pods "p" not found' }))
+      .toBe('Failure: code 404: NotFound: pods "p" not found');
+  });
+
+  it("never renders an object as [object Object]", () => {
+    expect(describeExecError({ foo: 1 })).toBe('{"foo":1}');
+    expect(describeExecError(Buffer.from("boom"))).toBe("boom");
+    expect(describeExecError(new Error("bad"))).toBe("bad");
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(describeExecError(circular)).not.toContain("[object Object]");
   });
 });
