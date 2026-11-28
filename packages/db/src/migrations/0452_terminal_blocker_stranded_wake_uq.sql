@@ -1,1 +1,0 @@
-CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "agent_wakeup_requests_issue_terminal_blocker_stranded_uq" ON "agent_wakeup_requests" USING btree ("company_id","idempotency_key") WHERE "agent_wakeup_requests"."idempotency_key" LIKE 'issue_terminal_blocker_stranded:%' AND "agent_wakeup_requests"."status" <> 'skipped';

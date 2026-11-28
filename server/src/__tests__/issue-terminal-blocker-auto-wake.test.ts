@@ -143,21 +143,22 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
   it("admits one wake when concurrent sweeps reach admission for the same attempt together", async () => {
     const f = await fixture({ quietMinutes: 30, dependents: 2 });
     const calls: string[] = [];
-    // Both callers pass the existing-row check, then wait here so neither has
-    // inserted before the other reaches the insert.
-    let arrive!: () => void;
-    const bothArrived = new Promise<void>(resolve => { let arrived = 0; arrive = () => { arrived += 1; if (arrived === 2) resolve(); }; });
+    // Both sweeps pass the "already sent?" pre-check together: the first one to
+    // reach the enqueue holds there, before inserting, until the other sweep has
+    // finished. Without atomic admission the other sweep enqueues a second wake.
+    const sweeps: Array<Promise<unknown>> = [];
+    let first = true;
     const enqueueWakeup = vi.fn(async (agentId: string, input: Record<string, any>) => {
       calls.push(input.idempotencyKey);
-      arrive();
-      await bothArrived;
+      if (first) { first = false; await Promise.race(sweeps); }
       const [row] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: input.source,
         triggerDetail: input.triggerDetail, reason: input.reason, payload: input.payload,
         idempotencyKey: input.idempotencyKey, status: "queued" }).returning();
       return { id: row.id };
     });
-    const results = await Promise.all([sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1)]);
-    expect(calls).toEqual([calls[0], calls[0]]);
+    sweeps.push(sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1));
+    const results = await Promise.all(sweeps) as Array<Awaited<ReturnType<typeof wakeStrandedTerminalBlocker>>>;
+    expect(calls).toHaveLength(1);
     const rows = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
       eq(agentWakeupRequests.reason, ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON)));
     expect(rows).toHaveLength(1);

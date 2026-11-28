@@ -13,10 +13,12 @@
  *
  * Bounded and debounced: at most `maxAttempts` wakes per stall fingerprint, one
  * idempotency key per terminal blocker + fingerprint + attempt, so N blocked
- * issues behind one blocker cost one wake. A partial unique index on that key
- * makes admission atomic: concurrent sweeps that compute the same attempt
- * cannot both deliver, and the loser treats the attempt as admitted. Blocked
- * issues the woken agent cannot read are redacted. State lives in wake rows, so a
+ * issues behind one blocker cost one wake. Admission is atomic across sweeps,
+ * workers and replicas: a transaction-scoped advisory lock on that key covers
+ * the "already sent?" check and the enqueue, so concurrent sweeps that compute
+ * the same attempt cannot both deliver; the loser treats the attempt as
+ * admitted. (No unique index: the fork carries no migrations.) Blocked issues
+ * the woken agent cannot read are redacted. State lives in wake rows, so a
  * restart rebuilds it. A pending wake registers its real deadline with the
  * sweep; an exhausted or human-owned blocker registers none.
  */
@@ -28,7 +30,6 @@ import {
 } from "@paperclipai/shared";
 import { logActivity } from "../activity-log.js";
 import { authorizationService } from "../authorization.js";
-import { isUniqueViolation } from "../../db-errors.js";
 import {
   loadTerminalBlockerAutoWakeStates,
   TERMINAL_BLOCKER_AUTO_WAKE,
@@ -40,8 +41,6 @@ import { logger } from "../../middleware/logger.js";
 
 const ACTOR_ID = "issue-terminal-blocker-auto-wake";
 const BLOCKED_ISSUE_SAMPLE = 5;
-/** Partial unique index on (company_id, idempotency_key): one admitted wake per blocker, fingerprint and attempt. */
-const TERMINAL_BLOCKER_STRANDED_WAKE_INDEX = "agent_wakeup_requests_issue_terminal_blocker_stranded_uq";
 /**
  * While an auto-wake runs, the blocked tree reads as live and names no
  * terminal blocker, so the pass cannot see which blocker it waits on. Keep
@@ -175,11 +174,11 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
   if (!terminal) return result;
   const idempotencyKey = terminalBlockerAutoWakeKey(terminal.id, state.fingerprint, state.attempt);
   // Another blocked issue behind the same blocker may have sent this attempt already.
-  const [existing] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
-    .where(and(eq(agentWakeupRequests.companyId, input.companyId),
+  const alreadySent = async (executor: Pick<Db, "select">) => (await executor.select({ id: agentWakeupRequests.id })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${terminal.id}`,
-      eq(agentWakeupRequests.idempotencyKey, idempotencyKey))).limit(1);
-  if (existing) { result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs; return result; }
+      eq(agentWakeupRequests.idempotencyKey, idempotencyKey))).limit(1)).length > 0;
+  if (await alreadySent(db)) { result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs; return result; }
 
   const blockedIssues = await blockedIssueSample(db, input.companyId, terminal.id, terminal.parentId);
   const visible = await readableBlockedIssues(db, { companyId: input.companyId, agentId: state.agentId,
@@ -197,16 +196,31 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
     maxAttempts: TERMINAL_BLOCKER_AUTO_WAKE.maxAttempts, fingerprint: state.fingerprint, blockedIssueCount: blockedIssues.count,
     blockedIssuesWithheld: visible.withheld, companyId: input.companyId };
   try {
-    const wake = await enqueueWakeup(state.agentId, {
-      source: "automation", triggerDetail: "system", reason: ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON,
-      payload: { issueId: terminal.id, terminalBlockerStranded: context }, idempotencyKey,
-      requestedByActorType: "system", requestedByActorId: ACTOR_ID,
-      contextSnapshot: { issueId: terminal.id, taskId: terminal.id, wakeReason: ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON,
-        source: "issue.terminal_blocker_stranded", terminalBlockerStranded: context },
-      allowRunCoalescing: false,
-      // A blocker that moved on (new status, version or owner) drops the wake.
-      issueStateGuard: { statuses: [terminal.status], assigneeAgentId: state.agentId, statusVersion: terminal.statusVersion },
+    // Admission: hold a lock on this attempt's key across the re-check and the
+    // enqueue. A concurrent sweep that holds it, or already saved the wake, has
+    // admitted this attempt; the loser does not deliver a second one.
+    const admission = await db.transaction(async (tx) => {
+      const [lock] = await tx.execute<{ acquired: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${
+        `${ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON}:${input.companyId}:${idempotencyKey}`}, 0)) as acquired`);
+      if (!lock?.acquired || await alreadySent(tx)) return { admitted: false as const };
+      return { admitted: true as const, wake: await enqueueWakeup(state.agentId, {
+        source: "automation", triggerDetail: "system", reason: ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON,
+        payload: { issueId: terminal.id, terminalBlockerStranded: context }, idempotencyKey,
+        requestedByActorType: "system", requestedByActorId: ACTOR_ID,
+        contextSnapshot: { issueId: terminal.id, taskId: terminal.id, wakeReason: ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON,
+          source: "issue.terminal_blocker_stranded", terminalBlockerStranded: context },
+        allowRunCoalescing: false,
+        // A blocker that moved on (new status, version or owner) drops the wake.
+        issueStateGuard: { statuses: [terminal.status], assigneeAgentId: state.agentId, statusVersion: terminal.statusVersion },
+      }) };
     });
+    if (!admission.admitted) {
+      logger.info({ event: "terminal_blocker_auto_wake_already_admitted", ...log },
+        "auto-wake attempt for stranded terminal blocker already admitted by a concurrent sweep");
+      result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs;
+      return result;
+    }
+    const wake = admission.wake;
     // Null is a deferral with no wake row; the next pass tries again.
     if (!wake) { result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs; return result; }
     await logActivity(db, {
@@ -221,14 +235,6 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
     // Come back when the next attempt could be due, or to record exhaustion.
     result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs;
   } catch (err) {
-    // A concurrent sweep (another blocked issue, worker or replica) admitted
-    // this attempt first: the unique key held, so the wake is already sent.
-    if (isUniqueViolation(err, TERMINAL_BLOCKER_STRANDED_WAKE_INDEX)) {
-      logger.info({ event: "terminal_blocker_auto_wake_already_admitted", ...log },
-        "auto-wake attempt for stranded terminal blocker already admitted by a concurrent sweep");
-      result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs;
-      return result;
-    }
     result.failed = true;
     logger.warn({ err, event: "terminal_blocker_auto_wake_failed", ...log }, "failed to auto-wake owner of stranded terminal blocker");
   }
