@@ -4485,6 +4485,7 @@ export function heartbeatService(
     releaseEnvironmentLeasesForRun,
     resumeRemoteStopComments,
     resumeTaskRetry: runControl.resumeTaskRetry,
+    releaseIssueExecutionAndPromote,
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
 

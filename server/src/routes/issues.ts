@@ -5855,8 +5855,10 @@ export function issueRoutes(
       return false;
     }
     if (req.actor.source === "agent_jwt" && req.actor.runId &&
-        issue.assigneeAgentId === null && issue.assigneeUserId) {
-      const run = await heartbeat.getRun(req.actor.runId);
+        issue.assigneeAgentId !== actorAgentId &&
+        (issue.assigneeAgentId !== null || issue.assigneeUserId)) {
+      // Handoff fences live in the server-owned execution evidence.
+      const run = await heartbeat.getRun(req.actor.runId, { includeExecutionEvidence: true });
       if (run?.agentId === actorAgentId) assertLegacyRunTaskOwnership(run, issue);
     }
     // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
@@ -14843,6 +14845,7 @@ export function issueRoutes(
         return;
       }
       let interruptedRunId: string | null = null;
+      let ownRunStageHandoff = false;
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(existing);
       const isAgentWorkUpdate =
@@ -15326,7 +15329,8 @@ export function issueRoutes(
       }
 
       // Only this request may finish a mutation that intentionally stops its
-      // own run (for example handing work to a signoff reviewer).
+      // own run (for example an agent key reassigning its own task). An
+      // execution-stage handoff from the caller's own run does not stop it.
       const issueMutationStopId = randomUUID();
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
@@ -15335,18 +15339,36 @@ export function issueRoutes(
           agentId: existing.assigneeAgentId,
         });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        const isHumanSelfHandoff =
+        // The run making this request is the current assignee's own run on
+        // this issue, so stopping it would cancel the caller mid-request.
+        const isCallerOwnIssueRun =
           req.actor.type === "agent" &&
           req.actor.source === "agent_jwt" &&
-          nextAssigneeAgentId === null &&
-          typeof nextAssigneeUserId === "string" &&
           req.actor.agentId === existing.assigneeAgentId &&
-          runToStopForReassignment?.runtimeMode === "legacy" &&
+          !!runToStopForReassignment &&
           runToStopForReassignment.id === req.actor.runId &&
           runToStopForReassignment.agentId === req.actor.agentId &&
           runToStopForReassignment.companyId === existing.companyId &&
           runToStopForReassignment.contextSnapshot?.issueId === existing.id;
-        if (runToStopForReassignment && !isHumanSelfHandoff) {
+        const isHumanSelfHandoff =
+          isCallerOwnIssueRun &&
+          nextAssigneeAgentId === null &&
+          typeof nextAssigneeUserId === "string" &&
+          runToStopForReassignment?.runtimeMode === "legacy";
+        // The execution policy moved ownership to a stage participant (for
+        // example done -> in_review for the reviewer). The handing-off run
+        // finishes its turn instead of being cancelled. The update marks the
+        // run as handed off in the same commit, and assertLegacyRunTaskOwnership
+        // then refuses its further writes to this issue; a native run's tool
+        // binding also requires current assignment. The participant's wake
+        // defers behind this run and is promoted when the run releases the
+        // issue.
+        const isOwnStageHandoff =
+          isCallerOwnIssueRun &&
+          transition.workflowControlledAssignment === true &&
+          nextAssigneeAgentId !== req.actor.agentId;
+        if (runToStopForReassignment && isOwnStageHandoff) ownRunStageHandoff = true;
+        if (runToStopForReassignment && !isHumanSelfHandoff && !isOwnStageHandoff) {
           let cancelled: Awaited<ReturnType<typeof heartbeat.cancelRun>> = null;
           try {
             cancelled = await heartbeat.cancelRun(
@@ -15489,6 +15511,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
+        actorRunHandsOffIssue: ownRunStageHandoff,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =

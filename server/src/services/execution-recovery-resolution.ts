@@ -14,6 +14,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   chatActions,
   environmentLeases,
   heartbeatRuns,
@@ -306,6 +307,9 @@ export async function markExecutionReconciliation(
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  // Re-runs the stopped run's release drain, so a stage wake parked behind
+  // its hold is promoted as the same durable receipt instead of a new wake.
+  promoteDeferred?: ReturnType<typeof import("./heartbeat.js").heartbeatService>["releaseIssueExecutionAndPromote"],
 ) {
   const pending = await db
     .select()
@@ -338,9 +342,19 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
+      // The stopped run's owner may have handed the task to an execution
+      // stage before the hold was reconciled. That participant's stage wake
+      // was parked behind this hold, so deliver it to them instead.
+      const stage = task?.status === "in_review" && !task.assigneeUserId
+        ? parseIssueExecutionState(task.executionState) : null;
+      const stageParticipantAgentId = task && stage?.status === "pending" &&
+        stage.currentParticipant?.type === "agent" &&
+        stage.currentParticipant.agentId === task.assigneeAgentId &&
+        task.assigneeAgentId !== action.returnOwnerAgentId
+        ? task.assigneeAgentId : null;
       if (
         !task ||
-        task.assigneeAgentId !== action.returnOwnerAgentId ||
+        (task.assigneeAgentId !== action.returnOwnerAgentId && !stageParticipantAgentId) ||
         ["done", "cancelled"].includes(task.status)
       ) {
         await db
@@ -349,6 +363,96 @@ export async function deliverReconciledExecutions(
             evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
           })
           .where(pendingDecision);
+        continue;
+      }
+      if (stageParticipantAgentId && stage) {
+        const reason = stage.currentStageType === "approval"
+          ? "execution_approval_requested" : "execution_review_requested";
+        const executionStage = {
+          wakeRole: stage.currentStageType === "approval" ? "approver" : "reviewer",
+          stageId: stage.currentStageId,
+          stageType: stage.currentStageType,
+          currentParticipant: stage.currentParticipant,
+          returnAssignee: stage.returnAssignee,
+          reviewRequest: stage.reviewRequest ?? null,
+          lastDecisionOutcome: stage.lastDecisionOutcome,
+          allowedActions: ["approve", "request_changes"],
+        };
+        // The handoff already saved the participant's stage wake as a durable
+        // receipt. Deliver that receipt, never a second one: adopt a run it
+        // already started (also after a crash before delivery was recorded,
+        // and even when that run has finished), otherwise promote it through
+        // the stopped run's own release drain, which consumes it atomically.
+        // A wake saved behind a live run is stored with the generic
+        // `issue_execution_deferred` reason; its stage reason is kept in the
+        // saved wake context, and stays there after promotion.
+        const stageReceipts = and(
+          eq(agentWakeupRequests.companyId, action.companyId),
+          eq(agentWakeupRequests.agentId, stageParticipantAgentId),
+          or(
+            inArray(agentWakeupRequests.reason, ["execution_review_requested", "execution_approval_requested"]),
+            sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' in ('execution_review_requested', 'execution_approval_requested')`,
+          ),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
+        );
+        const findStageSuccessor = async () => {
+          const [successor] = await db.select({ id: heartbeatRuns.id }).from(agentWakeupRequests)
+            .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, agentWakeupRequests.runId),
+              eq(heartbeatRuns.companyId, agentWakeupRequests.companyId)))
+            .where(and(stageReceipts, sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
+              SELECT source.created_at, source.id FROM heartbeat_runs source
+              WHERE source.company_id = ${action.companyId} AND source.id = ${decision.runId})`))
+            .orderBy(heartbeatRuns.createdAt, heartbeatRuns.id).limit(1);
+          return successor?.id ?? null;
+        };
+        let stageRunId = await findStageSuccessor();
+        if (!stageRunId) {
+          const [deferredStage] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(stageReceipts, eq(agentWakeupRequests.status, "deferred_issue_execution"))).limit(1);
+          if (deferredStage) {
+            if (promoteDeferred) {
+              await promoteDeferred({ id: decision.runId, companyId: action.companyId },
+                { suppressImmediateRecovery: true, resumeStrandedQueue: true });
+              stageRunId = await findStageSuccessor();
+            }
+          } else {
+            // No saved receipt (the stage wake was refused, not deferred):
+            // issue one. Its admitted run is found above on any retry.
+            const stageRun = await wake(stageParticipantAgentId, {
+              source: "assignment",
+              triggerDetail: "system",
+              reason,
+              idempotencyKey: `execution-stage-after-reconciliation:${action.id}`,
+              payload: { issueId: task.id, mutation: "update", executionStage, reconciledRecoveryActionId: action.id },
+              requestedByActorType: "system",
+              requestedByActorId: "execution-recovery",
+              contextSnapshot: {
+                issueId: task.id,
+                taskId: task.id,
+                wakeReason: reason,
+                source: "issue.execution_stage",
+                executionStage,
+                reconciledRecoveryActionId: action.id,
+              },
+            });
+            stageRunId = stageRun?.id ?? await findStageSuccessor();
+          }
+        }
+        if (stageRunId) {
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+              continuationDelivery: "delivered",
+              continuationRunId: stageRunId,
+            })}::jsonb`,
+          }).where(pendingDecision);
+        } else {
+          // Leave the delivery pending so the next delivery pass retries it,
+          // and say why the participant has not started yet.
+          logger.warn(
+            { recoveryActionId: action.id, issueId: task.id, agentId: stageParticipantAgentId },
+            "Reconciled execution stage wake was not admitted; delivery remains pending",
+          );
+        }
         continue;
       }
       const run = await wake(action.returnOwnerAgentId, {
