@@ -35,7 +35,7 @@ vi.mock("../middleware/logger.js", async (importOriginal) => ({
 }));
 
 const { errorHandler } = await import("../middleware/index.js");
-const { projectRoutes, PROJECT_WORKSPACE_WRITE_DENIED_EVENT } = await import("../routes/projects.js");
+const { loggableRunId, projectRoutes, PROJECT_WORKSPACE_WRITE_DENIED_EVENT } = await import("../routes/projects.js");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -204,6 +204,70 @@ describeEmbeddedPostgres("denied project workspace writes emit one security even
       reason: "deny_scope",
     });
     expectNoFreeText(fields);
+  });
+
+  it("logs a valid run id but never a malformed X-Paperclip-Run-Id value", async () => {
+    // API-key auth copies X-Paperclip-Run-Id into actor.runId verbatim
+    // (middleware/auth.ts), so the denial event must not trust it.
+    const { companyId, agentId } = await seed("RunIdHeader");
+    const { projectId, workspaceId } = await seedProject(companyId, "Run id header");
+    // The route sees only req.actor; this is the actor shape agent-key auth
+    // builds, with runId taken straight from the header.
+    const keyActor = {
+      type: "agent" as const,
+      agentId,
+      companyId,
+      keyId: randomUUID(),
+      keyScope: { kind: "standard" as const },
+      source: "agent_key" as const,
+    };
+    const patch = (runId: string) =>
+      request(createApp(db, { ...keyActor, runId }))
+        .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+        .send({ name: "run id header" });
+
+    const validRunId = randomUUID();
+    const valid = await patch(validRunId);
+    expect(valid.status, JSON.stringify(valid.body)).toBe(403);
+
+    // Non-canonical spellings Postgres still casts to uuid, so they get past
+    // the read check and reach the workspace-write denial.
+    const nonCanonical = [`{${validRunId}}`, validRunId.replaceAll("-", "")];
+    for (const runId of nonCanonical) {
+      const res = await patch(runId);
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+    }
+
+    // Free text and paths never reach any log line through this route.
+    const freeText = await patch(`${FREE_TEXT_MARKER} /tmp/${FREE_TEXT_MARKER}`);
+    expect(freeText.status).not.toBe(200);
+
+    const events = denialEvents().map(([fields]) => fields as Record<string, unknown>);
+    expect(events).toHaveLength(1 + nonCanonical.length);
+    expect(events[0]).toMatchObject({ actorId: agentId, runId: validRunId });
+    for (const fields of events.slice(1)) {
+      expect(fields).toMatchObject({ actorId: agentId, runId: null, reason: "deny_missing_grant" });
+    }
+    expect(JSON.stringify(mockLogger.warn.mock.calls)).not.toContain(FREE_TEXT_MARKER);
+  });
+
+  it("admits only a canonical run id into the event", () => {
+    const id = randomUUID();
+    expect(loggableRunId(id)).toBe(id);
+    expect(loggableRunId(id.toUpperCase())).toBe(id.toUpperCase());
+    for (const value of [
+      undefined,
+      null,
+      "",
+      FREE_TEXT_MARKER,
+      `/tmp/${FREE_TEXT_MARKER}`,
+      ` ${id} `,
+      `${id}\n${FREE_TEXT_MARKER}`,
+      `{${id}}`,
+      id.replaceAll("-", ""),
+    ]) {
+      expect(loggableRunId(value)).toBeNull();
+    }
   });
 
   it("emits nothing for allowed workspace writes", async () => {

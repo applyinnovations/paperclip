@@ -69,6 +69,14 @@ const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
 // decision explanation or any other free text. Allowed writes log nothing.
 export const PROJECT_WORKSPACE_WRITE_DENIED_EVENT = "authz.project_write_workspace.denied";
 
+// actor.runId is not always server-issued: API-key auth copies it verbatim
+// from the X-Paperclip-Run-Id header. Only a well-formed run id (a UUID, with
+// no surrounding whitespace) enters the security event; anything else is null.
+export function loggableRunId(runId: string | null | undefined): string | null {
+  if (typeof runId !== "string" || runId !== runId.trim() || !isUuidLike(runId)) return null;
+  return runId;
+}
+
 function logProjectWorkspaceWriteDenied(
   actor: Request["actor"],
   project: { id: string; companyId: string },
@@ -84,7 +92,7 @@ function logProjectWorkspaceWriteDenied(
     actorId: actorAgentId ?? actorUserId,
     actorAgentId,
     actorUserId,
-    runId: actor.runId ?? null,
+    runId: loggableRunId(actor.runId),
     projectId: project.id,
     reason: decision.reason,
     code: decision.code ?? null,
