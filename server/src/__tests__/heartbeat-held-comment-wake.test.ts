@@ -393,13 +393,17 @@ describePostgres("saved intents while another run's accounting is pending", () =
       contextSnapshot: { issueId: task.id, taskId: task.id, commentId: comment.id, wakeCommentId: comment.id,
         source: "issue.comment", wakeReason: "issue_commented" },
       requestedByActorType: "user", requestedByActorId: f.userId })).rejects.toMatchObject({ status: 409 });
+    // The pause saves the message as the task's one deferred intent.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
-      .filter(wake => wake.status === "deferred_issue_execution" && (wake.payload as { issueId?: string }).issueId === task.id)).toEqual([]);
+      .filter(wake => wake.status === "deferred_issue_execution" && (wake.payload as { issueId?: string }).issueId === task.id))
+      .toHaveLength(1);
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    // Stranded-work recovery and the saved intent both see the task; it starts once.
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
-    await heartbeat.drainActiveRunExecutions();
+    await settle(f); await settle(f);
     const started = (await issueRuns({ companyId: f.companyId, issueId: task.id })).filter(run => run.startedAt);
     expect(started).toHaveLength(1);
+    expect(deliveries(comment.id)).toHaveLength(1);
   }, 180_000);
 
   // Chaos s9401/t69: a restart landed between the comment commit (which

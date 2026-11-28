@@ -68,6 +68,7 @@ import {
   workspaceLoginHandoffFailureStatus,
 } from "../services/workspace-login-handoff-issuer.js";
 import { conflict, unprocessable } from "../errors.js";
+import { logWakeError } from "../services/deferred-execution-wait.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -1172,8 +1173,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           rescueRef: result.rescueRef?.branchName ?? null,
         },
       }).catch((err) =>
-        logger.warn(
-          { err, issueId: result.restoredSourceIssue?.id, agentId: result.restoredSourceIssue?.assigneeAgentId },
+        logWakeError(logger, err,
+          { issueId: result.restoredSourceIssue?.id, agentId: result.restoredSourceIssue?.assigneeAgentId },
           "failed to wake agent after execution workspace quarantine restore",
         ));
     }

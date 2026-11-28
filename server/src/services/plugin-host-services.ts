@@ -108,6 +108,7 @@ import {
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumentation.js";
+import { logWakeError } from "./deferred-execution-wait.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -1199,8 +1200,7 @@ export function buildHostServices(
         wakeReason: "issue_commented",
         source: `plugin:${pluginKey}`,
       },
-    }).catch((err) => logger.warn({
-      err,
+    }).catch((err) => logWakeError(logger, err, {
       issueId: issue.id,
       interactionId: interaction.id,
       agentId: issue.assigneeAgentId,
@@ -2823,8 +2823,7 @@ export function buildHostServices(
                 wakeReason: "issue_commented",
                 source: `plugin:${pluginKey}`,
               },
-            }).catch((err) => logger.warn({
-              err,
+            }).catch((err) => logWakeError(logger, err, {
               issueId: issue.id,
               commentId: comment.id,
               agentId: postCommentIssue.assigneeAgentId,
@@ -3085,8 +3084,7 @@ export function buildHostServices(
               approvalStatus: approval.status,
               wakeReason: params.action === "approve" ? "approval_approved" : "approval_rejected",
             },
-          }).catch((err) => logger.warn({
-            err,
+          }).catch((err) => logWakeError(logger, err, {
             approvalId: approval.id,
             requestedByAgentId: approval.requestedByAgentId,
           }, "failed to wake requester on plugin-relayed approval decision"));
