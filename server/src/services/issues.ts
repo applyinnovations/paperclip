@@ -11287,6 +11287,12 @@ export function issueService(db: Db) {
         /** Server-owned transfer being applied; never accepted from HTTP input. */
         caseHandoffId?: string;
         actorRunStopId?: string | null;
+        /**
+         * Server-owned: the actor run is handing this issue to an execution
+         * stage participant and keeps running. Its later writes to the issue
+         * are refused. Never accepted from HTTP input.
+         */
+        actorRunHandsOffIssue?: boolean;
         actorUserId?: string | null;
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
@@ -11379,6 +11385,7 @@ export function issueService(db: Db) {
         actorRunId,
         caseHandoffId,
         actorRunStopId,
+        actorRunHandsOffIssue,
         actorUserId,
         companyGuard,
         workspaceSelectionActor,
@@ -12006,6 +12013,15 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (actorRunHandsOffIssue && actorAgentId && actorRunId && updated.assigneeAgentId !== actorAgentId) {
+          // Fence the outgoing run in the same commit that moves ownership,
+          // so no later write from it can land on the participant's issue.
+          await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ issueHandoffIssueId: updated.id })}::jsonb`,
+            updatedAt: new Date(),
+          }).where(and(eq(heartbeatRuns.companyId, updated.companyId), eq(heartbeatRuns.id, actorRunId),
+            eq(heartbeatRuns.agentId, actorAgentId)));
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });

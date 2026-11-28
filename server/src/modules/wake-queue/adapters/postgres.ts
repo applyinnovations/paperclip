@@ -1297,9 +1297,15 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // A deliberate stop does not promote the stopped agent's queued work.
         // When a reassignment committed while that stop was still settling, the
         // new assignee's wake parked behind this run; it is explicit new work
-        // and must run now, or the task is left with no run at all.
+        // and must run now, or the task is left with no run at all. The same
+        // holds when the stopped run had started provider work: reconciling
+        // that run's actions is the previous owner's hold, not a reason to
+        // strand another agent's work. A recorded hold on the issue still
+        // gates the handoff through the execution blocker check below, and the
+        // hold's delivery wakes the stage participant once it is reconciled.
         const handoffAssigneeAgentId = preDrain.kind === "released" &&
-          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false }).kind === "proceed" &&
+          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false,
+            legacyExecutionNeedsReconciliation: false }).kind === "proceed" &&
           issueRow?.assigneeAgentId && !issueRow.assigneeUserId && issueRow.assigneeAgentId !== run.agentId
           ? issueRow.assigneeAgentId : undefined;
 

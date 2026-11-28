@@ -338,9 +338,19 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
+      // The stopped run's owner may have handed the task to an execution
+      // stage before the hold was reconciled. That participant's stage wake
+      // was parked behind this hold, so deliver it to them instead.
+      const stage = task?.status === "in_review" && !task.assigneeUserId
+        ? parseIssueExecutionState(task.executionState) : null;
+      const stageParticipantAgentId = task && stage?.status === "pending" &&
+        stage.currentParticipant?.type === "agent" &&
+        stage.currentParticipant.agentId === task.assigneeAgentId &&
+        task.assigneeAgentId !== action.returnOwnerAgentId
+        ? task.assigneeAgentId : null;
       if (
         !task ||
-        task.assigneeAgentId !== action.returnOwnerAgentId ||
+        (task.assigneeAgentId !== action.returnOwnerAgentId && !stageParticipantAgentId) ||
         ["done", "cancelled"].includes(task.status)
       ) {
         await db
@@ -349,6 +359,55 @@ export async function deliverReconciledExecutions(
             evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
           })
           .where(pendingDecision);
+        continue;
+      }
+      if (stageParticipantAgentId && stage) {
+        const reason = stage.currentStageType === "approval"
+          ? "execution_approval_requested" : "execution_review_requested";
+        const executionStage = {
+          wakeRole: stage.currentStageType === "approval" ? "approver" : "reviewer",
+          stageId: stage.currentStageId,
+          stageType: stage.currentStageType,
+          currentParticipant: stage.currentParticipant,
+          returnAssignee: stage.returnAssignee,
+          reviewRequest: stage.reviewRequest ?? null,
+          lastDecisionOutcome: stage.lastDecisionOutcome,
+          allowedActions: ["approve", "request_changes"],
+        };
+        // A new participant's stage wake, not the owner's reconciled
+        // continuation: it must not use that continuation's receipt key.
+        const stageRun = await wake(stageParticipantAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason,
+          idempotencyKey: `execution-stage-after-reconciliation:${action.id}`,
+          payload: { issueId: task.id, mutation: "update", executionStage, reconciledRecoveryActionId: action.id },
+          requestedByActorType: "system",
+          requestedByActorId: "execution-recovery",
+          contextSnapshot: {
+            issueId: task.id,
+            taskId: task.id,
+            wakeReason: reason,
+            source: "issue.execution_stage",
+            executionStage,
+            reconciledRecoveryActionId: action.id,
+          },
+        });
+        if (stageRun) {
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+              continuationDelivery: "delivered",
+              continuationRunId: stageRun.id,
+            })}::jsonb`,
+          }).where(pendingDecision);
+        } else {
+          // Leave the delivery pending so the next delivery pass retries it,
+          // and say why the participant has not started yet.
+          logger.warn(
+            { recoveryActionId: action.id, issueId: task.id, agentId: stageParticipantAgentId },
+            "Reconciled execution stage wake was not admitted; delivery remains pending",
+          );
+        }
         continue;
       }
       const run = await wake(action.returnOwnerAgentId, {
