@@ -613,32 +613,6 @@ describeEmbeddedPostgres("authorization service", () => {
     }
   });
 
-  it("allows simple-mode task assignment between same-company agents without explicit grants", async () => {
-    const company = await createCompany(db, "AssignmentDefault");
-    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
-    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "agent",
-      principalId: actorAgent.id,
-      status: "active",
-      membershipRole: "member",
-    });
-
-    const decision = await authorizationService(db).decide({
-      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
-      action: "tasks:assign",
-      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
-      scope: { assigneeAgentId: targetAgent.id },
-    });
-
-    expect(decision).toMatchObject({
-      allowed: true,
-      reason: "allow_visible_issue_write",
-    });
-    expect(decision.explanation).toContain("shared default-open");
-  });
-
   it("allows standard-trust agents to comment on and update visible peer-owned issues", async () => {
     const company = await createCompany(db, "DefaultOpenPeerWrites");
     const actorAgent = await createAgent(db, company.id);
@@ -1452,6 +1426,131 @@ describeEmbeddedPostgres("authorization service", () => {
         allowed: true,
         reason: "allow_visible_issue_write",
       });
+    });
+  });
+
+  describe("agents holding neither tasks:assign nor tasks:assign_scope cannot assign (APP-786)", () => {
+    const protectedPolicy = { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } };
+    const privatePolicy = {
+      authorizationPolicy: {
+        agentVisibility: { mode: "private", hiddenFromDefaultDirectory: true },
+        assignmentPolicy: { mode: "company_default", protectedAgentRequiresApproval: false },
+        protectedAgent: { requiresApproval: false },
+        managedBy: "permissions-extension",
+      },
+    };
+
+    async function assign(
+      companyId: string,
+      actorAgentId: string,
+      targetAgentId: string,
+      options: { issueId?: string; parentIssueId?: string } = {},
+    ) {
+      return authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId, source: "agent_key" },
+        action: "tasks:assign",
+        resource: {
+          type: "issue",
+          companyId,
+          issueId: options.issueId ?? null,
+          parentIssueId: options.parentIssueId ?? null,
+          assigneeAgentId: targetAgentId,
+        },
+        scope: { issueId: options.issueId ?? null, parentIssueId: options.parentIssueId ?? null, assigneeAgentId: targetAgentId },
+      });
+    }
+
+    async function activeMemberWithoutGrants(companyId: string) {
+      const agent = await createAgent(db, companyId);
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "agent",
+        principalId: agent.id,
+        status: "active",
+        membershipRole: "member",
+      });
+      return agent;
+    }
+
+    async function revokeAgentGrant(companyId: string, agentId: string, permissionKey: PermissionKey) {
+      await db.delete(principalPermissionGrants).where(and(
+        eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, agentId),
+        eq(principalPermissionGrants.permissionKey, permissionKey),
+      ));
+    }
+
+    it("denies unprotected, protected and private targets with a missing-grant reason", async () => {
+      const company = await createCompany(db, "NoAssignGrant");
+      const actorAgent = await activeMemberWithoutGrants(company.id);
+      const unprotected = await createAgent(db, company.id);
+      const protectedTarget = await createAgent(db, company.id, { permissions: protectedPolicy });
+      const privateTarget = await createAgent(db, company.id, { permissions: privatePolicy });
+
+      const denied = await assign(company.id, actorAgent.id, unprotected.id);
+      expect(denied).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+      expect(denied.explanation).toContain("neither tasks:assign nor tasks:assign_scope");
+      expect(await assign(company.id, actorAgent.id, protectedTarget.id)).toMatchObject({ allowed: false });
+      expect(await assign(company.id, actorAgent.id, privateTarget.id)).toMatchObject({ allowed: false });
+    });
+
+    it("denies creating a child, reassigning and claiming an issue for itself", async () => {
+      const company = await createCompany(db, "NoAssignGrantFlows");
+      const actorAgent = await activeMemberWithoutGrants(company.id);
+      const other = await createAgent(db, company.id);
+      const parent = await createIssue(db, company.id, { title: "Parent", assigneeAgentId: actorAgent.id });
+      const unassigned = await createIssue(db, company.id, { title: "Unassigned" });
+
+      // create-with-assignee: a new child under a visible parent
+      expect(await assign(company.id, actorAgent.id, other.id, { parentIssueId: parent.id })).toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+      // ordinary reassignment of its own issue
+      expect(await assign(company.id, actorAgent.id, other.id, { issueId: parent.id })).toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+      // checkout of an issue not assigned to the agent asks to assign it to itself
+      expect(await assign(company.id, actorAgent.id, actorAgent.id, { issueId: unassigned.id })).toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+    });
+
+    it("revokes assignment when the last grant is removed instead of broadening it", async () => {
+      const company = await createCompany(db, "RemoveLastAssignGrant");
+      const actorAgent = await createAgent(db, company.id);
+      const inScope = await createAgent(db, company.id);
+      const outOfScope = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign_scope", {
+        assigneeAgentIds: [inScope.id],
+      });
+
+      expect(await assign(company.id, actorAgent.id, inScope.id)).toMatchObject({ allowed: true });
+      expect(await assign(company.id, actorAgent.id, outOfScope.id)).toMatchObject({ allowed: false, reason: "deny_scope" });
+
+      await revokeAgentGrant(company.id, actorAgent.id, "tasks:assign_scope");
+
+      expect(await assign(company.id, actorAgent.id, inScope.id)).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+      expect(await assign(company.id, actorAgent.id, outOfScope.id)).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+
+    it("keeps broad tasks:assign holders default-open, and denies them once it is revoked", async () => {
+      const company = await createCompany(db, "BroadAssignGrant");
+      const actorAgent = await createAgent(db, company.id);
+      const other = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+      expect(await assign(company.id, actorAgent.id, other.id)).toMatchObject({
+        allowed: true,
+        reason: "allow_visible_issue_write",
+      });
+
+      await revokeAgentGrant(company.id, actorAgent.id, "tasks:assign");
+
+      expect(await assign(company.id, actorAgent.id, other.id)).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
     });
   });
 

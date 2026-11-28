@@ -2232,8 +2232,28 @@ describe("agent permission routes", () => {
     expect(res.body.access.taskAssignSource).toBe("explicit_grant");
   }, 15_000);
 
-  it("reports simple-mode task assignment as enabled for active company agent members", async () => {
+  it("reports task assignment as disabled for an active agent with neither assignment grant", async () => {
     mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.access.canAssignTasks).toBe(false);
+    expect(res.body.access.taskAssignSource).toBe("none");
+  }, 15_000);
+
+  it("reports scoped task assignment as enabled for active agents holding only tasks:assign_scope", async () => {
+    mockAccessService.listPrincipalGrants.mockResolvedValue([
+      { permissionKey: "tasks:assign_scope", scope: { subtreeRootAgentId: agentId } },
+    ]);
 
     const app = await createApp({
       type: "board",
