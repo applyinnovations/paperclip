@@ -25,12 +25,15 @@ if $fhs_ci; then
     ln -s "$XLAB_GLIBC/lib/ld-linux-x86-64.so.2" "$loader"
   fi
   # Tests start children with PATH=/usr/bin:/bin (git, bash, getconf, ps...).
+  # Not `name`: nix develop exports it (a derivation attribute), so assigning
+  # it here would export the last binary's name to every child (CI saw
+  # name=test).
   IFS=: read -ra path_dirs <<<"$PATH"
   for dir in "${path_dirs[@]}"; do
     case $dir in /nix/store/*) ;; *) continue ;; esac
     for bin in "$dir"/*; do
-      name=${bin##*/}
-      if [ -x "$bin" ] && [ ! -e "/usr/bin/$name" ]; then ln -s "$bin" "/usr/bin/$name"; fi
+      bin_name=${bin##*/}
+      if [ -x "$bin" ] && [ ! -e "/usr/bin/$bin_name" ]; then ln -s "$bin" "/usr/bin/$bin_name"; fi
     done
   done
 fi
@@ -49,9 +52,17 @@ step install pnpm install --frozen-lockfile
 step typecheck pnpm -r typecheck
 step build pnpm build
 
-# The tests run as this user when the script runs as root: embedded Postgres
+# The tests run without the compiler variables the Nix shell exports (AR=ar,
+# CC=gcc, ...) or its derivation attributes (name, outputs=out,
+# NIX_BUILD_CORES=<cores>, IN_NIX_SHELL, SOURCE_DATE_EPOCH). Ubuntu sets none,
+# and the run-failure redactor masks short host values as whole tokens in
+# unrelated text: "recovery.test.ts" and "@types+node@24.x" in stacks.
+# test-env-guard.mjs fails the run if such a value comes back.
+as_test_user=(env -u AR -u AS -u CC -u CXX -u LD -u NM -u OBJCOPY -u OBJDUMP
+  -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP
+  -u name -u outputs -u NIX_BUILD_CORES -u IN_NIX_SHELL -u SOURCE_DATE_EPOCH)
+# They run as this user when the script runs as root: embedded Postgres
 # refuses root, and file-mode and ownership checks differ under root.
-as_test_user=()
 if $fhs_ci; then
   # Embedded Postgres' bundled ICU needs the distribution's libstdc++; its
   # binaries search their own lib directory ($ORIGIN/../lib) first.
@@ -74,10 +85,7 @@ if $fhs_ci; then
   # Root still reads the checkout below (git diff for pull requests).
   git config --global --add safe.directory "$PWD"
   # tini -s reaps orphaned test children, as an init would; nothing in the
-  # step does, and some tests wait for a killed child to disappear. The
-  # tests also run without the compiler variables the Nix shell exports
-  # (AR=ar, CC=gcc, ...): Ubuntu sets none, and the redactor masks their
-  # short values inside unrelated strings.
+  # step does, and some tests wait for a killed child to disappear.
   # nix-v1 mounts its scratch volume at /tmp, so the tests' temporary
   # directories sit on a different filesystem from /. Git then stops its
   # repository search at /tmp and reports "not a git repository (or any
@@ -85,11 +93,12 @@ if $fhs_ci; then
   # directories)", which the server matches to recognise a plain directory.
   # Upstream's /tmp is on the root filesystem; let Git search across mounts
   # as it would there.
-  as_test_user=(env -u AR -u AS -u CC -u CXX -u LD -u NM -u OBJCOPY -u OBJDUMP
-    -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP
-    HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+  as_test_user+=(HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
 fi
+# Every pull request, whichever tests it selects: the stack assertions that
+# catch this only run when their file changes.
+step test-env "${as_test_user[@]}" node .xlab/test-env-guard.mjs
 # Pull requests run the test files they add or change. Import-graph selection
 # (vitest --changed) still picks most of the suite for any server change, and
 # the full suite takes about 2 hours, so it runs weekly from
