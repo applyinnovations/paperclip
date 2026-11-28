@@ -68,6 +68,7 @@ const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   listPrincipalGrants: vi.fn(),
   setPrincipalPermission: vi.fn(),
+  changePrincipalGrantsAudited: vi.fn(),
 }));
 
 const mockApprovalService = vi.hoisted(() => ({
@@ -211,6 +212,7 @@ function registerModuleMocks() {
 
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
+    publishActivity: vi.fn(),
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
@@ -330,6 +332,7 @@ describe("agent permission routes", () => {
     mockAccessService.ensureMembership.mockReset();
     mockAccessService.listPrincipalGrants.mockReset();
     mockAccessService.setPrincipalPermission.mockReset();
+    mockAccessService.changePrincipalGrantsAudited.mockReset();
     mockApprovalService.create.mockReset();
     mockApprovalService.getById.mockReset();
     mockApprovalService.findOpenHireApprovalForAgent.mockReset();
@@ -398,6 +401,27 @@ describe("agent permission routes", () => {
     mockAccessService.listPrincipalGrants.mockResolvedValue([]);
     mockAccessService.ensureMembership.mockResolvedValue(undefined);
     mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
+    // Stands in for the service's transaction and grant lock: changes run one
+    // at a time and record sees that change's own before and after.
+    let grantLock: Promise<unknown> = Promise.resolve();
+    mockAccessService.changePrincipalGrantsAudited.mockImplementation(async (
+      companyIdArg: string,
+      principalType: string,
+      principalId: string,
+      change: (scoped: typeof mockAccessService, tx: unknown) => Promise<unknown>,
+      record: (input: { tx: unknown; result: unknown; before: unknown[]; after: unknown[] }) => Promise<void>,
+    ) => {
+      const run = grantLock.then(async () => {
+        const tx = {};
+        const before = await mockAccessService.listPrincipalGrants(companyIdArg, principalType, principalId);
+        const result = await change(mockAccessService, tx);
+        const after = await mockAccessService.listPrincipalGrants(companyIdArg, principalType, principalId);
+        await record({ tx, result, before, after });
+        return result;
+      });
+      grantLock = run.catch(() => undefined);
+      return run;
+    });
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockImplementation(async (_companyId, requested) => requested);
     mockBudgetService.upsertPolicy.mockResolvedValue(undefined);
@@ -2434,6 +2458,135 @@ describe("agent permission routes", () => {
       inboxArchivedByUserId: "board-user",
       status: "backlog,todo,in_progress,in_review,blocked,done",
       limit: 500,
+    });
+  });
+
+  describe("permission grant audit", () => {
+    type TestGrant = { permissionKey: string; scope: Record<string, unknown> | null };
+    let grants: TestGrant[];
+    const board = {
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    };
+
+    beforeEach(() => {
+      grants = [];
+      mockAccessService.listPrincipalGrants.mockImplementation(async () =>
+        [...grants].sort((a, b) => a.permissionKey.localeCompare(b.permissionKey)));
+      mockAccessService.setPrincipalPermission.mockImplementation(
+        async (_companyId: string, _type: string, _id: string, key: string, enabled: boolean) => {
+          grants = grants.filter((grant) => grant.permissionKey !== key);
+          if (enabled) grants.push({ permissionKey: key, scope: null });
+        },
+      );
+    });
+
+    function activityCalls(action: string) {
+      return mockLogActivity.mock.calls.map((call) => call[1]).filter((entry) => entry.action === action);
+    }
+
+    async function patchPermissions(body: Record<string, unknown>) {
+      const res = await requestApp(createApp(board), (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send(body));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    }
+
+    it("records before and after grants when tasks:assign is added", async () => {
+      grants = [{ permissionKey: "agents:read", scope: null }];
+
+      await patchPermissions({ canCreateAgents: false, canAssignTasks: true });
+
+      const [entry] = activityCalls("agent.permissions_updated");
+      expect(entry.details).toMatchObject({
+        canAssignTasks: true,
+        before: { permissionKeys: ["agents:read"], assignScope: null },
+        after: { permissionKeys: ["agents:read", "tasks:assign"], assignScope: { "tasks:assign": null } },
+      });
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(0);
+    });
+
+    it("records the assignment-grant removal once, and not again on a later update", async () => {
+      grants = [{ permissionKey: "tasks:assign", scope: null }];
+
+      await patchPermissions({ canCreateAgents: false, canAssignTasks: false });
+
+      const [entry] = activityCalls("agent.permissions_updated");
+      expect(entry.details).toMatchObject({
+        before: { permissionKeys: ["tasks:assign"], assignScope: { "tasks:assign": null } },
+        after: { permissionKeys: [], assignScope: null },
+      });
+      const removed = activityCalls("agent.assignment_grants_removed");
+      expect(removed).toEqual([{
+        companyId,
+        actorType: "user",
+        actorId: "board-user",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "agent.assignment_grants_removed",
+        entityType: "agent",
+        entityId: agentId,
+        details: {
+          before: entry.details.before,
+          after: entry.details.after,
+          sourceAction: "agent.permissions_updated",
+        },
+      }]);
+      expect(entry).toMatchObject({ actorType: removed[0].actorType, actorId: removed[0].actorId });
+
+      mockLogActivity.mockClear();
+      await patchPermissions({ canCreateAgents: false, canAssignTasks: false });
+      await patchPermissions({ canCreateAgents: false, canCreateSkills: false, canAssignTasks: false });
+      expect(activityCalls("agent.permissions_updated")).toHaveLength(2);
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(0);
+    });
+
+    it("records one removal for overlapping requests that remove the last assignment grant", async () => {
+      grants = [{ permissionKey: "tasks:assign", scope: null }];
+
+      await Promise.all([
+        patchPermissions({ canCreateAgents: false, canAssignTasks: false }),
+        patchPermissions({ canCreateAgents: false, canAssignTasks: false }),
+      ]);
+
+      const updates = activityCalls("agent.permissions_updated");
+      expect(updates.map((entry) => entry.details.before.permissionKeys)).toEqual([["tasks:assign"], []]);
+      expect(updates.map((entry) => entry.details.after.permissionKeys)).toEqual([[], []]);
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(1);
+      expect(mockAccessService.changePrincipalGrantsAudited).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not record a removal while tasks:assign_scope remains", async () => {
+      grants = [
+        { permissionKey: "tasks:assign", scope: null },
+        { permissionKey: "tasks:assign_scope", scope: { subtreeRootAgentId: agentId, note: "dropped" } },
+      ];
+
+      await patchPermissions({ canCreateAgents: false, canAssignTasks: false });
+
+      const [entry] = activityCalls("agent.permissions_updated");
+      expect(entry.details.after).toEqual({
+        permissionKeys: ["tasks:assign_scope"],
+        assignScope: {
+          "tasks:assign_scope": { projectIds: [], agentIds: [], userIds: [], subtreeRootAgentIds: [agentId] },
+        },
+      });
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(0);
+    });
+
+    it.each(["pending_approval", "terminated"])("does not record a removal for a %s agent", async (status) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, status });
+      mockAgentService.updatePermissions.mockResolvedValue({ ...baseAgent, status });
+      grants = [{ permissionKey: "tasks:assign", scope: null }];
+
+      await patchPermissions({ canCreateAgents: false, canAssignTasks: false });
+
+      expect(activityCalls("agent.permissions_updated")[0].details.after).toEqual({ permissionKeys: [], assignScope: null });
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(0);
     });
   });
 

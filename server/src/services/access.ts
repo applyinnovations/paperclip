@@ -490,17 +490,115 @@ export function accessService(db: Db) {
       .orderBy(sql`${companyMemberships.createdAt} asc`);
   }
 
+  type GrantTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+  type PrincipalGrantRow = typeof principalPermissionGrants.$inferSelect;
+
+  /**
+   * Serializes grant writers for one principal. Take it first in the
+   * transaction, before any membership row lock, so every writer locks in the
+   * same order. The lock is held until the transaction ends and is reentrant
+   * for the same transaction.
+   */
+  async function lockPrincipalGrants(
+    tx: GrantTx,
+    companyId: string,
+    principalType: string,
+    principalId: string,
+  ) {
+    const key = `paperclip:principal-grants:${companyId}:${principalType}:${principalId}`;
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+  }
+
+  /**
+   * Takes the principal grant lock for a membership. A membership's principal
+   * never changes, so an unlocked read is enough to find it.
+   */
+  async function lockMemberPrincipalGrants(tx: GrantTx, companyId: string, memberId: string) {
+    const principal = await tx.select({
+      principalType: companyMemberships.principalType,
+      principalId: companyMemberships.principalId,
+    }).from(companyMemberships)
+      .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+      .then(rows => rows[0] ?? null);
+    if (principal) await lockPrincipalGrants(tx, companyId, principal.principalType, principal.principalId);
+    return principal;
+  }
+
+  async function readPrincipalGrants(
+    tx: GrantTx,
+    companyId: string,
+    principalType: string,
+    principalId: string,
+  ): Promise<PrincipalGrantRow[]> {
+    return tx
+      .select()
+      .from(principalPermissionGrants)
+      .where(
+        and(
+          eq(principalPermissionGrants.companyId, companyId),
+          eq(principalPermissionGrants.principalType, principalType),
+          eq(principalPermissionGrants.principalId, principalId),
+        ),
+      )
+      .orderBy(principalPermissionGrants.permissionKey);
+  }
+
+  /** Grant writers bound to the audited change's transaction. */
+  type PrincipalGrantWriters = {
+    ensureMembership: typeof ensureMembership;
+    setPrincipalPermission: typeof setPrincipalPermission;
+    setPrincipalGrants: typeof setPrincipalGrants;
+  };
+
+  /**
+   * Runs a grant change for one principal under the principal grant lock and
+   * hands its own before and after grants to `record` in the same
+   * transaction. Concurrent writers for the principal wait, so the snapshots
+   * describe only this change. `change` receives an access service bound to
+   * the transaction; use it for every write. Write audit entries in `record`
+   * with the given `tx`.
+   */
+  async function changePrincipalGrantsAudited<T>(
+    companyId: string,
+    principalType: PrincipalType,
+    principalId: string,
+    change: (scoped: PrincipalGrantWriters, tx: GrantTx) => Promise<T>,
+    record: (input: { tx: GrantTx; result: T; before: PrincipalGrantRow[]; after: PrincipalGrantRow[] }) => Promise<void>,
+  ): Promise<T> {
+    return db.transaction(async (tx) => {
+      await lockPrincipalGrants(tx, companyId, principalType, principalId);
+      const before = await readPrincipalGrants(tx, companyId, principalType, principalId);
+      const scoped = accessService(tx as unknown as Db);
+      const result = await change({
+        ensureMembership: scoped.ensureMembership,
+        setPrincipalPermission: scoped.setPrincipalPermission,
+        setPrincipalGrants: scoped.setPrincipalGrants,
+      }, tx);
+      const after = await readPrincipalGrants(tx, companyId, principalType, principalId);
+      await record({ tx, result, before, after });
+      return result;
+    });
+  }
+
   async function setMemberPermissions(
     companyId: string,
     memberId: string,
     grants: GrantInput[],
     grantedByUserId: string | null,
+    audit?: (input: {
+      tx: GrantTx;
+      member: typeof companyMemberships.$inferSelect;
+      before: PrincipalGrantRow[];
+      after: PrincipalGrantRow[];
+    }) => Promise<void>,
   ) {
     return db.transaction(async (tx) => {
+      if (!(await lockMemberPrincipalGrants(tx, companyId, memberId))) return null;
       const member = await tx.select().from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .for("update").then(rows => rows[0] ?? null);
       if (!member) return null;
+      const before = audit ? await readPrincipalGrants(tx, companyId, member.principalType, member.principalId) : [];
       await tx
         .delete(principalPermissionGrants)
         .where(
@@ -524,6 +622,10 @@ export function accessService(db: Db) {
           })),
         );
       }
+      if (audit) {
+        const after = await readPrincipalGrants(tx, companyId, member.principalType, member.principalId);
+        await audit({ tx, member, before, after });
+      }
       return member;
     });
   }
@@ -539,6 +641,7 @@ export function accessService(db: Db) {
     grantedByUserId: string | null,
   ) {
     return memberAccessTransaction(async (tx) => {
+      await lockMemberPrincipalGrants(tx, companyId, memberId);
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
@@ -701,6 +804,7 @@ export function accessService(db: Db) {
 
   async function archiveMember(companyId: string, memberId: string, input: MemberArchiveInput = {}) {
     return memberAccessTransaction(async (tx) => {
+      await lockMemberPrincipalGrants(tx, companyId, memberId);
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
@@ -996,6 +1100,7 @@ export function accessService(db: Db) {
     grantedByUserId: string | null,
   ) {
     await db.transaction(async (tx) => {
+      await lockPrincipalGrants(tx, companyId, principalType, principalId);
       await tx
         .delete(principalPermissionGrants)
         .where(
@@ -1082,9 +1187,27 @@ export function accessService(db: Db) {
     grantedByUserId: string | null,
     scope: Record<string, unknown> | null = null,
   ) {
-    if (!enabled) {
-      await db
-        .delete(principalPermissionGrants)
+    await db.transaction(async (tx) => {
+      await lockPrincipalGrants(tx, companyId, principalType, principalId);
+      if (!enabled) {
+        await tx
+          .delete(principalPermissionGrants)
+          .where(
+            and(
+              eq(principalPermissionGrants.companyId, companyId),
+              eq(principalPermissionGrants.principalType, principalType),
+              eq(principalPermissionGrants.principalId, principalId),
+              eq(principalPermissionGrants.permissionKey, permissionKey),
+            ),
+          );
+        return;
+      }
+
+      await accessService(tx as unknown as Db).ensureMembership(companyId, principalType, principalId, "member", "active");
+
+      const existing = await tx
+        .select()
+        .from(principalPermissionGrants)
         .where(
           and(
             eq(principalPermissionGrants.companyId, companyId),
@@ -1092,46 +1215,31 @@ export function accessService(db: Db) {
             eq(principalPermissionGrants.principalId, principalId),
             eq(principalPermissionGrants.permissionKey, permissionKey),
           ),
-        );
-      return;
-    }
+        )
+        .then((rows) => rows[0] ?? null);
 
-    await ensureMembership(companyId, principalType, principalId, "member", "active");
+      if (existing) {
+        await tx
+          .update(principalPermissionGrants)
+          .set({
+            scope,
+            grantedByUserId,
+            updatedAt: new Date(),
+          })
+          .where(eq(principalPermissionGrants.id, existing.id));
+        return;
+      }
 
-    const existing = await db
-      .select()
-      .from(principalPermissionGrants)
-      .where(
-        and(
-          eq(principalPermissionGrants.companyId, companyId),
-          eq(principalPermissionGrants.principalType, principalType),
-          eq(principalPermissionGrants.principalId, principalId),
-          eq(principalPermissionGrants.permissionKey, permissionKey),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-
-    if (existing) {
-      await db
-        .update(principalPermissionGrants)
-        .set({
-          scope,
-          grantedByUserId,
-          updatedAt: new Date(),
-        })
-        .where(eq(principalPermissionGrants.id, existing.id));
-      return;
-    }
-
-    await db.insert(principalPermissionGrants).values({
-      companyId,
-      principalType,
-      principalId,
-      permissionKey,
-      scope,
-      grantedByUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      await tx.insert(principalPermissionGrants).values({
+        companyId,
+        principalType,
+        principalId,
+        permissionKey,
+        scope,
+        grantedByUserId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
     });
   }
 
@@ -1244,6 +1352,7 @@ export function accessService(db: Db) {
     setPrincipalGrants,
     listPrincipalGrants,
     setPrincipalPermission,
+    changePrincipalGrantsAudited,
     updateMember,
   };
 }
