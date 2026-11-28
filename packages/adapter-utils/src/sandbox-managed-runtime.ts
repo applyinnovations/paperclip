@@ -334,6 +334,20 @@ async function delay(ms: number): Promise<void> {
  */
 const WORKSPACE_RESTORE_RETRY_DELAYS_MS = [2_000, 5_000] as const;
 
+// Upper bound for each post-run restore command (git export, checkpoint capture,
+// workspace tarball). 10 minutes is ~20x the slowest healthy git export we see on
+// the largest workspace, so it only fires on a stuck or dead sandbox. These
+// commands used to inherit the whole run budget (`spec.timeoutMs`, often 60
+// minutes), so one stuck export could burn an hour after the agent finished
+// (APP-762).
+export const POST_RUN_RESTORE_COMMAND_TIMEOUT_MS = 10 * 60_000;
+
+export function postRunRestoreCommandTimeoutMs(runTimeoutMs: number): number {
+  return Number.isFinite(runTimeoutMs) && runTimeoutMs > 0
+    ? Math.min(runTimeoutMs, POST_RUN_RESTORE_COMMAND_TIMEOUT_MS)
+    : POST_RUN_RESTORE_COMMAND_TIMEOUT_MS;
+}
+
 /**
  * Retry a copy-back attempt only while it has written nothing into the host
  * workspace. The baseline stays valid until then, so a fresh attempt is the
@@ -2102,7 +2116,7 @@ export async function prepareSandboxManagedRuntime(input: {
                           forceFullBundle,
                           shallowPath: forceFullBundle ? remoteShallowPath : undefined,
                         }))}`,
-                        { timeoutMs: input.spec.timeoutMs },
+                        { timeoutMs: postRunRestoreCommandTimeoutMs(input.spec.timeoutMs) },
                       );
                     } catch (error) {
                       // Restore the owned producer refusal across clients that
@@ -2220,7 +2234,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     try {
                       let captured = false;
                       try {
-                        await input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: input.spec.timeoutMs });
+                        await input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: postRunRestoreCommandTimeoutMs(input.spec.timeoutMs) });
                         captured = true;
                       } catch (error) {
                         if (!isCheckpointCaptureCapacityError(error)) throw error;
@@ -2286,7 +2300,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       archivePath: remoteWorkspaceTar,
                       exclude: workspaceRestoreExclude,
                     }))}`,
-                    { timeoutMs: input.spec.timeoutMs },
+                    { timeoutMs: postRunRestoreCommandTimeoutMs(input.spec.timeoutMs) },
                   ));
                   const workspaceRestore = makeTransferProgress(
                     restoreSink,

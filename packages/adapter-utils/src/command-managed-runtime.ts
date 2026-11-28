@@ -173,9 +173,37 @@ function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
 
 const FAILED_COMMAND_OUTPUT_TAIL_CHARS = 4_000;
 
+/**
+ * Render command output for an error message. Runner transports are typed as
+ * returning strings, but a provider bridge can still hand back a Buffer, an
+ * Error or a plain object (a WebSocket error event, a provider status body).
+ * `String(obj)` on those is `"[object Object]"`, which hid the real cause of
+ * APP-762, so every non-string shape is decoded explicitly here.
+ */
+export function describeCommandOutput(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
+  if (value instanceof Error) return value.message || value.name;
+  if (typeof value === "object") {
+    const message = (value as { message?: unknown }).message;
+    if (typeof message === "string" && message.length > 0) return message;
+    try {
+      const json = JSON.stringify(value);
+      if (typeof json === "string") return json;
+    } catch {
+      // Circular or otherwise unserializable; fall through.
+    }
+    const ctor = (value as { constructor?: { name?: unknown } }).constructor?.name;
+    return `<unserializable ${typeof ctor === "string" ? ctor : "object"}>`;
+  }
+  return String(value);
+}
+
 function formatFailedCommandOutput(result: RunProcessResult): string {
-  const tail = (text: string): string => {
-    const trimmed = text.trim();
+  const tail = (value: unknown): string => {
+    const trimmed = describeCommandOutput(value).trim();
     if (trimmed.length <= FAILED_COMMAND_OUTPUT_TAIL_CHARS) return trimmed;
     return `...[truncated]\n${trimmed.slice(-FAILED_COMMAND_OUTPUT_TAIL_CHARS)}`;
   };
@@ -187,10 +215,19 @@ function formatFailedCommandOutput(result: RunProcessResult): string {
   return parts.length > 0 ? `:\n${parts.join("\n")}` : "";
 }
 
-function requireSuccessfulResult(result: RunProcessResult, action: string): void {
+function describeCommandFailure(result: RunProcessResult, timeoutMs: number | undefined): string {
+  if (result.timedOut) {
+    return typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+      ? `timed out after ${timeoutMs}ms`
+      : "timed out";
+  }
+  return `failed with exit code ${result.exitCode ?? "null"}`;
+}
+
+export function requireSuccessfulResult(result: RunProcessResult, action: string, timeoutMs?: number): void {
   if (result.exitCode === 0 && !result.timedOut) return;
   const detail = formatFailedCommandOutput(result);
-  throw Object.assign(new Error(`${action} failed with exit code ${result.exitCode ?? "null"}${detail}`), {
+  throw Object.assign(new Error(`${action} ${describeCommandFailure(result, timeoutMs)}${detail}`), {
     exitCode: result.exitCode, timedOut: result.timedOut,
   });
 }
@@ -281,7 +318,7 @@ export function createCommandManagedRuntimeClient(input: {
       timeoutMs: opts.timeoutMs ?? input.timeoutMs,
       onLog: opts.onLog,
     });
-    requireSuccessfulResult(result, script);
+    requireSuccessfulResult(result, script, opts.timeoutMs ?? input.timeoutMs);
     return result;
   };
 
@@ -420,7 +457,7 @@ export function createCommandManagedRuntimeClient(input: {
         timeoutMs: input.timeoutMs,
         bypassSession: true,
       });
-      requireSuccessfulResult(result, `remove ${remotePath}`);
+      requireSuccessfulResult(result, `remove ${remotePath}`, input.timeoutMs);
     },
     run: async (command, options) => {
       const result = await input.runner.execute({
@@ -432,7 +469,7 @@ export function createCommandManagedRuntimeClient(input: {
         // persistent shell nor its separate, streamed output observations.
         bypassSession: true,
       });
-      requireSuccessfulResult(result, command);
+      requireSuccessfulResult(result, command, options.timeoutMs);
     },
   };
 
@@ -500,7 +537,7 @@ export function createCommandManagedRuntimeClient(input: {
             cwd: command.cwd ?? input.commandCwd,
             timeoutMs: command.timeoutMs ?? input.timeoutMs,
           });
-          requireSuccessfulResult(result, command.command);
+          requireSuccessfulResult(result, command.command, command.timeoutMs ?? input.timeoutMs);
         }
         resultOperations.push({
           operationId: operation.operationId,

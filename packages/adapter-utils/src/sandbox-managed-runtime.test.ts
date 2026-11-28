@@ -20,6 +20,8 @@ import {
   assertSyncOperationsConfined,
   escapeTarExcludeLiteral,
   mirrorDirectory,
+  POST_RUN_RESTORE_COMMAND_TIMEOUT_MS,
+  postRunRestoreCommandTimeoutMs,
   prepareSandboxManagedRuntime,
   REFERENCED_SOURCE_IGNORE_FAILURE_REASONS,
   resolveReferencedSourceIgnore,
@@ -4242,6 +4244,39 @@ describe("sandbox git-bundle export transport", () => {
       expect(directoryTransfers).toBe(1);
       expect(merge).toHaveBeenCalledTimes(1);
     } finally { vi.restoreAllMocks(); }
+  });
+
+  it("runs the post-run git export under its own bound, not the whole run budget (APP-762)", async () => {
+    const capture: TransportCapture = { syncOutOperations: [], readFilePaths: [] };
+    const { localWorkspaceDir, remoteWorkspaceDir } = await setupGitBackedWorkspace("paperclip-bundle-timeout-");
+    const client = makeTransportClient(true, capture);
+    const exportTimeouts: number[] = [];
+    const run = client.run.bind(client);
+    client.run = async (command, options) => {
+      if (command.includes("git-delta.bundle")) {
+        exportTimeouts.push(options.timeoutMs);
+        // A dead or stuck sandbox: the runner gives up at the timeout it was handed.
+        throw Object.assign(new Error(`git export timed out after ${options.timeoutMs}ms`), { exitCode: null, timedOut: true });
+      }
+      return run(command, options);
+    };
+    const runBudgetMs = 60 * 60_000;
+    const prepared = await prepareSandboxManagedRuntime({
+      ...sandboxRuntimeInput({ ...gitSpec(remoteWorkspaceDir), timeoutMs: runBudgetMs }, "test-adapter", client, localWorkspaceDir),
+      workspaceRestoreRetryDelaysMs: [0, 0],
+    });
+    await commitInSandbox(remoteWorkspaceDir);
+
+    await expect(prepared.restoreWorkspace()).rejects.toThrow(/timed out after 600000ms/);
+    expect(exportTimeouts.length).toBeGreaterThan(0);
+    expect(exportTimeouts.every((timeoutMs) => timeoutMs === POST_RUN_RESTORE_COMMAND_TIMEOUT_MS)).toBe(true);
+    expect(POST_RUN_RESTORE_COMMAND_TIMEOUT_MS).toBeLessThan(runBudgetMs);
+  });
+
+  it("never lets the post-run bound exceed a shorter run budget", () => {
+    expect(postRunRestoreCommandTimeoutMs(30_000)).toBe(30_000);
+    expect(postRunRestoreCommandTimeoutMs(60 * 60_000)).toBe(POST_RUN_RESTORE_COMMAND_TIMEOUT_MS);
+    expect(postRunRestoreCommandTimeoutMs(Number.NaN)).toBe(POST_RUN_RESTORE_COMMAND_TIMEOUT_MS);
   });
 
   it("moves the bundle through one native syncOut file mapping, never through readFile", async () => {

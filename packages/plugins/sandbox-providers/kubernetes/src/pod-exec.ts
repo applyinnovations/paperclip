@@ -23,6 +23,50 @@ import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
 
+/**
+ * Turn whatever the Kubernetes client rejected with into a readable message.
+ *
+ * `Exec.exec` rejects with a non-`Error` when the WebSocket upgrade fails: a
+ * `ws` `ErrorEvent` (`{ type, message, error, target }`) when the apiserver or
+ * pod is unreachable, or a `V1Status`-shaped body when the apiserver refuses
+ * the exec (for example a pod that is gone). `String(obj)` on either is
+ * `"[object Object]"`, which is how a dead sandbox used to surface as
+ * `stderr: [object Object]` (APP-762).
+ */
+export function describeExecError(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  if (typeof err === "string") return err;
+  if (Buffer.isBuffer(err)) return err.toString("utf8");
+  if (err && typeof err === "object") {
+    const record = err as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof record.type === "string" && record.type !== "error") parts.push(record.type);
+    if (typeof record.status === "string") parts.push(record.status);
+    if (typeof record.code === "number" || typeof record.code === "string") parts.push(`code ${String(record.code)}`);
+    if (typeof record.reason === "string" && record.reason.length > 0) parts.push(record.reason);
+    if (typeof record.message === "string" && record.message.length > 0) parts.push(record.message);
+    if (record.error instanceof Error && record.error.message && record.error.message !== record.message) {
+      parts.push(record.error.message);
+    }
+    if (parts.length > 0) return parts.join(": ");
+    try {
+      // Skip `target` (an ErrorEvent's WebSocket) so JSON never walks a socket.
+      const json = JSON.stringify(err, (key, value) => (key === "target" ? undefined : value));
+      if (json && json !== "{}") return json;
+    } catch {
+      // Circular or otherwise unserializable; fall through.
+    }
+    const ctor = (err as { constructor?: { name?: unknown } }).constructor?.name;
+    return `non-Error exec failure (${typeof ctor === "string" ? ctor : "object"})`;
+  }
+  return String(err);
+}
+
+/** Normalize a client rejection into an `Error` with a readable message. */
+export function toExecError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(describeExecError(err));
+}
+
 // Minimal WebSocket-like shape covering what we touch. The full type comes from
 // @kubernetes/client-node's transitive ws/isomorphic-ws dep but importing it
 // directly couples this file to that internal choice. `send`, `pause` and
@@ -319,7 +363,7 @@ export async function execInPod(
           // Belt-and-suspenders: even under an explicit cap (or with none set),
           // never let a `+=` RangeError at V8's max string length escape this
           // listener as an uncaught exception.
-          failClosed(err instanceof Error ? err : new Error(String(err)));
+          failClosed(toExecError(err));
         }
       });
 
@@ -340,7 +384,7 @@ export async function execInPod(
         try {
           stderrData += chunk.toString("utf-8");
         } catch (err) {
-          failClosed(err instanceof Error ? err : new Error(String(err)));
+          failClosed(toExecError(err));
         }
       });
 
@@ -383,7 +427,7 @@ export async function execInPod(
           if (resolved) return;
           resolved = true;
           if (watchdog) clearTimeout(watchdog);
-          reject(err);
+          reject(toExecError(err));
         });
     },
   );
@@ -542,7 +586,7 @@ export async function execInPodStreaming(
       try {
         stderrData += chunk.toString("utf-8");
       } catch (err) {
-        failClosed(err instanceof Error ? err : new Error(String(err)));
+        failClosed(toExecError(err));
       }
     });
     stderrStream.on("end", () => { stderrEnded = true; tryFinish(); });
@@ -578,7 +622,7 @@ export async function execInPodStreaming(
           // closed.
           stdinStream.removeAllListeners("end");
           pumpExecStdin(ws, io.stdin, () => resolved).catch((err: unknown) => {
-            failClosed(err instanceof Error ? err : new Error(String(err)));
+            failClosed(toExecError(err));
           });
         } else if (stdinStream) {
           stdinStream.removeAllListeners("end");
@@ -589,7 +633,7 @@ export async function execInPodStreaming(
         if (resolved) return;
         resolved = true;
         if (watchdog) clearTimeout(watchdog);
-        reject(err);
+        reject(toExecError(err));
       });
   });
 }
