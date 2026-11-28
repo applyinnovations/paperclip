@@ -174,6 +174,22 @@ describeEmbeddedPostgres("project workspace writes follow assignment grants (APP
     expect(await workspaceRow(outside.workspaceId)).toMatchObject({ name: "Original name" });
   });
 
+  it("keeps workspace writes for a new agent's default self-subtree grant", async () => {
+    // New agents get tasks:assign_scope { subtreeRootAgentId: self } (agent-permissions.ts).
+    // The route passes the actor as the assignee, so that default must keep
+    // allowing the agent's own workspace writes on unprotected projects.
+    const { companyId, agentId } = await seed("DefaultScope");
+    const { projectId, workspaceId } = await seedProject(companyId, "Unprotected");
+    await grant(companyId, agentId, "tasks:assign_scope", { subtreeRootAgentId: agentId });
+    const app = createApp(db, agentActor(companyId, agentId));
+
+    const update = await request(app)
+      .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+      .send({ name: "Renamed with default grant" });
+    expect(update.status, JSON.stringify(update.body)).toBe(200);
+    expect(await workspaceRow(workspaceId)).toMatchObject({ name: "Renamed with default grant" });
+  });
+
   it("keeps the responsible-user ceiling for agents that hold tasks:assign", async () => {
     const { companyId, agentId } = await seed("Ceiling");
     const { projectId, workspaceId } = await seedProject(companyId, "Unprotected");
