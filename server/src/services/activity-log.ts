@@ -25,6 +25,7 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
   issue_execution_decision_recorded: "issue.execution_decision.recorded",
+  issue_execution_decision_amended: "issue.execution_decision.amended",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
@@ -41,6 +42,18 @@ export function setPluginEventBus(bus: PluginEventBus): void {
     logger.warn("setPluginEventBus called more than once, replacing existing bus");
   }
   _pluginEventBus = bus;
+}
+
+/**
+ * Activity actions only the host's own code paths may write. Execution
+ * decision activity is read back as authority (a Reviewed-SHA attestation is
+ * its `issue.execution_decision_amended` row) and maps to plugin events the
+ * GitHub approval gate acts on, so generic writers (the board's
+ * `POST /companies/:id/activity`, plugin `ctx.activity.log`) must not be able
+ * to forge it.
+ */
+export function isReservedActivityAction(action: string): boolean {
+  return action.trim().toLowerCase().replaceAll(".", "_").startsWith("issue_execution_decision");
 }
 
 function eventTypeForActivityAction(action: string): PluginEventType | null {

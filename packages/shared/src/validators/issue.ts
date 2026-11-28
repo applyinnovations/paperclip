@@ -632,6 +632,18 @@ export const retryWorkspaceExportSchema = z.object({
   repairNote: z.string().trim().min(20).max(12000),
 }).strict();
 
+/**
+ * Body of `POST /api/issues/:id/execution-decisions/:decisionId/reviewed-sha`.
+ * The SHA is a full 40-character lowercase hex commit id, as
+ * `parseReviewedSha` accepts; the comment says why it is attested late.
+ */
+export const attestExecutionDecisionReviewedShaSchema = z.object({
+  reviewedSha: z.string().regex(/^[0-9a-f]{40}$/, "reviewedSha must be a full 40-character lowercase hex commit id"),
+  comment: z.string().trim().min(1).max(12000),
+}).strict();
+
+export type AttestExecutionDecisionReviewedSha = z.infer<typeof attestExecutionDecisionReviewedShaSchema>;
+
 export const taskRetrySchema = z.object({
   idempotencyKey: z.string().guid(),
   observedRunId: z.string().guid().nullable(),

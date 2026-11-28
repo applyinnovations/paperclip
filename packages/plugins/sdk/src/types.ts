@@ -1647,14 +1647,43 @@ export interface PluginIssueExecutionDecisionRecordedPayload {
   actorAgentId: string | null;
   actorUserId: string | null;
   /**
-   * The commit the decision names as reviewed: the last
+   * The commit the decision names as reviewed. It is the last
    * `Reviewed-SHA: <40 lowercase hex>` line of the decision body (see
-   * `parseReviewedSha` in `@paperclipai/shared`), or `null` when the body
-   * has no valid such line.
+   * `parseReviewedSha` in `@paperclipai/shared`) when the body has a valid
+   * one; otherwise the SHA the decision's own actor attested afterwards; or
+   * `null` when neither exists.
    */
   reviewedSha: string | null;
+  /**
+   * Where `reviewedSha` came from: `"body"` (a line in the decision body),
+   * `"attestation"` (attested later by the decision's own actor through
+   * `POST /api/issues/:issueId/execution-decisions/:decisionId/reviewed-sha`),
+   * or `null` when `reviewedSha` is `null`.
+   */
+  reviewedShaSource: "body" | "attestation" | null;
+  /**
+   * ISO 8601 time of the attestation when `reviewedShaSource` is
+   * `"attestation"`, otherwise `null`. An attestation is always later than
+   * `createdAt`; a gate that requires the reviewed commit to be the PR head
+   * at decision time should compare against this time as well.
+   */
+  reviewedShaAttestedAt: string | null;
   /** ISO 8601 timestamp of when the decision was recorded. */
   createdAt: string;
+}
+
+/**
+ * Payload of the `issue.execution_decision.amended` event: a recorded
+ * decision changed after the fact. The decision fields reflect the decision
+ * after the amendment. Today the only amendment is `"reviewed_sha_attested"`:
+ * the decision's own actor filled a missing Reviewed-SHA, so `reviewedSha`
+ * is set and `reviewedShaSource` is `"attestation"`. The decision's body,
+ * `createdAt` and stage are unchanged, and no `recorded` event is re-sent.
+ */
+export interface PluginIssueExecutionDecisionAmendedPayload extends PluginIssueExecutionDecisionRecordedPayload {
+  amendment: "reviewed_sha_attested";
+  /** The attesting actor's reason, as submitted. */
+  attestationComment: string;
 }
 
 /**

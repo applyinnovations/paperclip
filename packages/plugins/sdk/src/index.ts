@@ -270,6 +270,7 @@ export type {
   PluginIssueRelationSummary,
   PluginIssueCheckoutOwnership,
   PluginIssueExecutionDecision,
+  PluginIssueExecutionDecisionAmendedPayload,
   PluginIssueExecutionDecisionRecordedPayload,
   PluginIssueWakeupResult,
   PluginIssueWakeupBatchResult,

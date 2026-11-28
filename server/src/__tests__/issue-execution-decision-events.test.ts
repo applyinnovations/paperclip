@@ -236,6 +236,8 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       actorAgentId: seeded.reviewerAgentId,
       actorUserId: null,
       reviewedSha: REVIEWED_SHA,
+      reviewedShaSource: "body",
+      reviewedShaAttestedAt: null,
       createdAt: row!.createdAt.toISOString(),
       body,
     }]);
@@ -374,12 +376,14 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
       {
         issueId, issueIdentifier: "XDL-1", decisionId: first, stageId, stageType: "review",
         outcome: "changes_requested", actorAgentId: null, actorUserId: "board-user",
-        reviewedSha: null, createdAt: older.toISOString(), body: "Needs work",
+        reviewedSha: null, reviewedShaSource: null, reviewedShaAttestedAt: null,
+        createdAt: older.toISOString(), body: "Needs work",
       },
       {
         issueId, issueIdentifier: "XDL-1", decisionId: second, stageId, stageType: "review",
         outcome: "approved", actorAgentId: seeded.reviewerAgentId, actorUserId: null,
-        reviewedSha: REVIEWED_SHA, createdAt: newer.toISOString(), body: `Reviewed-SHA: ${REVIEWED_SHA}`,
+        reviewedSha: REVIEWED_SHA, reviewedShaSource: "body", reviewedShaAttestedAt: null,
+        createdAt: newer.toISOString(), body: `Reviewed-SHA: ${REVIEWED_SHA}`,
       },
     ]);
 

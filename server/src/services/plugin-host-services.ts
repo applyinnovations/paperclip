@@ -81,7 +81,7 @@ import {
   recordPushEvidence as recordGitHubPushEvidence,
 } from "./github-push-provenance.js";
 import { githubApprovalsTokenSource } from "./github-approvals-token.js";
-import { logActivity } from "./activity-log.js";
+import { isReservedActivityAction, logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -1892,6 +1892,9 @@ export function buildHostServices(
       async log(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        if (isReservedActivityAction(params.message)) {
+          throw new Error(`Plugin activity may not use the reserved action "${params.message}"`);
+        }
         await logActivity(db, {
           companyId,
           actorType: "plugin",

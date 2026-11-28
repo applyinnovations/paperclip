@@ -10886,6 +10886,11 @@ for (const route of [
   ["post", "/api/issues/{id}/documents/{key}/lock", "Lock an issue document"],
   [
     "post",
+    "/api/issues/{id}/execution-decisions/{decisionId}/reviewed-sha",
+    "Attest the reviewed commit of your own approved stage decision",
+  ],
+  [
+    "post",
     "/api/issues/{id}/documents/{key}/unlock",
     "Unlock an issue document",
   ],

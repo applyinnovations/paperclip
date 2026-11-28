@@ -124,6 +124,7 @@ import {
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
   recoverWorkspaceSchema,
+  attestExecutionDecisionReviewedShaSchema,
   taskRetrySchema,
   resumeWorkspaceFinalizationSchema,
   confirmNativeControllerStoppedSchema,
@@ -377,7 +378,10 @@ import {
   assertAgentExecutionPolicyStagesSatisfied,
   loadHydratedLegacyCycleDecisionIds,
 } from "../services/issue-execution-policy-guards.js";
-import { recordIssueExecutionDecision } from "../services/issue-execution-decisions.js";
+import {
+  attestIssueExecutionDecisionReviewedSha,
+  recordIssueExecutionDecision,
+} from "../services/issue-execution-decisions.js";
 import { buildExecutionWorkspaceAdapterConfig, parseProjectExecutionWorkspacePolicy, parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -11571,6 +11575,39 @@ export function issueRoutes(
       });
 
       res.status(result.created ? 201 : 200).json(doc);
+    },
+  );
+
+  // Fill a missing Reviewed-SHA on an approved stage decision. Only the
+  // decision's own actor may attest; there is no board or admin override,
+  // because the attestation speaks for what that reviewer reviewed.
+  router.post(
+    "/issues/:id/execution-decisions/:decisionId/reviewed-sha",
+    validate(attestExecutionDecisionReviewedShaSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      const decisionId = String(req.params.decisionId ?? "");
+      if (!isUuidLike(decisionId)) {
+        res.status(404).json({ error: "Execution decision not found on this issue" });
+        return;
+      }
+      const decision = await attestIssueExecutionDecisionReviewedSha(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        issueIdentifier: issue.identifier ?? null,
+        decisionId,
+        reviewedSha: req.body.reviewedSha,
+        comment: req.body.comment,
+        actor: getActorInfo(req),
+      });
+      res.json(decision);
     },
   );
 

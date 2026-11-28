@@ -2006,6 +2006,8 @@ export {
   isValidExistingBranchName,
   retryWorkspaceExportSchema,
   recoverWorkspaceSchema,
+  attestExecutionDecisionReviewedShaSchema,
+  type AttestExecutionDecisionReviewedSha,
   taskRetrySchema,
   reconstructWorkspaceSchema,
   resumeWorkspaceFinalizationSchema,

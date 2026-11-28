@@ -120,9 +120,17 @@ export interface TestHarness {
     issueInteractions?: IssueThreadInteraction[];
     /**
      * Execution-policy stage decisions for `ctx.issues.listExecutionDecisions`.
-     * Omit `reviewedSha` to derive it from `body` as the host does.
+     * Omit `reviewedSha` to derive it from `body` as the host does. Omit
+     * `reviewedShaSource` / `reviewedShaAttestedAt` to derive them: a SHA
+     * that matches the body is `"body"`, any other is `"attestation"`.
      */
-    issueExecutionDecisions?: Array<Omit<PluginIssueExecutionDecision, "reviewedSha"> & { reviewedSha?: string | null }>;
+    issueExecutionDecisions?: Array<
+      Omit<PluginIssueExecutionDecision, "reviewedSha" | "reviewedShaSource" | "reviewedShaAttestedAt"> & {
+        reviewedSha?: string | null;
+        reviewedShaSource?: PluginIssueExecutionDecision["reviewedShaSource"];
+        reviewedShaAttestedAt?: string | null;
+      }
+    >;
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
     agents?: Agent[];
@@ -2658,7 +2666,17 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       }
       for (const row of input.issueExecutionDecisions ?? []) {
         const list = issueExecutionDecisions.get(row.issueId) ?? [];
-        list.push({ ...row, reviewedSha: row.reviewedSha === undefined ? parseReviewedSha(row.body) : row.reviewedSha });
+        const bodySha = parseReviewedSha(row.body);
+        const reviewedSha = row.reviewedSha === undefined ? bodySha : row.reviewedSha;
+        const reviewedShaSource = row.reviewedShaSource !== undefined
+          ? row.reviewedShaSource
+          : reviewedSha === null ? null : reviewedSha === bodySha ? "body" : "attestation";
+        list.push({
+          ...row,
+          reviewedSha,
+          reviewedShaSource,
+          reviewedShaAttestedAt: row.reviewedShaAttestedAt ?? null,
+        });
         list.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
         issueExecutionDecisions.set(row.issueId, list);
       }
