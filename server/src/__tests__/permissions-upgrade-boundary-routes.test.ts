@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -289,6 +290,64 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     expect(res.body.error).toBe("Issue not found");
   });
 
+  it("denies create-with-assignee, reassignment and checkout to an agent holding neither assignment grant (APP-786)", async () => {
+    const company = await seedCompany(db, "NoAssignGrant");
+    const actorAgent = await seedAgent(db, company.id);
+    const targetAgent = await seedAgent(db, company.id);
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    const [scopeGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentIds: [actorAgent.id, targetAgent.id] },
+      grantedByUserId: null,
+    }).returning();
+    const [ownIssue, unassignedIssue] = await db.insert(issues).values([
+      { companyId: company.id, title: "Own issue", status: "todo", assigneeAgentId: actorAgent.id },
+      { companyId: company.id, title: "Unassigned issue", status: "todo" },
+    ]).returning();
+    const app = await createApp(db, agentActor(company.id, actorAgent.id));
+
+    // With the scope grant the target is assignable.
+    const scopedCreate = await request(app)
+      .post(`/api/companies/${company.id}/issues`)
+      .send({ title: "In scope", assigneeAgentId: targetAgent.id });
+    expect(scopedCreate.status, JSON.stringify(scopedCreate.body)).toBe(201);
+
+    // Removing the last grant revokes assignment; it does not fall back to default-open.
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, scopeGrant!.id));
+
+    const create = await request(app)
+      .post(`/api/companies/${company.id}/issues`)
+      .send({ title: "No grant", assigneeAgentId: targetAgent.id });
+    expect(create.status, JSON.stringify(create.body)).toBe(403);
+    expect(create.body.error).toContain("neither tasks:assign nor tasks:assign_scope");
+
+    const reassign = await request(app)
+      .patch(`/api/issues/${ownIssue!.id}`)
+      .send({ assigneeAgentId: targetAgent.id });
+    expect(reassign.status, JSON.stringify(reassign.body)).toBe(403);
+
+    const checkout = await request(app)
+      .post(`/api/issues/${unassignedIssue!.id}/checkout`)
+      .send({ agentId: actorAgent.id, expectedStatuses: ["todo"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(403);
+
+    const [ownAfter, unassignedAfter] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, ownIssue!.id)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, unassignedIssue!.id)).then((rows) => rows[0]!),
+    ]);
+    expect(ownAfter.assigneeAgentId).toBe(actorAgent.id);
+    expect(unassignedAfter.assigneeAgentId).toBeNull();
+  });
+
   it("allows same-company route assignment after upgrade but keeps private target assignment grant constrained", async () => {
     const company = await seedCompany(db, "Assignment");
     const actorAgent = await seedAgent(db, company.id);
@@ -303,6 +362,23 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
         },
       },
     });
+    // Without any assignment grant an agent cannot assign at all (APP-786);
+    // a scope naming the open target allows it.
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    const [scopeGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentIds: [openTargetAgent.id] },
+      grantedByUserId: null,
+    }).returning();
     const app = await createApp(db, agentActor(company.id, actorAgent.id));
 
     const openAssignment = await request(app)
@@ -316,21 +392,9 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     expect(deniedPrivateAssignment.status).toBe(403);
     expect(deniedPrivateAssignment.body.error).toContain("private");
 
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "agent",
-      principalId: actorAgent.id,
-      status: "active",
-      membershipRole: "member",
-    });
-    await db.insert(principalPermissionGrants).values({
-      companyId: company.id,
-      principalType: "agent",
-      principalId: actorAgent.id,
-      permissionKey: "tasks:assign_scope",
-      scope: { assigneeAgentIds: [privateTargetAgent.id] },
-      grantedByUserId: null,
-    });
+    await db.update(principalPermissionGrants)
+      .set({ scope: { assigneeAgentIds: [openTargetAgent.id, privateTargetAgent.id] } })
+      .where(eq(principalPermissionGrants.id, scopeGrant!.id));
 
     const allowedPrivateAssignment = await request(app)
       .post(`/api/companies/${company.id}/issues`)

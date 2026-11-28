@@ -1885,6 +1885,53 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       return broadDecision;
     }
 
+    /**
+     * Assignment authority for a standard agent comes from its grants, for
+     * every target, protected or not:
+     * - tasks:assign: no extra confinement (the caller's normal rules apply);
+     * - tasks:assign_scope only: confined to that scope (APP-738);
+     * - neither: a standard-trust agent is denied (APP-786). Removing its last
+     *   assignment grant revokes assignment; it never falls back to the
+     *   default-open rule. Non-standard trust (a low-trust boundary) keeps its
+     *   own confinement and the existing bounded rule.
+     * There is no self-assignment exception: an agent that claims or creates
+     * work for itself needs a grant covering itself (new agents get
+     * tasks:assign_scope rooted at themselves). Checking out an issue already
+     * assigned to the agent does not reach this decision.
+     * Returns a denial, or null when the grants allow the target.
+     */
+    async function denyAssignmentOutsideAgentGrants(
+      agentId: string,
+      options: { requireGrant: boolean },
+    ): Promise<AuthorizationDecision | null> {
+      if (await findGrant(companyId, "agent", agentId, "tasks:assign")) return null;
+      if (!(await findGrant(companyId, "agent", agentId, "tasks:assign_scope"))) {
+        if (!options.requireGrant) return null;
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation:
+            "Assignment denied: this agent holds neither tasks:assign nor tasks:assign_scope, so it cannot assign tasks.",
+        });
+      }
+      const scoped = await decidePrincipalGrant({
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        action: input.action,
+        permissionKey: "tasks:assign_scope",
+        scope: input.scope,
+      });
+      if (scoped.allowed) return null;
+      return deny({
+        action: input.action,
+        reason: scoped.reason === "deny_missing_membership" ? scoped.reason : "deny_scope",
+        explanation:
+          "Assignment denied: this agent holds only tasks:assign_scope, and the target assignee is outside that scope.",
+        grant: scoped.grant,
+      });
+    }
+
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,
@@ -2574,6 +2621,12 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
         if (grantDecision.allowed) return grantDecision;
         return denyRestrictedAssignmentPolicy(policyEffect);
+      }
+      if (input.action === "tasks:assign") {
+        const grantDeny = await denyAssignmentOutsideAgentGrants(actorAgentId, {
+          requireGrant: trustResolution.kind === "standard",
+        });
+        if (grantDeny) return grantDeny;
       }
       if (trustResolution.kind === "standard") return decideVisibleIssueWrite();
       return allow({

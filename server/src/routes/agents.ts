@@ -1302,7 +1302,9 @@ export function agentRoutes(
       };
     }
 
-    if (membership?.status === "active") {
+    // Enforcement denies assignment to an agent with neither tasks:assign nor
+    // tasks:assign_scope (APP-786), so report it as unable to assign.
+    if (membership?.status === "active" && grants.some((grant) => grant.permissionKey === "tasks:assign_scope")) {
       return {
         canAssignTasks: true,
         taskAssignSource: "simple_default" as const,
