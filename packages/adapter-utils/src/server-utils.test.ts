@@ -3008,6 +3008,28 @@ describe("renderPaperclipWakePrompt", () => {
     expect(JSON.parse(stringifyPaperclipWakePayload(payload)!)).toMatchObject({ dispositionRepair: payload.dispositionRepair });
   });
 
+  it("tells the owner of a stranded terminal blocker what it blocks and to move it", () => {
+    const payload = {
+      reason: "issue_terminal_blocker_stranded",
+      issue: { id: "review-1", identifier: "APP-658", title: "Review the fix", status: "in_review", priority: "high" },
+      terminalBlockerStranded: {
+        terminalIssueId: "review-1", terminalIssueIdentifier: "APP-658", terminalIssueStatus: "in_review",
+        blockedIssues: [{ id: "blocked-1", identifier: "APP-661", title: "Release it" }],
+        blockedIssueCount: 3, attempt: 1, maxAttempts: 2,
+      },
+    };
+    expect(JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}")).toMatchObject({
+      terminalBlockerStranded: { blockedIssueCount: 3, attempt: 1, maxAttempts: 2 },
+    });
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("## You are blocking other work");
+    expect(prompt).toContain("blocks 3 open issues");
+    expect(prompt).toContain("- blocked: APP-661 Release it");
+    expect(prompt).toContain("- and 2 more");
+    expect(prompt).toContain("attempt 1 of 2");
+    expect(renderPaperclipWakePrompt({ ...payload, terminalBlockerStranded: undefined })).not.toContain("You are blocking other work");
+  });
+
   it("tells the agent what it can do when a child or blocker stalls on the board", () => {
     const payload = {
       reason: "issue_blocker_stalled",

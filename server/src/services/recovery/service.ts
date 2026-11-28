@@ -1,4 +1,5 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { wakeStrandedTerminalBlocker, type TerminalBlockerAutoWakeup } from "./terminal-blocker-auto-wake.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
 import { promoteDeferredWorkIntents } from "../work-intent-outbox.js";
@@ -6092,6 +6093,15 @@ export function recoveryService(
       // Counted with the dependency wakes, so the worker retries a failed one.
       result.enqueueFailed += stalls.failed;
       if (stalls.retryAt !== null) opts?.onDeferredDeadline?.(stalls.retryAt);
+      // A stranded agent-owned terminal blocker: wake its owner before the
+      // board card appears (terminal-blocker-auto-wake.ts). Per blocked issue
+      // only, so the pass is bounded by the issues this worker already visits.
+      if (opts?.issueId && opts.companyId) {
+        const autoWake = await wakeStrandedTerminalBlocker(db, deps.enqueueWakeup as TerminalBlockerAutoWakeup,
+          { companyId: opts.companyId, blockedIssueId: opts.issueId });
+        if (autoWake.failed) result.enqueueFailed += 1;
+        if (autoWake.retryAt !== null) opts.onDeferredDeadline?.(autoWake.retryAt);
+      }
     }
     return result;
   }

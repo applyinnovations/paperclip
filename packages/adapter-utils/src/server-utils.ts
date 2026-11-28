@@ -720,6 +720,15 @@ type PaperclipWakeBlockerStall = {
   };
 };
 
+/** `issue_terminal_blocker_stranded`: this issue blocks other work and nothing is moving it. */
+type PaperclipWakeTerminalBlockerStranded = {
+  terminalIssueStatus: string | null;
+  blockedIssues: Array<{ identifier: string | null; id: string | null; title: string | null }>;
+  blockedIssueCount: number;
+  attempt: number | null;
+  maxAttempts: number | null;
+};
+
 type PaperclipWakeBlockerSummary = {
   id: string | null;
   identifier: string | null;
@@ -834,6 +843,7 @@ type PaperclipWakePayload = {
   childIssueSummaries: PaperclipWakeChildIssueSummary[];
   childIssueSummaryTruncated: boolean;
   blockerStall: PaperclipWakeBlockerStall | null;
+  terminalBlockerStranded: PaperclipWakeTerminalBlockerStranded | null;
   commentIds: string[];
   latestCommentId: string | null;
   comments: PaperclipWakeComment[];
@@ -1359,6 +1369,25 @@ function normalizePaperclipWakeBlockerStall(value: unknown): PaperclipWakeBlocke
       ownerType: text(action.ownerType),
       nextAction: text(action.nextAction),
     },
+  };
+}
+
+function normalizePaperclipWakeTerminalBlockerStranded(value: unknown): PaperclipWakeTerminalBlockerStranded | null {
+  const stranded = parseObject(value);
+  const text = (field: unknown) => asString(field, "").trim() || null;
+  if (!text(stranded.terminalIssueId)) return null;
+  const blockedIssues = (Array.isArray(stranded.blockedIssues) ? stranded.blockedIssues : []).slice(0, 10).map((entry) => {
+    const issue = parseObject(entry);
+    return { id: text(issue.id), identifier: text(issue.identifier), title: text(issue.title) };
+  }).filter((issue) => issue.id || issue.identifier);
+  const attempt = asNumber(stranded.attempt, 0);
+  const maxAttempts = asNumber(stranded.maxAttempts, 0);
+  return {
+    terminalIssueStatus: text(stranded.terminalIssueStatus),
+    blockedIssues,
+    blockedIssueCount: Math.max(blockedIssues.length, asNumber(stranded.blockedIssueCount, 0)),
+    attempt: attempt > 0 ? attempt : null,
+    maxAttempts: maxAttempts > 0 ? maxAttempts : null,
   };
 }
 
@@ -1936,6 +1965,7 @@ export function normalizePaperclipWakePayload(
       false,
     ),
     blockerStall: normalizePaperclipWakeBlockerStall(payload.blockerStall),
+    terminalBlockerStranded: normalizePaperclipWakeTerminalBlockerStranded(payload.terminalBlockerStranded),
     commentIds,
     latestCommentId: asString(payload.latestCommentId, "").trim() || null,
     comments,
@@ -3125,6 +3155,23 @@ function renderPaperclipWakePromptBody(
       `- Escalate: comment on this issue with what is stuck and what the board must do on ${label} (its Retry or reassignment), so the board sees it here.`,
       `- Block this issue with a reason that names ${label} and its recovery action, if nothing else can move until the board acts.`,
       `Do not redo ${label}'s work yourself while it is assigned, and do not wait silently.`,
+    );
+  }
+
+  if (normalized.terminalBlockerStranded) {
+    const stranded = normalized.terminalBlockerStranded;
+    const labels = stranded.blockedIssues.map((issue) => `${issue.identifier ?? issue.id}${issue.title ? ` ${issue.title}` : ""}`);
+    const more = stranded.blockedIssueCount - labels.length;
+    lines.push(
+      "",
+      "## You are blocking other work",
+      "",
+      `This issue${stranded.terminalIssueStatus ? ` (${stranded.terminalIssueStatus})` : ""} blocks ${stranded.blockedIssueCount} open ${stranded.blockedIssueCount === 1 ? "issue" : "issues"}, and no run, wake or waiting path has moved it for a while.`,
+      ...labels.map((label) => `- blocked: ${label}`),
+      ...(more > 0 ? [`- and ${more} more`] : []),
+      ...(stranded.attempt ? [`Paperclip woke you automatically (attempt ${stranded.attempt}${stranded.maxAttempts ? ` of ${stranded.maxAttempts}` : ""}); after the last attempt the board is asked to step in.`] : []),
+      "",
+      "Move it forward now: finish or review the work, hand it to the next owner, or, if you cannot continue, set it to blocked with the reason and who must act. Do not end this run with the issue unchanged.",
     );
   }
 

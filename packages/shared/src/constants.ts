@@ -422,6 +422,13 @@ export type IssueRecoveryActionOwnerType = (typeof ISSUE_RECOVERY_ACTION_OWNER_T
  * that needs the board. Woken once per stall (one recovery action).
  */
 export const ISSUE_BLOCKER_STALLED_WAKE_REASON = "issue_blocker_stalled" as const;
+/**
+ * Wake reason for the agent that owns a terminal blocker (`todo` or
+ * `in_review`) which strands the work it blocks: no run, wake or recovery
+ * path for a while. Paperclip wakes the owner a bounded number of times before
+ * it asks the board (APP-761).
+ */
+export const ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON = "issue_terminal_blocker_stranded" as const;
 export const ISSUE_BLOCKER_STALL_RELATIONS = ["child", "blocker"] as const;
 export type IssueBlockerStallRelation = (typeof ISSUE_BLOCKER_STALL_RELATIONS)[number];
 

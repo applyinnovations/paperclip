@@ -1456,6 +1456,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
   "issue_blocker_stalled",
+  "issue_terminal_blocker_stranded",
   "issue_commented",
   "issue_comment_mentioned",
   "issue_dependencies_blocked",

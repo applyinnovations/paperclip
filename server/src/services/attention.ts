@@ -1,4 +1,4 @@
-import { recoveryActionAttentionCondition, ATTENTION_BUDGET_WARNING_PERCENT, ATTENTION_AGENT_ERROR_STATUS, collapsePendingConfirmationsToNewest, loadNewestSettledConfirmationAt, readRunIssueId, listFailedRunsWithNewerRun, requiresReviewAttention, terminalBlockerRequiresAttention } from "./attention-source-eligibility.js";
+import { recoveryActionAttentionCondition, ATTENTION_BUDGET_WARNING_PERCENT, ATTENTION_AGENT_ERROR_STATUS, collapsePendingConfirmationsToNewest, loadNewestSettledConfirmationAt, readRunIssueId, listFailedRunsWithNewerRun, requiresReviewAttention, terminalBlockerIsStranded, terminalBlockerRequiresAttention, loadTerminalBlockerAutoWakeStates, terminalBlockerAutoWakeHoldsCard, terminalBlockerAutoWakeWhyNow } from "./attention-source-eligibility.js";
 import { approvalExecutionIssueCondition, firstApprovalIssueId } from "./approval-visibility.js";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1541,7 +1541,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           }));
         }
         const blockerAttention = issue.blockerAttention;
-        if (!terminalBlockerRequiresAttention(blockerAttention)) continue;
+        if (!terminalBlockerIsStranded(blockerAttention)) continue;
         const issueSummary = blockedIssueSummaries.get(issue.id) ?? null;
         const terminalIssueId = blockerAttention.terminalBlockerIssueId ?? issue.id;
         const terminalSummary = terminalBlockerSummaries.get(terminalIssueId)
@@ -1558,16 +1558,26 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }
       }
 
-      const blockedWorkCounts = await blockedWorkCountMap(db, companyId, [...terminalCandidates.keys()]);
+      // An agent-owned terminal blocker is auto-woken before the board sees it
+      // (APP-761); its card waits until a human is needed or attempts run out.
+      const [blockedWorkCounts, terminalAutoWake] = await Promise.all([
+        blockedWorkCountMap(db, companyId, [...terminalCandidates.keys()]),
+        loadTerminalBlockerAutoWakeStates(db, companyId, [...terminalCandidates.keys()]),
+      ]);
       for (const [terminalIssueId, candidate] of terminalCandidates) {
+        const autoWake = terminalAutoWake.get(terminalIssueId);
+        if (!terminalBlockerRequiresAttention({ state: candidate.state, blockingTreeLive: false }, autoWake)) continue;
         const blockedTaskCount = blockedWorkCounts.get(terminalIssueId) ?? 0;
         const taskLabel = blockedTaskCount === 1 ? "task" : "tasks";
         const dedupKey = `blocker:${terminalIssueId}`;
+        const autoWakeWhyNow = terminalBlockerAutoWakeWhyNow(autoWake);
         add(createItem({
           companyId,
           sourceKind: "blocker_attention",
           subject: issueSubject(prefix, candidate.terminalSummary),
-          whyNow: candidate.state === "needs_attention"
+          whyNow: autoWakeWhyNow
+            ? `${autoWakeWhyNow} Blocks ${blockedTaskCount} ${taskLabel}; choose the next owner or action.`
+            : candidate.state === "needs_attention"
             ? `Blocks ${blockedTaskCount} ${taskLabel} and needs human attention.`
             : `Blocks ${blockedTaskCount} ${taskLabel}; choose the next owner or action.`,
           decisionVerbs: decisionVerbs(
@@ -1635,6 +1645,10 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         issueSummaryMap(db, companyId, reviewIssueIds, readCondition),
         loadImages(db, companyId, reviewIssueIds, readCondition),
       ]);
+      // A stalled review that blocks other work is the same stranded terminal
+      // blocker: it waits for the same auto-wake as the blocker card (APP-761).
+      const stalledReviewIds = reviewIssueIds.filter((id) => reviewAttentionByIssueId.get(id)?.state === "stalled");
+      const reviewAutoWake = await loadTerminalBlockerAutoWakeStates(db, companyId, stalledReviewIds);
 
       for (const review of reviewRows) {
         const state = parseIssueExecutionState(review.executionState);
@@ -1643,6 +1657,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const pendingApprovalId = pendingApprovalByIssueId.get(review.id) ?? null;
         const reviewAttention = reviewAttentionByIssueId.get(review.id);
         const stalled = reviewAttention?.state === "stalled";
+        const reviewAutoWakeState = stalled ? reviewAutoWake.get(review.id) : undefined;
+        if (stalled && !hasHumanParticipant && !review.assigneeUserId && !pendingApprovalId
+          && terminalBlockerAutoWakeHoldsCard(reviewAutoWakeState)) continue;
         if (!requiresReviewAttention({ hasHumanParticipant, hasUserAssignee: Boolean(review.assigneeUserId),
           hasPendingApproval: Boolean(pendingApprovalId), stalled })) continue;
         const issue = reviewIssueMap.get(review.id);
@@ -1660,7 +1677,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             ? { ...reviewSubject, metadata: { ...reviewSubject.metadata, reviewAttentionState: "stalled" } }
             : reviewSubject,
           whyNow: stalled
-            ? "Issue is in review without a maintained reviewer, interaction, approval, monitor, run, wake, or recovery path."
+            ? [terminalBlockerAutoWakeWhyNow(reviewAutoWakeState),
+              "Issue is in review without a maintained reviewer, interaction, approval, monitor, run, wake, or recovery path."]
+              .filter(Boolean).join(" ")
             : pendingApprovalId
             ? "Issue is in review with a linked pending approval."
             : hasHumanParticipant

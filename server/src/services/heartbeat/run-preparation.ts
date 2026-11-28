@@ -179,6 +179,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_blockers_resolved",
   "issue_children_completed",
   "issue_blocker_stalled",
+  "issue_terminal_blocker_stranded",
   "issue_status_changed",
   "issue_tree_restored",
   "issue_recovery_action_restored",
@@ -835,6 +836,13 @@ export interface WakeupOptions {
     statusVersion?: number;
     monitorNextCheckAt?: string;
     monitorWakeRequestedAt?: string;
+    /**
+     * Admit at most one wake per idempotency key on this issue. Checked under
+     * the issue row lock, so concurrent callers cannot both deliver; the loser
+     * gets null and no receipt row. The caller needs no lock or connection of
+     * its own across the enqueue.
+     */
+    oncePerIdempotencyKey?: boolean;
     /** Internal diagnostic only; the callback cannot grant admission. */
     onExecutionDeferred?: (blockerCause: string) => void;
   };
@@ -2754,6 +2762,7 @@ export async function buildPaperclipWakePayload(input: {
     childIssueSummaryTruncated:
       input.contextSnapshot.childIssueSummaryTruncated === true,
     blockerStall: input.contextSnapshot.blockerStall ?? null,
+    terminalBlockerStranded: input.contextSnapshot.terminalBlockerStranded ?? null,
     dispositionRepair:
       buildReviewPathRecoveryDisposition(input.contextSnapshot) ??
       (input.contextSnapshot.legacyDispositionEpisode ? {
