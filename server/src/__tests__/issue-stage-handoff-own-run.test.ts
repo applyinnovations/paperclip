@@ -328,12 +328,11 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     ))).toHaveLength(1);
   });
 
-  // The executor's run was stopped after the handoff and left a hold. The
-  // handoff's stage wake for the reviewer is saved behind that hold.
+  // The handoff saved the reviewer's stage wake behind the executor's live
+  // run. That run was then stopped mid-flight and left a hold, which the
+  // operator has reconciled; nothing has promoted the saved wake yet.
   async function holdStageWakeBehindReconciliation(prefix: string) {
     const s = await seed(prefix);
-    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), errorCode: "issue_reassigned" })
-      .where(eq(heartbeatRuns.id, s.executorRunId));
     await db.update(issues).set({
       status: "in_review",
       assigneeAgentId: s.reviewerAgentId,
@@ -353,18 +352,6 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
         lastDecisionOutcome: null,
       },
     }).where(eq(issues.id, s.issueId));
-    const [hold] = await db.insert(issueRecoveryActions).values({
-      companyId: s.companyId,
-      sourceIssueId: s.issueId,
-      kind: "active_run_watchdog",
-      ownerType: "board",
-      returnOwnerAgentId: s.executorAgentId,
-      cause: "legacy_execution_requires_reconciliation",
-      fingerprint: `legacy-execution:${s.executorRunId}`,
-      status: "active",
-      nextAction: "Reconcile the stopped run",
-      evidence: { runId: s.executorRunId },
-    }).returning();
     const heartbeat = heartbeatService(db);
     const deferred = await heartbeat.wakeup(s.reviewerAgentId, {
       source: "assignment",
@@ -378,16 +365,25 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     expect(deferred).toBeNull();
     const saved = await reviewerWakes(s);
     expect(saved.map(wake => wake.status)).toEqual(["deferred_issue_execution"]);
-    // The operator reconciles the stopped run.
-    await db.update(issueRecoveryActions).set({
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), errorCode: "issue_reassigned" })
+      .where(eq(heartbeatRuns.id, s.executorRunId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId: s.companyId,
+      sourceIssueId: s.issueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      returnOwnerAgentId: s.executorAgentId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${s.executorRunId}`,
       status: "resolved",
       resolvedAt: new Date(),
+      nextAction: "Reconcile the stopped run",
       evidence: {
         runId: s.executorRunId,
         executionReconciliation: { runId: s.executorRunId, outcome: "verified" },
         continuationDelivery: "pending",
       },
-    }).where(eq(issueRecoveryActions.id, hold!.id));
+    }).returning();
     return { s, heartbeat, holdId: hold!.id, savedWakeId: saved[0]!.id };
   }
 
