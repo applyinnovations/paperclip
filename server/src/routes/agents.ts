@@ -141,6 +141,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { publishActivity, type ActivityPublication } from "../services/activity-log.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -5069,9 +5070,6 @@ export function agentRoutes(
           at: new Date().toISOString(),
         } }
       : req.body;
-    const grantsBefore = summarizeAssignmentGrants(
-      await access.listPrincipalGrants(existing.companyId, "agent", existing.id),
-    );
     const agent = await svc.updatePermissions(id, permissionsPatch);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5080,25 +5078,6 @@ export function agentRoutes(
 
     const effectiveCanAssignTasks =
       agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
-    await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
-    // The toggle is the visible hiring control: turning it off also removes an
-    // explicit agents:create grant that would otherwise still allow hiring.
-    if (req.body.canCreateAgents === false) {
-      await access.setPrincipalPermission(agent.companyId, "agent", agent.id, "agents:create", false, null);
-    }
-    await access.setPrincipalPermission(
-      agent.companyId,
-      "agent",
-      agent.id,
-      "tasks:assign",
-      effectiveCanAssignTasks,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-
-    const grantsAfter = summarizeAssignmentGrants(
-      await access.listPrincipalGrants(agent.companyId, "agent", agent.id),
-    );
-
     const actor = getActorInfo(req);
     const activityActor = {
       companyId: agent.companyId,
@@ -5108,28 +5087,58 @@ export function agentRoutes(
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
     };
-    await logActivity(db, {
-      ...activityActor,
-      action: "agent.permissions_updated",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        canCreateAgents: agent.permissions?.canCreateAgents ?? false,
-        canCreateSkills: agent.permissions?.canCreateSkills ?? true,
-        canAssignTasks: effectiveCanAssignTasks,
-        trustPreset: agent.permissions?.trustPreset ?? "standard",
-        before: grantsBefore,
-        after: grantsAfter,
+    // The grant writes, their before/after snapshots and the audit entries
+    // share one transaction under the agent's grant lock, so overlapping
+    // requests each record only their own change.
+    const publications: ActivityPublication[] = [];
+    await access.changePrincipalGrantsAudited(
+      agent.companyId,
+      "agent",
+      agent.id,
+      async (grants) => {
+        await grants.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
+        // The toggle is the visible hiring control: turning it off also removes an
+        // explicit agents:create grant that would otherwise still allow hiring.
+        if (req.body.canCreateAgents === false) {
+          await grants.setPrincipalPermission(agent.companyId, "agent", agent.id, "agents:create", false, null);
+        }
+        await grants.setPrincipalPermission(
+          agent.companyId,
+          "agent",
+          agent.id,
+          "tasks:assign",
+          effectiveCanAssignTasks,
+          req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+        );
       },
-    });
-    const grantsRemoved = assignmentGrantsRemovedActivity({
-      actor: activityActor,
-      agent,
-      before: grantsBefore,
-      after: grantsAfter,
-      sourceAction: "agent.permissions_updated",
-    });
-    if (grantsRemoved) await logActivity(db, grantsRemoved);
+      async ({ tx, before, after }) => {
+        const grantsBefore = summarizeAssignmentGrants(before);
+        const grantsAfter = summarizeAssignmentGrants(after);
+        await logActivity(tx as unknown as Db, {
+          ...activityActor,
+          action: "agent.permissions_updated",
+          entityType: "agent",
+          entityId: agent.id,
+          details: {
+            canCreateAgents: agent.permissions?.canCreateAgents ?? false,
+            canCreateSkills: agent.permissions?.canCreateSkills ?? true,
+            canAssignTasks: effectiveCanAssignTasks,
+            trustPreset: agent.permissions?.trustPreset ?? "standard",
+            before: grantsBefore,
+            after: grantsAfter,
+          },
+        }, publications);
+        const grantsRemoved = assignmentGrantsRemovedActivity({
+          actor: activityActor,
+          agent,
+          before: grantsBefore,
+          after: grantsAfter,
+          sourceAction: "agent.permissions_updated",
+        });
+        if (grantsRemoved) await logActivity(tx as unknown as Db, grantsRemoved, publications);
+      },
+    );
+    for (const publication of publications) publishActivity(publication);
 
     res.json(await buildAgentDetail(agent));
   });

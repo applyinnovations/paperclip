@@ -50,7 +50,7 @@ import {
   PERMISSION_KEYS,
   isUuidLike,
 } from "@paperclipai/shared";
-import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole, PrincipalType } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole } from "@paperclipai/shared";
 import {
   forbidden,
   conflict,
@@ -92,6 +92,7 @@ import {
   logActivity,
   notifyHireApproved
 } from "../services/index.js";
+import { publishActivity, type ActivityPublication } from "../services/activity-log.js";
 import {
   grantsForHumanRole,
   normalizeHumanRole,
@@ -4605,52 +4606,54 @@ export function accessRoutes(
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
-      const grantsBefore = summarizeAssignmentGrants(
-        await access.listPrincipalGrants(
-          companyId,
-          memberToUpdate.principalType as PrincipalType,
-          memberToUpdate.principalId,
-        ),
-      );
-      const updated = await access.setMemberPermissions(
-        companyId,
-        memberId,
-        req.body.grants ?? [],
-        req.actor.userId ?? null
-      );
-      if (!updated) throw notFound("Member not found");
-      const grantsAfter = summarizeAssignmentGrants(
-        await access.listPrincipalGrants(companyId, updated.principalType as PrincipalType, updated.principalId),
-      );
       const activityActor = {
         companyId,
         actorType: "user" as const,
         actorId: req.actor.userId ?? "board",
       };
-      await logActivity(db, {
-        ...activityActor,
-        action: "company_member.permissions_updated",
-        entityType: "company_membership",
-        entityId: memberId,
-        details: {
-          grantCount: req.body.grants?.length ?? 0,
-          before: grantsBefore,
-          after: grantsAfter,
-        },
-      });
       // Unreachable today: assertCanManageCompanyMember refuses non-human
       // members. Kept so this route stays covered if that guard is relaxed.
-      if (updated.principalType === "agent") {
-        const agent = await agents.getById(updated.principalId);
-        const grantsRemoved = assignmentGrantsRemovedActivity({
-          actor: activityActor,
-          agent: agent?.companyId === companyId ? agent : null,
-          before: grantsBefore,
-          after: grantsAfter,
-          sourceAction: "company_member.permissions_updated",
-        });
-        if (grantsRemoved) await logActivity(db, grantsRemoved);
-      }
+      const memberAgent = memberToUpdate.principalType === "agent"
+        ? await agents.getById(memberToUpdate.principalId)
+        : null;
+      // setMemberPermissions takes the member's grant lock and runs this audit
+      // in the same transaction as the write, so before/after describe only
+      // this change.
+      const publications: ActivityPublication[] = [];
+      const updated = await access.setMemberPermissions(
+        companyId,
+        memberId,
+        req.body.grants ?? [],
+        req.actor.userId ?? null,
+        async ({ tx, member: lockedMember, before, after }) => {
+          const grantsBefore = summarizeAssignmentGrants(before);
+          const grantsAfter = summarizeAssignmentGrants(after);
+          await logActivity(tx as unknown as Db, {
+            ...activityActor,
+            action: "company_member.permissions_updated",
+            entityType: "company_membership",
+            entityId: memberId,
+            details: {
+              grantCount: req.body.grants?.length ?? 0,
+              before: grantsBefore,
+              after: grantsAfter,
+            },
+          }, publications);
+          if (lockedMember.principalType !== "agent") return;
+          const grantsRemoved = assignmentGrantsRemovedActivity({
+            actor: activityActor,
+            agent: memberAgent?.companyId === companyId && memberAgent.id === lockedMember.principalId
+              ? memberAgent
+              : null,
+            before: grantsBefore,
+            after: grantsAfter,
+            sourceAction: "company_member.permissions_updated",
+          });
+          if (grantsRemoved) await logActivity(tx as unknown as Db, grantsRemoved, publications);
+        },
+      );
+      if (!updated) throw notFound("Member not found");
+      for (const publication of publications) publishActivity(publication);
       const member = (await loadCompanyMemberRecords(db, companyId)).find(
         (entry) => entry.id === memberId,
       );

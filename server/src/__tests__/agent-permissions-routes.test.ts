@@ -68,6 +68,7 @@ const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   listPrincipalGrants: vi.fn(),
   setPrincipalPermission: vi.fn(),
+  changePrincipalGrantsAudited: vi.fn(),
 }));
 
 const mockApprovalService = vi.hoisted(() => ({
@@ -211,6 +212,7 @@ function registerModuleMocks() {
 
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
+    publishActivity: vi.fn(),
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
@@ -330,6 +332,7 @@ describe("agent permission routes", () => {
     mockAccessService.ensureMembership.mockReset();
     mockAccessService.listPrincipalGrants.mockReset();
     mockAccessService.setPrincipalPermission.mockReset();
+    mockAccessService.changePrincipalGrantsAudited.mockReset();
     mockApprovalService.create.mockReset();
     mockApprovalService.getById.mockReset();
     mockApprovalService.findOpenHireApprovalForAgent.mockReset();
@@ -398,6 +401,27 @@ describe("agent permission routes", () => {
     mockAccessService.listPrincipalGrants.mockResolvedValue([]);
     mockAccessService.ensureMembership.mockResolvedValue(undefined);
     mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
+    // Stands in for the service's transaction and grant lock: changes run one
+    // at a time and record sees that change's own before and after.
+    let grantLock: Promise<unknown> = Promise.resolve();
+    mockAccessService.changePrincipalGrantsAudited.mockImplementation(async (
+      companyIdArg: string,
+      principalType: string,
+      principalId: string,
+      change: (scoped: typeof mockAccessService, tx: unknown) => Promise<unknown>,
+      record: (input: { tx: unknown; result: unknown; before: unknown[]; after: unknown[] }) => Promise<void>,
+    ) => {
+      const run = grantLock.then(async () => {
+        const tx = {};
+        const before = await mockAccessService.listPrincipalGrants(companyIdArg, principalType, principalId);
+        const result = await change(mockAccessService, tx);
+        const after = await mockAccessService.listPrincipalGrants(companyIdArg, principalType, principalId);
+        await record({ tx, result, before, after });
+        return result;
+      });
+      grantLock = run.catch(() => undefined);
+      return run;
+    });
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockImplementation(async (_companyId, requested) => requested);
     mockBudgetService.upsertPolicy.mockResolvedValue(undefined);
@@ -2519,6 +2543,21 @@ describe("agent permission routes", () => {
       await patchPermissions({ canCreateAgents: false, canCreateSkills: false, canAssignTasks: false });
       expect(activityCalls("agent.permissions_updated")).toHaveLength(2);
       expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(0);
+    });
+
+    it("records one removal for overlapping requests that remove the last assignment grant", async () => {
+      grants = [{ permissionKey: "tasks:assign", scope: null }];
+
+      await Promise.all([
+        patchPermissions({ canCreateAgents: false, canAssignTasks: false }),
+        patchPermissions({ canCreateAgents: false, canAssignTasks: false }),
+      ]);
+
+      const updates = activityCalls("agent.permissions_updated");
+      expect(updates.map((entry) => entry.details.before.permissionKeys)).toEqual([["tasks:assign"], []]);
+      expect(updates.map((entry) => entry.details.after.permissionKeys)).toEqual([[], []]);
+      expect(activityCalls("agent.assignment_grants_removed")).toHaveLength(1);
+      expect(mockAccessService.changePrincipalGrantsAudited).toHaveBeenCalledTimes(2);
     });
 
     it("does not record a removal while tasks:assign_scope remains", async () => {
