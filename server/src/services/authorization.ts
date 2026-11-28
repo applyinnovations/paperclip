@@ -1898,6 +1898,9 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
      * work for itself needs a grant covering itself (new agents get
      * tasks:assign_scope rooted at themselves). Checking out an issue already
      * assigned to the agent does not reach this decision.
+     * project:write_workspace uses the same rule (APP-794): the request scope
+     * is { projectId, assigneeAgentId: actor }, so a scope-only agent writes
+     * workspaces only for projects its scope covers.
      * Returns a denial, or null when the grants allow the target.
      */
     async function denyAssignmentOutsideAgentGrants(
@@ -1910,8 +1913,9 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         return deny({
           action: input.action,
           reason: "deny_missing_grant",
-          explanation:
-            "Assignment denied: this agent holds neither tasks:assign nor tasks:assign_scope, so it cannot assign tasks.",
+          explanation: input.action === "project:write_workspace"
+            ? "Workspace write denied: this agent holds neither tasks:assign nor tasks:assign_scope, so it cannot change project workspaces."
+            : "Assignment denied: this agent holds neither tasks:assign nor tasks:assign_scope, so it cannot assign tasks.",
         });
       }
       const scoped = await decidePrincipalGrant({
@@ -1926,8 +1930,9 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       return deny({
         action: input.action,
         reason: scoped.reason === "deny_missing_membership" ? scoped.reason : "deny_scope",
-        explanation:
-          "Assignment denied: this agent holds only tasks:assign_scope, and the target assignee is outside that scope.",
+        explanation: input.action === "project:write_workspace"
+          ? "Workspace write denied: this agent holds only tasks:assign_scope, and this project is outside that scope."
+          : "Assignment denied: this agent holds only tasks:assign_scope, and the target assignee is outside that scope.",
         grant: scoped.grant,
       });
     }
@@ -2622,12 +2627,14 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         if (grantDecision.allowed) return grantDecision;
         return denyRestrictedAssignmentPolicy(policyEffect);
       }
-      if (input.action === "tasks:assign") {
-        const grantDeny = await denyAssignmentOutsideAgentGrants(actorAgentId, {
-          requireGrant: trustResolution.kind === "standard",
-        });
-        if (grantDeny) return grantDeny;
-      }
+      // project:write_workspace is authorised by tasks:assign (see
+      // permissionForAction), so it shares the same grant confinement:
+      // revoking both assignment grants revokes workspace writes, and a
+      // scope-only agent may write only inside its scope (APP-794).
+      const grantDeny = await denyAssignmentOutsideAgentGrants(actorAgentId, {
+        requireGrant: trustResolution.kind === "standard",
+      });
+      if (grantDeny) return grantDeny;
       if (trustResolution.kind === "standard") return decideVisibleIssueWrite();
       return allow({
         action: input.action,

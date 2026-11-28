@@ -936,6 +936,9 @@ describeEmbeddedPostgres("authorization service", () => {
     const company = await createCompany(db, "ResponsibleUserUnavailable");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
     const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    // The agent itself may assign (APP-786 denies grantless agents first), so
+    // the denial under test is the responsible-user ceiling.
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
 
     const decision = await authorizationService(db).decide({
       actor: {
@@ -1551,6 +1554,88 @@ describeEmbeddedPostgres("authorization service", () => {
       await revokeAgentGrant(company.id, actorAgent.id, "tasks:assign");
 
       expect(await assign(company.id, actorAgent.id, other.id)).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+  });
+
+  describe("project:write_workspace follows the assignment grant confinement (APP-794)", () => {
+    // Same request shape as assertProjectWorkspaceWriteAllowed in routes/projects.ts.
+    async function writeWorkspace(companyId: string, actorAgentId: string, projectId: string) {
+      return authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId, source: "agent_key" },
+        action: "project:write_workspace",
+        resource: { type: "issue", companyId, projectId, assigneeAgentId: actorAgentId },
+        scope: { projectId, assigneeAgentId: actorAgentId },
+      });
+    }
+
+    async function activeMember(companyId: string) {
+      const agent = await createAgent(db, companyId);
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "agent",
+        principalId: agent.id,
+        status: "active",
+        membershipRole: "member",
+      });
+      return agent;
+    }
+
+    async function addGrant(companyId: string, agentId: string, permissionKey: PermissionKey, scope: Record<string, unknown> | null = null) {
+      await db.insert(principalPermissionGrants).values({
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        permissionKey,
+        scope,
+        grantedByUserId: null,
+      });
+    }
+
+    it("denies an agent holding neither assignment grant on an unprotected project", async () => {
+      const company = await createCompany(db, "WorkspaceNoGrant");
+      const project = await createProject(db, company.id, "Unprotected");
+      const actorAgent = await activeMember(company.id);
+
+      const denied = await writeWorkspace(company.id, actorAgent.id, project.id);
+      expect(denied).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+      expect(denied.explanation).toContain("Workspace write denied");
+      expect(denied.explanation).toContain("neither tasks:assign nor tasks:assign_scope");
+    });
+
+    it("confines a scope-only agent to the projects its scope covers", async () => {
+      const company = await createCompany(db, "WorkspaceScopeOnly");
+      const inScope = await createProject(db, company.id, "InScope");
+      const outOfScope = await createProject(db, company.id, "OutOfScope");
+      const actorAgent = await activeMember(company.id);
+      await addGrant(company.id, actorAgent.id, "tasks:assign_scope", { projectId: inScope.id, assigneeAgentId: actorAgent.id });
+
+      expect(await writeWorkspace(company.id, actorAgent.id, inScope.id)).toMatchObject({ allowed: true });
+      const denied = await writeWorkspace(company.id, actorAgent.id, outOfScope.id);
+      expect(denied).toMatchObject({ allowed: false, reason: "deny_scope", grant: { permissionKey: "tasks:assign_scope" } });
+      expect(denied.explanation).toContain("this project is outside that scope");
+    });
+
+    it("keeps broad tasks:assign holders allowed and revokes workspace writes when the grants are removed", async () => {
+      const company = await createCompany(db, "WorkspaceRevoke");
+      const project = await createProject(db, company.id, "Unprotected");
+      const actorAgent = await activeMember(company.id);
+      await addGrant(company.id, actorAgent.id, "tasks:assign");
+      await addGrant(company.id, actorAgent.id, "tasks:assign_scope", { projectId: project.id });
+
+      expect(await writeWorkspace(company.id, actorAgent.id, project.id)).toMatchObject({
+        allowed: true,
+        reason: "allow_visible_issue_write",
+      });
+
+      await db.delete(principalPermissionGrants).where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalId, actorAgent.id),
+      ));
+
+      expect(await writeWorkspace(company.id, actorAgent.id, project.id)).toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
     });
   });
 
