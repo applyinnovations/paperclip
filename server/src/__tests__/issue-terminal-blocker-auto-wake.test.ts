@@ -10,6 +10,10 @@ import { loadTerminalBlockerAutoWakeStates, terminalBlockerAutoWakeKey } from ".
 import { decisionRetentionService } from "../services/decision-retention.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { wakeStrandedTerminalBlocker } from "../services/recovery/terminal-blocker-auto-wake.js";
+import { createHeartbeatQueue, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake } from "../services/heartbeat/queue.js";
+import { mergeCoalescedContextSnapshot } from "../services/heartbeat/run-preparation.js";
+import { createWakeQueue } from "../modules/wake-queue/index.js";
+import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -140,34 +144,85 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
     ]);
   });
 
-  it("admits one wake when concurrent sweeps reach admission for the same attempt together", async () => {
-    const f = await fixture({ quietMinutes: 30, dependents: 2 });
-    const calls: string[] = [];
-    // Both sweeps pass the "already sent?" pre-check together: the first one to
-    // reach the enqueue holds there, before inserting, until the other sweep has
-    // finished. Without atomic admission the other sweep enqueues a second wake.
-    const sweeps: Array<Promise<unknown>> = [];
-    let first = true;
-    const enqueueWakeup = vi.fn(async (agentId: string, input: Record<string, any>) => {
-      calls.push(input.idempotencyKey);
-      if (first) { first = false; await Promise.race(sweeps); }
-      const [row] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: input.source,
-        triggerDetail: input.triggerDetail, reason: input.reason, payload: input.payload,
-        idempotencyKey: input.idempotencyKey, status: "queued" }).returning();
-      return { id: row.id };
+  /**
+   * The real heartbeat queue on `owner`, with dispatch held (task_drain keeps
+   * admission, stops before any claim), so admission is what is under test.
+   */
+  function realQueue(owner: Db) {
+    const deps = createHeartbeatQueueTestDependencies(owner);
+    deps.getAgent.mockImplementation(async (id: string) =>
+      (await owner.select().from(agents).where(eq(agents.id, id)))[0] ?? null as never);
+    deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "task_drain" });
+    const admission = createWakeQueue(owner, {
+      resolveResponsibleUserId: async () => null,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
     });
-    sweeps.push(sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1));
-    const results = await Promise.all(sweeps) as Array<Awaited<ReturnType<typeof wakeStrandedTerminalBlocker>>>;
-    expect(calls).toHaveLength(1);
-    const rows = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
-      eq(agentWakeupRequests.reason, ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON)));
-    expect(rows).toHaveLength(1);
+    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(admission.createAdmissionTransactionScope);
+    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
+    return { deps, queue: createHeartbeatQueue(owner, deps) };
+  }
+  const wakeRows = (companyId: string) => db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON)));
+
+  it("admits one wake when concurrent sweeps reach the real queue's admission for the same attempt together", async () => {
+    const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    const { queue, deps } = realQueue(db);
+    // Both sweeps pass the "already sent?" pre-check and enter the real
+    // enqueue together. The blocker's issue row lock decides: the second
+    // admission waits for the first, then sees its row and admits nothing.
+    let release!: () => void;
+    const bothArrived = new Promise<void>(resolve => { release = resolve; });
+    const keys: string[] = [];
+    const enqueueWakeup = vi.fn(async (agentId: string, input: Record<string, any>) => {
+      keys.push(input.idempotencyKey);
+      if (keys.length === 2) release();
+      await bothArrived;
+      return queue.enqueueWakeup(agentId, input as never);
+    });
+    const results = await Promise.all([sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1)]);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    const rows = await wakeRows(f.companyId);
+    expect(rows.map(row => row.idempotencyKey)).toEqual([keys[0]]);
+    expect(rows[0]).toMatchObject({ agentId: f.reviewer, status: "queued" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
     // The loser counts the attempt as admitted, not as a failed enqueue.
     expect(results.filter(result => result.woken)).toHaveLength(1);
     expect(results.filter(result => result.failed)).toHaveLength(0);
     for (const result of results) expect(result.retryAt).not.toBeNull();
     expect(await activity(f.companyId, "issue.terminal_blocker_auto_wake")).toHaveLength(1);
+    expect(deps.executeRun).not.toHaveBeenCalled();
+    // A later sweep for the same attempt is stopped by the queue, too.
+    expect(await queue.enqueueWakeup(f.reviewer, { ...enqueueWakeup.mock.calls[0]![1] } as never)).toBeNull();
+    expect(await wakeRows(f.companyId)).toHaveLength(1);
   });
+
+  it("completes admission on a one-connection pool", async () => {
+    // DATABASE_POOL_MAX=1 is supported. The sweep must not hold a connection
+    // (lock or transaction) while the queue needs one for the enqueue.
+    const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    const single = createDb(external ?? temporary!.connectionString, { maxConnections: 1 });
+    single.$client.options.onnotice = () => {};
+    try {
+      const { queue } = realQueue(single);
+      const enqueueWakeup = (agentId: string, input: Record<string, any>) => queue.enqueueWakeup(agentId, input as never);
+      const run = (index: number) => wakeStrandedTerminalBlocker(single, enqueueWakeup as never,
+        { companyId: f.companyId, blockedIssueId: f.dependents[index]!.id });
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("sweep hung on a one-connection pool")), 15_000); });
+      try {
+        // Two sweeps for the same blocker share the single connection.
+        const results = await Promise.race([Promise.all([run(0), run(1)]), timeout]);
+        expect(results.filter(result => result.failed)).toHaveLength(0);
+        expect(results.filter(result => result.woken)).toHaveLength(1);
+      } finally { clearTimeout(timer); }
+      expect(await wakeRows(f.companyId)).toHaveLength(1);
+    } finally { await single.$client.end({ timeout: 1 }); }
+  }, 30_000);
 
   it("retries once after the backoff, then gives the board a card that says so", async () => {
     const f = await fixture({ quietMinutes: 30 });

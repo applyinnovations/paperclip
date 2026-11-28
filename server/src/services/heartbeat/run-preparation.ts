@@ -836,6 +836,13 @@ export interface WakeupOptions {
     statusVersion?: number;
     monitorNextCheckAt?: string;
     monitorWakeRequestedAt?: string;
+    /**
+     * Admit at most one wake per idempotency key on this issue. Checked under
+     * the issue row lock, so concurrent callers cannot both deliver; the loser
+     * gets null and no receipt row. The caller needs no lock or connection of
+     * its own across the enqueue.
+     */
+    oncePerIdempotencyKey?: boolean;
     /** Internal diagnostic only; the callback cannot grant admission. */
     onExecutionDeferred?: (blockerCause: string) => void;
   };

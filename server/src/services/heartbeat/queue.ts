@@ -3350,6 +3350,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             })) return { kind: "deferred" as const };
           }
           const issueStateGuard = opts.issueStateGuard;
+          // One wake per key on this issue (APP-769): the issue lock above
+          // serializes concurrent callers, so the second sees the first's row.
+          if (issueStateGuard?.oncePerIdempotencyKey && opts.idempotencyKey) {
+            const [admitted] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey))).limit(1);
+            if (admitted) return { kind: "skipped" as const };
+          }
           const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
             : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
