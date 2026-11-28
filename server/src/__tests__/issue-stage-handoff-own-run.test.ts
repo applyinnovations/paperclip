@@ -9,6 +9,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companySkills,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -59,6 +60,7 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
