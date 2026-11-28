@@ -1375,6 +1375,61 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       expect(ids).not.toContain(privateIssueId);
     });
 
+    // APP-872: issues.list pages in SQL; the host must not window the result a
+    // second time, or every page after the first skips `offset` rows.
+    it("pages issues.list once, with privacy filtered before paging", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const base = Date.UTC(2026, 0, 1);
+      const openIds: string[] = [];
+      const privateIds: string[] = [];
+      const rows = Array.from({ length: 9 }, (_, index) => {
+        const id = randomUUID();
+        // Interleave private issues so a post-paging privacy filter would
+        // produce short pages.
+        const visibility = index === 2 || index === 5 ? "private" : "open";
+        (visibility === "private" ? privateIds : openIds).push(id);
+        return {
+          id,
+          companyId,
+          title: `Paged issue ${index}`,
+          status: "todo",
+          priority: "medium",
+          visibility,
+          createdAt: new Date(base + index * 60_000),
+          updatedAt: new Date(base + index * 60_000),
+        };
+      });
+      await db.insert(issues).values(rows as any);
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
+
+      const all = (await services.issues.list({ companyId })).map((issue) => issue.id);
+      expect(all).toHaveLength(7);
+      expect(new Set(all)).toEqual(new Set(openIds));
+
+      const pages: string[][] = [];
+      for (let offset = 0; offset < 9; offset += 3) {
+        const page = (await services.issues.list({ companyId, limit: 3, offset })).map((issue) => issue.id);
+        expect(page).toEqual(all.slice(offset, offset + 3));
+        pages.push(page);
+      }
+      expect(pages.map((page) => page.length)).toEqual([3, 3, 1]);
+      const union = pages.flat();
+      expect(union).toHaveLength(new Set(union).size);
+      expect(union).toEqual(all);
+
+      const stringPage = (await services.issues.list({ companyId, limit: "3", offset: "3" } as any))
+        .map((issue) => issue.id);
+      const numberPage = (await services.issues.list({ companyId, limit: 3, offset: 3 })).map((issue) => issue.id);
+      expect(stringPage).toEqual(numberPage);
+      expect(stringPage).toEqual(all.slice(3, 6));
+
+      await expect(services.issues.list({ companyId, limit: 0 })).resolves.toEqual([]);
+
+      for (const id of [...all, ...union, ...stringPage]) {
+        expect(privateIds).not.toContain(id);
+      }
+    });
+
     it("returns null from issues.get for a private issue", async () => {
       const { companyId, openIssueId, privateIssueId } = await seedOpenAndPrivate();
       const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
