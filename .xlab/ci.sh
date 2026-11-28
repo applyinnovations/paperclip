@@ -76,8 +76,11 @@ if $fhs_ci; then
   # tini -s reaps orphaned test children, as an init would; nothing in the
   # step does, and some tests wait for a killed child to disappear. The
   # tests also run without the compiler variables the Nix shell exports
-  # (AR=ar, CC=gcc, ...): Ubuntu sets none, and the redactor masks their
-  # short values inside unrelated strings.
+  # (AR=ar, CC=gcc, ...), its build parallelism (NIX_BUILD_CORES, e.g. 24) or
+  # the shell derivation's name, which reads "test" inside vitest workers:
+  # Ubuntu sets none, and the redactor masks their short values inside
+  # unrelated strings (@types+node@24.13.3, recovery.test.ts).
+  # test_env_guard.mjs checks the environment the tests start with.
   # nix-v1 mounts its scratch volume at /tmp, so the tests' temporary
   # directories sit on a different filesystem from /. Git then stops its
   # repository search at /tmp and reports "not a git repository (or any
@@ -86,9 +89,10 @@ if $fhs_ci; then
   # Upstream's /tmp is on the root filesystem; let Git search across mounts
   # as it would there.
   as_test_user=(env -u AR -u AS -u CC -u CXX -u LD -u NM -u OBJCOPY -u OBJDUMP
-    -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP
+    -u RANLIB -u READELF -u SIZE -u STRINGS -u STRIP -u NIX_BUILD_CORES -u name
     HOME="$test_root/home" TMPDIR="$test_root/tmp" GIT_DISCOVERY_ACROSS_FILESYSTEM=1
     setpriv --reuid=1000 --regid=1000 --clear-groups -- tini -s --)
+  step test-env "${as_test_user[@]}" node .xlab/test_env_guard.mjs
 fi
 # Pull requests run the test files they add or change. Import-graph selection
 # (vitest --changed) still picks most of the suite for any server change, and
