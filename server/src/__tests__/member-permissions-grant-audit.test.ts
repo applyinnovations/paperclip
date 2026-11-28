@@ -80,7 +80,7 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
     await tempDb?.cleanup();
   });
 
-  async function setup(agentStatus = "idle") {
+  async function setup() {
     const company = await db.insert(companies).values({
       name: `Grant Audit ${randomUUID()}`,
       issuePrefix: `GA${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}`,
@@ -93,15 +93,22 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
       status: "active",
       membershipRole: "owner",
     });
+    const userMember = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `operator-${randomUUID()}`,
+      status: "active",
+      membershipRole: "operator",
+    }).returning().then((rows) => rows[0]!);
     const agent = await db.insert(agents).values({
       companyId: company.id,
       name: "Audited agent",
       role: "engineer",
-      status: agentStatus,
+      status: "idle",
       adapterType: "process",
       adapterConfig: {},
     }).returning().then((rows) => rows[0]!);
-    const member = await db.insert(companyMemberships).values({
+    const agentMember = await db.insert(companyMemberships).values({
       companyId: company.id,
       principalType: "agent",
       principalId: agent.id,
@@ -112,18 +119,23 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
     const activity = async (action: string) =>
       db.select().from(activityLog)
         .where(and(eq(activityLog.companyId, company.id), eq(activityLog.action, action)));
+    const patchGrants = (
+      memberId: string,
+      grants: Array<{ permissionKey: string; scope?: Record<string, unknown> | null }>,
+    ) => request(app).patch(`/api/companies/${company.id}/members/${memberId}/permissions`).send({ grants });
     const updates: Array<Record<string, any>> = [];
     // Returns the route's own permissions_updated entry, so ordering by a
     // shared timestamp never matters.
     const putGrants = async (grants: Array<{ permissionKey: string; scope?: Record<string, unknown> | null }>) => {
-      await request(app).patch(`/api/companies/${company.id}/members/${member.id}/permissions`).send({ grants });
+      const res = await patchGrants(userMember.id, grants);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
       const seen = new Set(updates.map((entry) => entry.id));
       const fresh = (await activity("company_member.permissions_updated")).filter((entry) => !seen.has(entry.id));
       expect(fresh).toHaveLength(1);
       updates.push(fresh[0]!);
       return fresh[0]!;
     };
-    return { company, ownerUserId, agent, member, putGrants, activity };
+    return { company, agent, agentMember, userMember, patchGrants, putGrants, activity };
   }
 
   const ids = (overrides: Partial<Record<"projectIds" | "agentIds" | "userIds" | "subtreeRootAgentIds", string[]>>) => ({
@@ -135,7 +147,7 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
   });
 
   it("records before and after grants, including scope-only edits", async () => {
-    const { agent, member, putGrants, activity } = await setup();
+    const { agent, userMember, putGrants, activity } = await setup();
 
     const entries = [
       await putGrants([{ permissionKey: "agents:read" }]),
@@ -149,8 +161,9 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
         { permissionKey: "tasks:assign" },
         { permissionKey: "tasks:assign_scope", scope: { subtreeRootAgentId: agent.id, allow: ["project:project-c"] } },
       ]),
+      await putGrants([{ permissionKey: "agents:read" }]),
     ];
-    expect(entries.every((entry) => entry.entityId === member.id)).toBe(true);
+    expect(entries.every((entry) => entry.entityId === userMember.id)).toBe(true);
     expect(entries[1]!.details).toMatchObject({
       grantCount: 3,
       before: { permissionKeys: ["agents:read"], assignScope: null },
@@ -173,55 +186,36 @@ describeEmbeddedPostgres("member permissions route grant audit", () => {
         },
       },
     });
+    // Removing both assignment grants shows in before/after.
+    expect(entries[3]!.details).toMatchObject({
+      grantCount: 1,
+      before: entries[2]!.details!.after,
+      after: { permissionKeys: ["agents:read"], assignScope: null },
+    });
     expect(JSON.stringify(entries.map((entry) => entry.details))).not.toContain("secretNote");
+    // The principal is a user, so there is no agent removal event.
     expect(await activity("agent.assignment_grants_removed")).toHaveLength(0);
   });
 
-  it("records the removal of an agent's last assignment grant once", async () => {
-    const { agent, ownerUserId, putGrants, activity } = await setup();
-
-    await putGrants([
-      { permissionKey: "tasks:assign" },
-      { permissionKey: "tasks:assign_scope", scope: { subtreeRootAgentId: agent.id } },
-    ]);
-    await putGrants([{ permissionKey: "tasks:assign_scope", scope: { subtreeRootAgentId: agent.id } }]);
-    expect(await activity("agent.assignment_grants_removed")).toHaveLength(0);
-
-    await putGrants([{ permissionKey: "agents:read" }]);
-    const removed = await activity("agent.assignment_grants_removed");
-    expect(removed).toHaveLength(1);
-    expect(removed[0]).toMatchObject({
-      actorType: "user",
-      actorId: ownerUserId,
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        before: {
-          permissionKeys: ["tasks:assign_scope"],
-          assignScope: { "tasks:assign_scope": ids({ subtreeRootAgentIds: [agent.id] }) },
-        },
-        after: { permissionKeys: ["agents:read"], assignScope: null },
-        sourceAction: "company_member.permissions_updated",
-      },
+  // The route refuses non-human members (getProtectedMemberReason), so it
+  // cannot strip an agent's assignment grant; agent grants change through the
+  // agent permission routes, which record agent.assignment_grants_removed.
+  it("refuses an agent member without changing grants or writing activity", async () => {
+    const { company, agent, agentMember, patchGrants, activity } = await setup();
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      permissionKey: "tasks:assign",
     });
 
-    // A no-op and an unrelated update while the agent already has none.
-    await putGrants([{ permissionKey: "agents:read" }]);
-    await putGrants([]);
-    expect(await activity("agent.assignment_grants_removed")).toHaveLength(1);
-    expect(await activity("company_member.permissions_updated")).toHaveLength(5);
-  });
+    const res = await patchGrants(agentMember.id, [{ permissionKey: "agents:read" }]);
 
-  it.each(["pending_approval", "terminated"])("does not record a removal for a %s agent", async (status) => {
-    const { putGrants, activity } = await setup(status);
-
-    await putGrants([{ permissionKey: "tasks:assign" }]);
-    const entry = await putGrants([]);
-
-    expect(entry.details).toMatchObject({
-      before: { permissionKeys: ["tasks:assign"] },
-      after: { permissionKeys: [], assignScope: null },
-    });
+    expect(res.status).toBe(403);
+    const grants = await db.select().from(principalPermissionGrants)
+      .where(and(eq(principalPermissionGrants.companyId, company.id), eq(principalPermissionGrants.principalId, agent.id)));
+    expect(grants.map((grant) => grant.permissionKey)).toEqual(["tasks:assign"]);
+    expect(await activity("company_member.permissions_updated")).toHaveLength(0);
     expect(await activity("agent.assignment_grants_removed")).toHaveLength(0);
   });
 });

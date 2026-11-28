@@ -4638,6 +4638,8 @@ export function accessRoutes(
           after: grantsAfter,
         },
       });
+      // Unreachable today: assertCanManageCompanyMember refuses non-human
+      // members. Kept so this route stays covered if that guard is relaxed.
       if (updated.principalType === "agent") {
         const agent = await agents.getById(updated.principalId);
         const grantsRemoved = assignmentGrantsRemovedActivity({
