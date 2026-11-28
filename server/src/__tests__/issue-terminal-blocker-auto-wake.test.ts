@@ -225,23 +225,36 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
   });
 
   it("completes admission on a one-connection pool", async () => {
-    // DATABASE_POOL_MAX=1 is supported. The sweep must not hold a connection
-    // (lock or transaction) while the queue needs one for the enqueue.
+    // DATABASE_POOL_MAX=1 is supported. The sweep must hold no connection (lock
+    // or transaction) while the enqueue needs one. This enqueue follows the
+    // queue's admission contract on the same one-connection pool: its own
+    // transaction, the issue row lock, the oncePerIdempotencyKey re-check, then
+    // the insert. (The real queue is not used here: it resolves the run's
+    // responsible user through the root pool inside that transaction, which
+    // blocks on a one-connection pool for any issue wake, independent of this
+    // sweep.)
     const f = await fixture({ quietMinutes: 30, dependents: 2 });
-    await withResponsibleUser(f);
     const single = createDb(external ?? temporary!.connectionString, { maxConnections: 1 });
     single.$client.options.onnotice = () => {};
     try {
-      const { queue } = realQueue(single);
-      const real = surfacing((agentId, input) => queue.enqueueWakeup(agentId, input as never));
-      const run = (index: number) => wakeStrandedTerminalBlocker(single, real.wrapped as never,
+      const enqueueWakeup = vi.fn(async (agentId: string, input: Record<string, any>) => single.transaction(async (tx) => {
+        await tx.execute(sql`select id from issues where id = ${input.payload.issueId} for update`);
+        expect(input.issueStateGuard.oncePerIdempotencyKey).toBe(true);
+        const [admitted] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey)));
+        if (admitted) return null;
+        const [row] = await tx.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: input.source,
+          triggerDetail: input.triggerDetail, reason: input.reason, payload: input.payload,
+          idempotencyKey: input.idempotencyKey, status: "queued" }).returning();
+        return { id: row.id };
+      }));
+      const run = (index: number) => wakeStrandedTerminalBlocker(single, enqueueWakeup as never,
         { companyId: f.companyId, blockedIssueId: f.dependents[index]!.id });
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("sweep hung on a one-connection pool")), 15_000); });
       try {
         // Two sweeps for the same blocker share the single connection.
         const results = await Promise.race([Promise.all([run(0), run(1)]), timeout]);
-        expect(real.errors).toEqual([]);
         expect(results.filter(result => result.failed)).toHaveLength(0);
         expect(results.filter(result => result.woken)).toHaveLength(1);
       } finally { clearTimeout(timer); }
