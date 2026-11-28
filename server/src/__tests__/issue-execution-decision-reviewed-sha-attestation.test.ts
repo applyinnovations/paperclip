@@ -19,6 +19,7 @@ import {
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { activityRoutes } from "../routes/activity.js";
 import { setPluginEventBus } from "../services/activity-log.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -87,6 +88,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any));
+    testApp.use("/api", activityRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -239,6 +241,22 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
       .send(body);
   }
 
+  /** The decision as plugins see it: `listExecutionDecisions` through the host services. */
+  async function effective(companyId: string, issueId: string, decisionId: string) {
+    const services = buildHostServices(db, "plugin-record-id", "test.reviewed-sha-attestation", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+    } as any);
+    const listed = await services.issues.listExecutionDecisions({ issueId, companyId });
+    return listed.find((decision) => decision.decisionId === decisionId)!;
+  }
+
+  async function amendedActivity(issueId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.execution_decision_amended")));
+  }
+
   async function snapshot(issueId: string) {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const decisions = await db
@@ -253,7 +271,10 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     const before = await snapshot(seeded.issueId);
     const reviewBefore = before.decisions.find((row) => row.id === seeded.reviewDecisionId)!;
     const boardBefore = before.decisions.find((row) => row.id === seeded.boardDecisionId)!;
-    expect(reviewBefore.reviewedShaAttested).toBeNull();
+    expect(await effective(seeded.companyId, seeded.issueId, seeded.reviewDecisionId)).toMatchObject({
+      reviewedSha: null,
+      reviewedShaSource: null,
+    });
     await vi.waitFor(() => expect(emitted.filter((event) => event.eventType === RECORDED)).toHaveLength(2));
     emitted.length = 0;
 
@@ -274,31 +295,30 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     });
     expect(Date.parse(res.body.reviewedShaAttestedAt)).toBeGreaterThanOrEqual(reviewBefore.createdAt.getTime());
 
-    // The original decision, the board decision and the stage state are untouched.
+    // Both decision rows and the stage state are untouched.
     const after = await snapshot(seeded.issueId);
     expect(after.issue.executionState).toEqual(before.issue.executionState);
     expect(after.issue.status).toBe(before.issue.status);
     expect(after.decisions.find((row) => row.id === seeded.boardDecisionId)).toEqual(boardBefore);
-    const reviewAfter = after.decisions.find((row) => row.id === seeded.reviewDecisionId)!;
-    expect(reviewAfter).toMatchObject({
-      body: reviewBefore.body,
-      createdAt: reviewBefore.createdAt,
-      updatedAt: reviewBefore.updatedAt,
-      stageId: reviewBefore.stageId,
-      outcome: "approved",
-      reviewedShaAttested: REVIEWED_SHA,
-      reviewedShaAttestedByAgentId: seeded.reviewerAgentId,
-      reviewedShaAttestedByUserId: null,
-      reviewedShaAttestedByRunId: seeded.reviewerRunId,
-      reviewedShaAttestationComment: "Approval comment omitted the Reviewed-SHA line; this is the head I reviewed.",
+    expect(after.decisions.find((row) => row.id === seeded.reviewDecisionId)).toEqual(reviewBefore);
+
+    // The attestation is the audited activity row: who, when, run and comment.
+    const [activity] = await amendedActivity(seeded.issueId);
+    expect(activity).toMatchObject({
+      actorType: "agent",
+      actorId: seeded.reviewerAgentId,
+      agentId: seeded.reviewerAgentId,
+      runId: seeded.reviewerRunId,
+    });
+    expect(activity!.details).toMatchObject({
+      decisionId: seeded.reviewDecisionId,
+      amendment: "reviewed_sha_attested",
+      reviewedSha: REVIEWED_SHA,
+      reviewedShaAttestedAt: res.body.reviewedShaAttestedAt,
+      attestationComment: "Approval comment omitted the Reviewed-SHA line; this is the head I reviewed.",
     });
 
-    // Audited, and plugins hear `amended`, not a second `recorded`.
-    const [activity] = await db
-      .select()
-      .from(activityLog)
-      .where(and(eq(activityLog.entityId, seeded.issueId), eq(activityLog.action, "issue.execution_decision_amended")));
-    expect(activity).toMatchObject({ actorType: "agent", actorId: seeded.reviewerAgentId, runId: seeded.reviewerRunId });
+    // Plugins hear `amended`, not a second `recorded`.
     await vi.waitFor(() => expect(emitted.filter((event) => event.eventType === AMENDED)).toHaveLength(1));
     const amended = emitted.find((event) => event.eventType === AMENDED)!;
     expect(amended).toMatchObject({ entityType: "issue", entityId: seeded.issueId, actorId: seeded.reviewerAgentId });
@@ -348,13 +368,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     );
     expect(foreignRes.status).toBe(404);
 
-    const { decisions } = await snapshot(seeded.issueId);
-    expect(decisions.every((row) => row.reviewedShaAttested === null)).toBe(true);
-    const amendedActivity = await db
-      .select()
-      .from(activityLog)
-      .where(eq(activityLog.action, "issue.execution_decision_amended"));
-    expect(amendedActivity).toHaveLength(0);
+    expect(await amendedActivity(seeded.issueId)).toHaveLength(0);
+    expect((await effective(seeded.companyId, seeded.issueId, seeded.reviewDecisionId)).reviewedSha).toBeNull();
   });
 
   it("lets a board user attest their own approved decision", async () => {
@@ -365,11 +380,12 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({ stageType: "approval", reviewedSha: REVIEWED_SHA, reviewedShaSource: "attestation" });
-    const [row] = await db
-      .select()
-      .from(issueExecutionDecisions)
-      .where(eq(issueExecutionDecisions.id, seeded.boardDecisionId));
-    expect(row).toMatchObject({ reviewedShaAttestedByUserId: BOARD_USER_ID, reviewedShaAttestedByAgentId: null });
+    const [activity] = await amendedActivity(seeded.issueId);
+    expect(activity).toMatchObject({ actorType: "user", actorId: BOARD_USER_ID, agentId: null });
+    expect(await effective(seeded.companyId, seeded.issueId, seeded.boardDecisionId)).toMatchObject({
+      reviewedSha: REVIEWED_SHA,
+      reviewedShaSource: "attestation",
+    });
   });
 
   it("never replaces a SHA: a second attestation and a body SHA are both refused", async () => {
@@ -408,11 +424,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     expect(bodyRes.status, JSON.stringify(bodyRes.body)).toBe(409);
     expect(bodyRes.body.details).toMatchObject({ code: "reviewed_sha_already_present", reviewedShaSource: "body" });
 
-    const [row] = await db
-      .select()
-      .from(issueExecutionDecisions)
-      .where(eq(issueExecutionDecisions.id, seeded.reviewDecisionId));
-    expect(row!.reviewedShaAttested).toBe(REVIEWED_SHA);
+    expect(await amendedActivity(seeded.issueId)).toHaveLength(1);
+    expect((await effective(seeded.companyId, seeded.issueId, seeded.reviewDecisionId)).reviewedSha).toBe(REVIEWED_SHA);
   });
 
   it("refuses changes-requested decisions, bad SHAs, and decisions from another issue", async () => {
@@ -463,10 +476,66 @@ describeEmbeddedPostgres("POST /issues/:id/execution-decisions/:decisionId/revie
     });
     expect(wrongIssue.status).toBe(404);
 
-    const [row] = await db
-      .select()
-      .from(issueExecutionDecisions)
-      .where(eq(issueExecutionDecisions.id, seeded.reviewDecisionId));
-    expect(row!.reviewedShaAttested).toBeNull();
+    expect(await amendedActivity(seeded.issueId)).toHaveLength(0);
+  });
+
+  it("cannot be forged through generic activity writes", async () => {
+    const seeded = await seedCompletedReviewWithoutSha("XAG");
+    const forgedDetails = {
+      decisionId: seeded.reviewDecisionId,
+      amendment: "reviewed_sha_attested",
+      reviewedSha: OTHER_SHA,
+      reviewedShaAttestedAt: new Date().toISOString(),
+      attestationComment: "forged",
+    };
+
+    // The board's generic activity route refuses the reserved actions,
+    // including posing as the reviewer agent.
+    for (const action of ["issue.execution_decision_amended", "issue.execution_decision.recorded", "Issue.Execution_Decision_Recorded"]) {
+      const res = await request(app(seeded.boardActor))
+        .post(`/api/companies/${seeded.companyId}/activity`)
+        .send({
+          actorType: "agent",
+          actorId: seeded.reviewerAgentId,
+          agentId: seeded.reviewerAgentId,
+          action,
+          entityType: "issue",
+          entityId: seeded.issueId,
+          details: forgedDetails,
+        });
+      expect(res.status, `${action}: ${JSON.stringify(res.body)}`).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "reserved_activity_action" });
+    }
+
+    // Plugin ctx.activity.log refuses them too.
+    const services = buildHostServices(db, "plugin-record-id", "test.reviewed-sha-attestation", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+    } as any);
+    await expect(services.activity.log({
+      companyId: seeded.companyId,
+      message: "issue.execution_decision_amended",
+      entityType: "issue",
+      entityId: seeded.issueId,
+      metadata: forgedDetails,
+    })).rejects.toThrow(/reserved action/);
+
+    // Rows written some other way by anyone but the decision's own actor are ignored.
+    await db.insert(activityLog).values([
+      { companyId: seeded.companyId, actorType: "plugin", actorId: "some-plugin", action: "issue.execution_decision_amended", entityType: "issue", entityId: seeded.issueId, details: forgedDetails },
+      { companyId: seeded.companyId, actorType: "user", actorId: BOARD_USER_ID, action: "issue.execution_decision_amended", entityType: "issue", entityId: seeded.issueId, details: forgedDetails },
+      { companyId: seeded.companyId, actorType: "system", actorId: "system", agentId: seeded.reviewerAgentId, action: "issue.execution_decision_amended", entityType: "issue", entityId: seeded.issueId, details: forgedDetails },
+    ]);
+    expect(await effective(seeded.companyId, seeded.issueId, seeded.reviewDecisionId)).toMatchObject({
+      reviewedSha: null,
+      reviewedShaSource: null,
+    });
+
+    // The real reviewer can still attest.
+    const res = await attest(seeded.reviewerActor, seeded.issueId, seeded.reviewDecisionId, {
+      reviewedSha: REVIEWED_SHA,
+      comment: "The head I reviewed.",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await effective(seeded.companyId, seeded.issueId, seeded.reviewDecisionId)).reviewedSha).toBe(REVIEWED_SHA);
   });
 });

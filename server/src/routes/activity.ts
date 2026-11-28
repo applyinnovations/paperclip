@@ -9,7 +9,7 @@ import { accessService, heartbeatService, issueService } from "../services/index
 import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
-import { logActivity } from "../services/activity-log.js";
+import { isReservedActivityAction, logActivity } from "../services/activity-log.js";
 import { issueContextUsage } from "../services/issue-context-usage.js";
 import { contextCompactionService } from "../services/context-compaction.js";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
@@ -344,6 +344,9 @@ export function activityRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (isReservedActivityAction(req.body.action)) {
+      throw forbidden("This activity action is written only by Paperclip", { code: "reserved_activity_action" });
+    }
     const event = await svc.create({
       companyId,
       ...req.body,

@@ -3151,13 +3151,6 @@
       "when": 1794185816322,
       "tag": "0451_budget_resume_claims",
       "breakpoints": true
-    },
-    {
-      "idx": 452,
-      "version": "7",
-      "when": 1795876623424,
-      "tag": "0452_execution_decision_reviewed_sha_attestation",
-      "breakpoints": true
     }
   ]
 }
