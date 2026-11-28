@@ -456,6 +456,55 @@ describe("codex execute", () => {
     }
   });
 
+  it.each([
+    { name: "inherits host ADC when the launch env leaves it unset", env: {}, expected: "/var/run/pod/adc.json" },
+    { name: "keeps a configured blank over host ADC", env: { GOOGLE_APPLICATION_CREDENTIALS: "" }, expected: "" },
+  ])("Codex tool shells $name (APP-724)", async ({ env, expected }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-adc-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath = path.join(root, "capture.json");
+    await fs.mkdir(workspace, { recursive: true });
+    // Simulates Codex's shell_environment_policy: a tool shell sees only the
+    // include_only names of the CLI's own (inherit="all") environment.
+    await fs.writeFile(commandPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const arg = process.argv.find((value) => value.startsWith("shell_environment_policy.include_only="));
+const includeOnly = JSON.parse(arg.slice(arg.indexOf("=") + 1));
+const shell = Object.fromEntries(includeOnly.filter((key) => key in process.env).map((key) => [key, process.env[key]]));
+fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify({ includeOnly, shell }));
+console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-1" }));
+console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }));
+`, { mode: 0o755 });
+    await seedSharedCodexAuth(root);
+    vi.stubEnv("GOOGLE_APPLICATION_CREDENTIALS", "/var/run/pod/adc.json");
+    vi.stubEnv("HOST_DATABASE_PASSWORD", "host-password");
+    try {
+      const result = await execute({
+        runId: "run-adc",
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli", command: commandPath, cwd: workspace,
+          env: { ...env, PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as { includeOnly: string[]; shell: Record<string, string> };
+      expect(capture.includeOnly).toContain("GOOGLE_APPLICATION_CREDENTIALS");
+      expect(capture.shell.GOOGLE_APPLICATION_CREDENTIALS).toBe(expected);
+      expect(capture.includeOnly).not.toContain("HOST_DATABASE_PASSWORD");
+      expect(capture.shell).not.toHaveProperty("HOST_DATABASE_PASSWORD");
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("injects bridge env into sandbox-managed remote runs", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-sandbox-"));
     const localWorkspace = path.join(root, "workspace");
