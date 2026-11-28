@@ -2,13 +2,13 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { sql } from "drizzle-orm";
 import {
   agents,
   companies,
   companyMemberships,
   createDb,
   heartbeatRuns,
-  issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -113,25 +113,27 @@ describeEmbeddedPostgres("denied tasks:assign decisions emit one security event 
   });
 
   afterEach(async () => {
-    await db.delete(principalPermissionGrants);
-    await db.delete(companyMemberships);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Issue creation also writes activity_log (and other) rows that reference
+    // runs and issues; cascade from companies rather than tracking each table.
+    await db.execute(sql`TRUNCATE companies CASCADE`);
   });
 
   afterAll(async () => {
     await tempDb?.cleanup();
   });
 
-  async function seed(label: string) {
+  // A target agent with a protected assignment policy is "restricted": a
+  // standard agent may assign to it only with a tasks:assign grant. This denies
+  // a grantless actor regardless of the company-default assignment rule.
+  const PROTECTED_TARGET = { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } };
+
+  async function seed(label: string, targetPermissions: Record<string, unknown> = PROTECTED_TARGET) {
     const [company] = await db.insert(companies).values({
       name: `Assign denial log ${label}`,
       issuePrefix: `T${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     }).returning();
-    const insertAgent = async () => {
+    const insertAgent = async (permissions: Record<string, unknown> = {}) => {
       const [agent] = await db.insert(agents).values({
         companyId: company!.id,
         name: `Agent ${randomUUID()}`,
@@ -140,12 +142,12 @@ describeEmbeddedPostgres("denied tasks:assign decisions emit one security event 
         adapterType: "process",
         adapterConfig: {},
         runtimeConfig: {},
-        permissions: {},
+        permissions,
       }).returning();
       return agent!;
     };
     const actorAgent = await insertAgent();
-    const targetAgent = await insertAgent();
+    const targetAgent = await insertAgent(targetPermissions);
     await db.insert(companyMemberships).values({
       companyId: company!.id,
       principalType: "agent",
@@ -176,7 +178,7 @@ describeEmbeddedPostgres("denied tasks:assign decisions emit one security event 
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     // The logged reason/code are the decision's own, as exposed in the 403 details.
-    expect(res.body.details?.reason).toMatch(/^deny_/);
+    expect(res.body.details?.reason).toBe("deny_policy_restricted");
     const events = denialEvents();
     expect(events).toHaveLength(1);
     const [fields, message] = events[0]!;
