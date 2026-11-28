@@ -6,6 +6,7 @@ import { latestFailedRunsByAgent } from "@paperclipai/shared";
 import { agentConfigurationSpec } from "@paperclipai/shared";
 import { agentConfigurationRevision, restoreAgentConfigurationRedactions } from "../lib/agent-configuration-revision.js";
 import { CEO_HIRING_DENIAL_KEY, ceoHiringDenial, normalizeAgentPermissions } from "../lib/agent-permissions.js";
+import { assignmentGrantsRemovedActivity, summarizeAssignmentGrants } from "../lib/assignment-grant-audit.js";
 import { prepareRuntimeSettingsPatch } from "../services/agent-runtime-settings.js";
 import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
 import { connectionManagementService, continuingConnectionManagement } from "../services/connection-management.js";
@@ -5068,6 +5069,9 @@ export function agentRoutes(
           at: new Date().toISOString(),
         } }
       : req.body;
+    const grantsBefore = summarizeAssignmentGrants(
+      await access.listPrincipalGrants(existing.companyId, "agent", existing.id),
+    );
     const agent = await svc.updatePermissions(id, permissionsPatch);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5091,14 +5095,21 @@ export function agentRoutes(
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
 
+    const grantsAfter = summarizeAssignmentGrants(
+      await access.listPrincipalGrants(agent.companyId, "agent", agent.id),
+    );
+
     const actor = getActorInfo(req);
-    await logActivity(db, {
+    const activityActor = {
       companyId: agent.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
+    };
+    await logActivity(db, {
+      ...activityActor,
       action: "agent.permissions_updated",
       entityType: "agent",
       entityId: agent.id,
@@ -5107,8 +5118,18 @@ export function agentRoutes(
         canCreateSkills: agent.permissions?.canCreateSkills ?? true,
         canAssignTasks: effectiveCanAssignTasks,
         trustPreset: agent.permissions?.trustPreset ?? "standard",
+        before: grantsBefore,
+        after: grantsAfter,
       },
     });
+    const grantsRemoved = assignmentGrantsRemovedActivity({
+      actor: activityActor,
+      agent,
+      before: grantsBefore,
+      after: grantsAfter,
+      sourceAction: "agent.permissions_updated",
+    });
+    if (grantsRemoved) await logActivity(db, grantsRemoved);
 
     res.json(await buildAgentDetail(agent));
   });

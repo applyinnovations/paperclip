@@ -60,6 +60,7 @@ import {
   tooManyRequests
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
+import { assignmentGrantsRemovedActivity, summarizeAssignmentGrants } from "../lib/assignment-grant-audit.js";
 import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
 
 /**
@@ -4604,6 +4605,9 @@ export function accessRoutes(
       const memberToUpdate = await access.getMemberById(companyId, memberId);
       if (!memberToUpdate) throw notFound("Member not found");
       await assertCanManageCompanyMember(req, access, companyId, memberToUpdate);
+      const grantsBefore = summarizeAssignmentGrants(
+        await access.listPrincipalGrants(companyId, memberToUpdate.principalType, memberToUpdate.principalId),
+      );
       const updated = await access.setMemberPermissions(
         companyId,
         memberId,
@@ -4611,17 +4615,36 @@ export function accessRoutes(
         req.actor.userId ?? null
       );
       if (!updated) throw notFound("Member not found");
-      await logActivity(db, {
+      const grantsAfter = summarizeAssignmentGrants(
+        await access.listPrincipalGrants(companyId, updated.principalType, updated.principalId),
+      );
+      const activityActor = {
         companyId,
-        actorType: "user",
+        actorType: "user" as const,
         actorId: req.actor.userId ?? "board",
+      };
+      await logActivity(db, {
+        ...activityActor,
         action: "company_member.permissions_updated",
         entityType: "company_membership",
         entityId: memberId,
         details: {
           grantCount: req.body.grants?.length ?? 0,
+          before: grantsBefore,
+          after: grantsAfter,
         },
       });
+      if (updated.principalType === "agent") {
+        const agent = await agents.getById(updated.principalId);
+        const grantsRemoved = assignmentGrantsRemovedActivity({
+          actor: activityActor,
+          agent: agent?.companyId === companyId ? agent : null,
+          before: grantsBefore,
+          after: grantsAfter,
+          sourceAction: "company_member.permissions_updated",
+        });
+        if (grantsRemoved) await logActivity(db, grantsRemoved);
+      }
       const member = (await loadCompanyMemberRecords(db, companyId)).find(
         (entry) => entry.id === memberId,
       );
