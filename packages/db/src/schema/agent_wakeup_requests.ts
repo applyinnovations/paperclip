@@ -106,6 +106,13 @@ export const agentWakeupRequests = pgTable(
       .on(table.companyId, table.idempotencyKey)
       .concurrently()
       .where(sql`${table.idempotencyKey} LIKE 'issue_blocker_stalled:%' AND ${table.status} IN ('queued', 'deferred_issue_execution', 'claimed', 'coalesced', 'completed')`),
+    // One wake per stranded terminal blocker, stall fingerprint and attempt
+    // (issue_terminal_blocker_stranded, APP-761). Concurrent sweeps that both
+    // compute the same attempt cannot both deliver; the loser is already admitted.
+    issueTerminalBlockerStrandedIdempotencyUq: uniqueIndex("agent_wakeup_requests_issue_terminal_blocker_stranded_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .concurrently()
+      .where(sql`${table.idempotencyKey} LIKE 'issue_terminal_blocker_stranded:%' AND ${table.status} <> 'skipped'`),
     companyPayloadIssueIdx: index("agent_wakeup_requests_company_payload_issue_idx").on(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,

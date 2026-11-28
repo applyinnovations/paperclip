@@ -111,6 +111,63 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
     expect(await cards(f.companyId, f.terminal.id)).toEqual([]);
   });
 
+  it("withholds blocked issues the woken agent cannot read, including the parent fallback", async () => {
+    const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    // The reviewer can read the blocker but not the private work waiting on it.
+    await db.update(issues).set({ visibility: "private", title: "Secret acquisition" }).where(eq(issues.id, f.dependents[1]!.id));
+    const [parent] = await db.insert(issues).values({ companyId: f.companyId, identifier: `${f.terminal.identifier}-P`,
+      title: "Secret parent plan", status: "blocked", visibility: "private", assigneeAgentId: f.developer }).returning();
+    await db.update(issues).set({ parentId: parent.id }).where(eq(issues.id, f.terminal.id));
+    const { calls, enqueueWakeup } = wakeRecorder(f.companyId);
+    await sweep(f, enqueueWakeup);
+    expect(calls).toHaveLength(1);
+    for (const field of ["payload", "contextSnapshot"] as const) {
+      const text = JSON.stringify(calls[0]!.input[field]);
+      expect(text).not.toContain("Secret acquisition");
+      expect(text).not.toContain("Secret parent plan");
+      expect(text).not.toContain(f.dependents[1]!.identifier);
+      expect(text).not.toContain(parent.identifier);
+    }
+    const blocked = calls[0]!.input.contextSnapshot.terminalBlockerStranded.blockedIssues as Array<Record<string, unknown>>;
+    expect(blocked).toEqual(expect.arrayContaining([
+      { id: f.dependents[0]!.id, identifier: f.dependents[0]!.identifier, title: "Blocked follow-up 1" },
+      { id: f.dependents[1]!.id, identifier: null, title: "A task you cannot read" },
+      { id: parent.id, identifier: null, title: "A task you cannot read" },
+    ]));
+    expect(calls[0]!.input.contextSnapshot.terminalBlockerStranded.blockedIssueCount).toBe(3);
+    expect(await activity(f.companyId, "issue.terminal_blocker_auto_wake")).toEqual([
+      expect.objectContaining({ details: expect.objectContaining({ blockedIssuesWithheld: 2 }) }),
+    ]);
+  });
+
+  it("admits one wake when concurrent sweeps reach admission for the same attempt together", async () => {
+    const f = await fixture({ quietMinutes: 30, dependents: 2 });
+    const calls: string[] = [];
+    // Both callers pass the existing-row check, then wait here so neither has
+    // inserted before the other reaches the insert.
+    let arrive!: () => void;
+    const bothArrived = new Promise<void>(resolve => { let arrived = 0; arrive = () => { arrived += 1; if (arrived === 2) resolve(); }; });
+    const enqueueWakeup = vi.fn(async (agentId: string, input: Record<string, any>) => {
+      calls.push(input.idempotencyKey);
+      arrive();
+      await bothArrived;
+      const [row] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: input.source,
+        triggerDetail: input.triggerDetail, reason: input.reason, payload: input.payload,
+        idempotencyKey: input.idempotencyKey, status: "queued" }).returning();
+      return { id: row.id };
+    });
+    const results = await Promise.all([sweep(f, enqueueWakeup as never, 0), sweep(f, enqueueWakeup as never, 1)]);
+    expect(calls).toEqual([calls[0], calls[0]]);
+    const rows = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.reason, ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON)));
+    expect(rows).toHaveLength(1);
+    // The loser counts the attempt as admitted, not as a failed enqueue.
+    expect(results.filter(result => result.woken)).toHaveLength(1);
+    expect(results.filter(result => result.failed)).toHaveLength(0);
+    for (const result of results) expect(result.retryAt).not.toBeNull();
+    expect(await activity(f.companyId, "issue.terminal_blocker_auto_wake")).toHaveLength(1);
+  });
+
   it("retries once after the backoff, then gives the board a card that says so", async () => {
     const f = await fixture({ quietMinutes: 30 });
     const { calls, enqueueWakeup } = wakeRecorder(f.companyId);

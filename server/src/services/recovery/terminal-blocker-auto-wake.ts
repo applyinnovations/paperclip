@@ -13,7 +13,10 @@
  *
  * Bounded and debounced: at most `maxAttempts` wakes per stall fingerprint, one
  * idempotency key per terminal blocker + fingerprint + attempt, so N blocked
- * issues behind one blocker cost one wake. State lives in wake rows, so a
+ * issues behind one blocker cost one wake. A partial unique index on that key
+ * makes admission atomic: concurrent sweeps that compute the same attempt
+ * cannot both deliver, and the loser treats the attempt as admitted. Blocked
+ * issues the woken agent cannot read are redacted. State lives in wake rows, so a
  * restart rebuilds it. A pending wake registers its real deadline with the
  * sweep; an exhausted or human-owned blocker registers none.
  */
@@ -24,6 +27,8 @@ import {
   type IssueTerminalBlockerStrandedWakeContext,
 } from "@paperclipai/shared";
 import { logActivity } from "../activity-log.js";
+import { authorizationService } from "../authorization.js";
+import { isUniqueViolation } from "../../db-errors.js";
 import {
   loadTerminalBlockerAutoWakeStates,
   TERMINAL_BLOCKER_AUTO_WAKE,
@@ -35,6 +40,8 @@ import { logger } from "../../middleware/logger.js";
 
 const ACTOR_ID = "issue-terminal-blocker-auto-wake";
 const BLOCKED_ISSUE_SAMPLE = 5;
+/** Partial unique index on (company_id, idempotency_key): one admitted wake per blocker, fingerprint and attempt. */
+const TERMINAL_BLOCKER_STRANDED_WAKE_INDEX = "agent_wakeup_requests_issue_terminal_blocker_stranded_uq";
 /**
  * While an auto-wake runs, the blocked tree reads as live and names no
  * terminal blocker, so the pass cannot see which blocker it waits on. Keep
@@ -66,22 +73,58 @@ export type TerminalBlockerAutoWakeResult = {
   retryAt: number | null;
 };
 
+const sampleColumns = {
+  id: issues.id, identifier: issues.identifier, title: issues.title, status: issues.status, projectId: issues.projectId,
+  parentId: issues.parentId, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId,
+};
+type SampledIssue = { id: string; identifier: string | null; title: string; status: string; projectId: string | null;
+  parentId: string | null; assigneeAgentId: string | null; assigneeUserId: string | null };
+
+/** What the woken agent may see of a blocked issue it cannot read: that it exists, nothing more. */
+const REDACTED_BLOCKED_ISSUE_TITLE = "A task you cannot read";
+
 async function blockedIssueSample(db: Db, companyId: string, terminalIssueId: string, parentId: string | null) {
   const open = sql`${issues.status} not in ('done', 'cancelled') and ${issues.hiddenAt} is null`;
-  const blocked = await db.select({ id: issues.id, identifier: issues.identifier, title: issues.title,
-    total: sql<number>`count(*) over()::int` }).from(issueRelations)
+  const blocked = await db.select({ ...sampleColumns, total: sql<number>`count(*) over()::int` }).from(issueRelations)
     .innerJoin(issues, and(eq(issues.id, issueRelations.relatedIssueId), eq(issues.companyId, issueRelations.companyId)))
     .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks"),
       eq(issueRelations.issueId, terminalIssueId), open))
     .orderBy(issues.id).limit(BLOCKED_ISSUE_SAMPLE);
-  const sample = blocked.map(({ total: _total, ...row }) => row);
+  const sample: SampledIssue[] = blocked.map(({ total: _total, ...row }) => row);
   let count = blocked[0]?.total ?? 0;
   if (parentId) {
-    const [parent] = await db.select({ id: issues.id, identifier: issues.identifier, title: issues.title }).from(issues)
+    const [parent] = await db.select(sampleColumns).from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.id, parentId), eq(issues.status, "blocked")));
     if (parent && !sample.some(row => row.id === parent.id)) { sample.unshift(parent); count += 1; }
   }
   return { sample: sample.slice(0, BLOCKED_ISSUE_SAMPLE), count };
+}
+
+/**
+ * The sampled blocked issues as the woken agent may see them. A blocker can be
+ * readable by an agent that cannot read the private work waiting on it, so
+ * each entry is checked with issue:read under the wake's execution identity
+ * (the agent, on behalf of the blocker's responsible user) and an unreadable
+ * one keeps only its id, as blocker-stall-wakeups.ts does.
+ */
+async function readableBlockedIssues(db: Db, input: {
+  companyId: string; agentId: string; onBehalfOfUserId: string | null; sample: SampledIssue[];
+}) {
+  const access = authorizationService(db);
+  let withheld = 0;
+  const entries = await Promise.all(input.sample.map(async (issue) => {
+    const readable = (await access.decide({
+      actor: { type: "agent", agentId: input.agentId, companyId: input.companyId, onBehalfOfUserId: input.onBehalfOfUserId },
+      action: "issue:read",
+      resource: { type: "issue", companyId: input.companyId, issueId: issue.id, projectId: issue.projectId,
+        parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
+        status: issue.status },
+    })).allowed;
+    if (!readable) withheld += 1;
+    return readable ? { id: issue.id, identifier: issue.identifier, title: issue.title }
+      : { id: issue.id, identifier: null, title: REDACTED_BLOCKED_ISSUE_TITLE };
+  }));
+  return { entries, withheld };
 }
 
 /**
@@ -126,7 +169,8 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
   if (now < state.dueAt) { result.retryAt = state.dueAt; return result; }
 
   const [terminal] = await db.select({ id: issues.id, identifier: issues.identifier, title: issues.title,
-    status: issues.status, statusVersion: issues.statusVersion, parentId: issues.parentId }).from(issues)
+    status: issues.status, statusVersion: issues.statusVersion, parentId: issues.parentId,
+    responsibleUserId: issues.responsibleUserId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, terminalIssueId)));
   if (!terminal) return result;
   const idempotencyKey = terminalBlockerAutoWakeKey(terminal.id, state.fingerprint, state.attempt);
@@ -138,18 +182,20 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
   if (existing) { result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs; return result; }
 
   const blockedIssues = await blockedIssueSample(db, input.companyId, terminal.id, terminal.parentId);
+  const visible = await readableBlockedIssues(db, { companyId: input.companyId, agentId: state.agentId,
+    onBehalfOfUserId: terminal.responsibleUserId, sample: blockedIssues.sample });
   const context: IssueTerminalBlockerStrandedWakeContext = {
     terminalIssueId: terminal.id,
     terminalIssueIdentifier: terminal.identifier,
     terminalIssueStatus: terminal.status,
-    blockedIssues: blockedIssues.sample,
+    blockedIssues: visible.entries,
     blockedIssueCount: blockedIssues.count,
     attempt: state.attempt,
     maxAttempts: TERMINAL_BLOCKER_AUTO_WAKE.maxAttempts,
   };
   const log = { issueId: terminal.id, issueIdentifier: terminal.identifier, agentId: state.agentId, attempt: state.attempt,
     maxAttempts: TERMINAL_BLOCKER_AUTO_WAKE.maxAttempts, fingerprint: state.fingerprint, blockedIssueCount: blockedIssues.count,
-    companyId: input.companyId };
+    blockedIssuesWithheld: visible.withheld, companyId: input.companyId };
   try {
     const wake = await enqueueWakeup(state.agentId, {
       source: "automation", triggerDetail: "system", reason: ISSUE_TERMINAL_BLOCKER_STRANDED_WAKE_REASON,
@@ -168,13 +214,21 @@ export async function wakeStrandedTerminalBlocker(db: Db, enqueueWakeup: Termina
       action: "issue.terminal_blocker_auto_wake", entityType: "issue", entityId: terminal.id,
       agentId: state.agentId, issueId: terminal.id,
       details: { attempt: state.attempt, maxAttempts: TERMINAL_BLOCKER_AUTO_WAKE.maxAttempts, fingerprint: state.fingerprint,
-        blockedIssueCount: blockedIssues.count, visitedBlockedIssueId: blocked.id },
+        blockedIssueCount: blockedIssues.count, blockedIssuesWithheld: visible.withheld, visitedBlockedIssueId: blocked.id },
     });
     logger.info({ event: "terminal_blocker_auto_wake", ...log }, "auto-woke owner of stranded terminal blocker");
     result.woken = true;
     // Come back when the next attempt could be due, or to record exhaustion.
     result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs;
   } catch (err) {
+    // A concurrent sweep (another blocked issue, worker or replica) admitted
+    // this attempt first: the unique key held, so the wake is already sent.
+    if (isUniqueViolation(err, TERMINAL_BLOCKER_STRANDED_WAKE_INDEX)) {
+      logger.info({ event: "terminal_blocker_auto_wake_already_admitted", ...log },
+        "auto-wake attempt for stranded terminal blocker already admitted by a concurrent sweep");
+      result.retryAt = now + TERMINAL_BLOCKER_AUTO_WAKE.quietMs;
+      return result;
+    }
     result.failed = true;
     logger.warn({ err, event: "terminal_blocker_auto_wake_failed", ...log }, "failed to auto-wake owner of stranded terminal blocker");
   }
