@@ -573,7 +573,7 @@ describe("issue execution policy transitions", () => {
     }
     function approve(input: {
       policy: IssueExecutionPolicy;
-      commentBody: string;
+      commentBody?: string;
       decision?: "approve" | "request_changes";
       requestedStatus?: string;
     }) {
@@ -608,6 +608,9 @@ describe("issue execution policy transitions", () => {
     it.each([
       { name: "approve, flagged, no line", flag: true, decision: "approve" as const, body: "LGTM", recorded: false },
       { name: "status done, flagged, no line", flag: true, status: "done", body: "LGTM", recorded: false },
+      { name: "approve, flagged, comment omitted", flag: true, decision: "approve" as const, body: undefined, recorded: false },
+      { name: "status done, flagged, comment omitted", flag: true, status: "done", body: undefined, recorded: false },
+      { name: "approve, flagged, whitespace comment", flag: true, decision: "approve" as const, body: "  \n ", recorded: false },
       { name: "approve, flagged, short sha", flag: true, decision: "approve" as const, body: "LGTM\nReviewed-SHA: 0123456", recorded: false },
       { name: "approve, flagged, uppercase sha", flag: true, decision: "approve" as const, body: `LGTM\nReviewed-SHA: ${sha.toUpperCase()}`, recorded: false },
       { name: "approve, flagged, last line invalid", flag: true, decision: "approve" as const, body: `Reviewed-SHA: ${sha}\nReviewed-SHA: nope`, recorded: false },
@@ -639,6 +642,15 @@ describe("issue execution policy transitions", () => {
       });
       expect(error.message).toContain("Reviewed-SHA: <sha>");
       expect(error.message).toContain("40-character lowercase hexadecimal");
+    });
+
+    it("keeps the generic missing-comment error on unflagged stages", () => {
+      expect(() => approve({ policy: flaggedPolicy(undefined), decision: "approve" })).toThrow(
+        expect.objectContaining({
+          status: 422,
+          details: expect.objectContaining({ code: "structured_review_decision_required" }),
+        }),
+      );
     });
 
     it("does not require the line to request changes", () => {

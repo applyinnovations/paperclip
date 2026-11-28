@@ -245,6 +245,8 @@ describeEmbeddedPostgres("issue.execution_decision.recorded", () => {
     it.each([
       { name: "decision approve without the line", via: "patch", send: { decision: "approve", comment: "LGTM" }, ok: false },
       { name: "status done without the line", via: "patch", send: { status: "done", comment: "LGTM" }, ok: false },
+      { name: "decision approve with the comment omitted", via: "patch", send: { decision: "approve" }, ok: false },
+      { name: "status done with the comment omitted", via: "patch", send: { status: "done" }, ok: false },
       { name: "decision approve with an invalid line", via: "patch", send: { decision: "approve", comment: "LGTM\nReviewed-SHA: abc123" }, ok: false },
       { name: "approving review comment without the line", via: "comment", send: { body: "## Review: APPROVED" }, ok: false },
       { name: "decision approve with a valid line", via: "patch", send: { decision: "approve", comment: `LGTM\n\nReviewed-SHA: ${REVIEWED_SHA}` }, ok: true },

@@ -1141,12 +1141,8 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (principalsEqual(currentParticipant, actor)) {
       if (requestedDecision === "approve" || requestedStatus === "done") {
-        if (!input.commentBody?.trim()) {
-          throw unprocessable(
-            `Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT} ${STRUCTURED_DECISION_GUIDANCE}`,
-            { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
-          );
-        }
+        // A flagged review stage reports the missing Reviewed-SHA line first,
+        // so an omitted comment gets the specific error and the line format.
         if (
           activeStage.type === "review" &&
           activeStage.requireReviewedSha === true &&
@@ -1157,6 +1153,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             stageId: activeStage.id,
             stageType: activeStage.type,
           });
+        }
+        if (!input.commentBody?.trim()) {
+          throw unprocessable(
+            `Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT} ${STRUCTURED_DECISION_GUIDANCE}`,
+            { code: "structured_review_decision_required", stageId: activeStage.id, stageType: activeStage.type },
+          );
         }
         const approvedState = buildCompletedState(existingState, activeStage);
         // Only stages after the stage being approved are advance candidates.
