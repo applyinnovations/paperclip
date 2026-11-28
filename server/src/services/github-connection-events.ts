@@ -28,6 +28,7 @@ import {
   type SealedConnectorEvents,
 } from "./paperclip-cloud-connector.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { boardItemAutoResolutionService } from "./board-item-auto-resolution.js";
 import { logger } from "../middleware/logger.js";
 
 type LeasedEvent = SealedConnectorEvents["events"][number];
@@ -125,6 +126,7 @@ function normalizeLeasedPayload(event: LeasedEvent): Record<string, unknown> {
       headSha: commitSha(payload.headSha),
       baseRef: boundedString(payload.baseRef, 300),
       baseSha: commitSha(payload.baseSha),
+      mergeCommitSha: commitSha(payload.mergeCommitSha),
     });
   }
   if (event.event === "installation_repositories") {
@@ -211,6 +213,7 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
       ...(stringValue(payload.headSha) ? { headSha: stringValue(payload.headSha) } : {}),
       ...(stringValue(payload.baseRef) ? { baseRef: stringValue(payload.baseRef) } : {}),
       ...(stringValue(payload.baseSha) ? { baseSha: stringValue(payload.baseSha) } : {}),
+      ...(stringValue(payload.mergeCommitSha) ? { mergeCommitSha: stringValue(payload.mergeCommitSha) } : {}),
     },
     remoteVersion: stringValue(payload.updatedAt),
   } as const;
@@ -303,6 +306,23 @@ export function githubConnectionEventService(
           repo: snapshot.repo,
           number: snapshot.number,
         }], { companyId }, undefined, { deferConfirmationCommitEffects: effect => effects.push(effect) });
+    }
+    if (event.action === "closed") {
+      // Queued after the merge-confirmation effects so confirmations the sweep
+      // accepted in this transaction no longer count as waiting on a person.
+      const pullRequest = {
+        owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number, merged: snapshot.merged,
+        mergeCommitSha: stringValue(snapshot.data.mergeCommitSha), headSha: stringValue(snapshot.data.headSha),
+      };
+      effects.push(async (committedDb) => {
+        try {
+          await boardItemAutoResolutionService(committedDb)
+            .onPullRequestClosed(companyId, pullRequest);
+        } catch (err) {
+          logger.warn({ err, companyId, pullRequest: `${snapshot.repository}#${snapshot.number}` },
+            "board item auto-resolution after pull request close failed");
+        }
+      });
     }
   }
 
