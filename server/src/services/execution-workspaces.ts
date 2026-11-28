@@ -59,6 +59,7 @@ import path from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { loadStageParticipantLoads } from "./stage-participant-loads.js";
 import {
   executionWorkspaces,
   agents,
@@ -5396,6 +5397,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const requestedStatus = quarantineRestoreRequestedSourceStatus(sourceBefore);
           const policy = normalizeIssueExecutionPolicy(sourceBefore.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
+            ...(await loadStageParticipantLoads(tx as unknown as Db, lockedWorkspace.companyId, policy)),
             issue: sourceBefore,
             policy,
             previousPolicy: policy,

@@ -96,6 +96,7 @@ import {
 } from "drizzle-orm";
 import { unionAll } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
+import { loadStageParticipantLoads } from "./stage-participant-loads.js";
 import {
   activityLog,
   chatActions,
@@ -10824,6 +10825,7 @@ export function issueService(db: Db) {
                 : participant.userId === initialAssignee!.userId),
             );
           const transition = applyIssueExecutionPolicyTransition({
+            ...(await loadStageParticipantLoads(tx as unknown as Db, companyId, normalizedExecutionPolicy)),
             issue: {
               status: "todo",
               assigneeAgentId: assigneeIsOnlyStageParticipant ? null : (values.assigneeAgentId ?? null),
@@ -11684,6 +11686,7 @@ export function issueService(db: Db) {
         if (expectedStatusVersion !== undefined) {
           const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
+            ...(await loadStageParticipantLoads(tx as Db, receiptExisting.companyId, policy)),
             issue: receiptExisting,
             policy,
             previousPolicy: policy,

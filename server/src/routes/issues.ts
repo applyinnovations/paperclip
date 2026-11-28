@@ -72,6 +72,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { loadStageParticipantLoads } from "../services/stage-participant-loads.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
@@ -10701,6 +10702,7 @@ export function issueRoutes(
               lockedIssue.executionState,
             );
             const transition = applyIssueExecutionPolicyTransition({
+              ...(await loadStageParticipantLoads(tx as unknown as Db, lockedIssue.companyId, executionPolicy)),
               issue: lockedIssue,
               policy: executionPolicy,
               previousPolicy: executionPolicy,
@@ -15026,6 +15028,7 @@ export function issueRoutes(
       const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
         ? { patch: {} }
         : applyIssueExecutionPolicyTransition({
+        ...(await loadStageParticipantLoads(db, existing.companyId, nextExecutionPolicy)),
         issue: existing,
         policy: nextExecutionPolicy,
         previousPolicy: previousExecutionPolicy,
@@ -19861,6 +19864,7 @@ export function issueRoutes(
       let fastResponseEnqueued = false;
       if (shouldAutoApproveReviewComment) {
         const transition = applyIssueExecutionPolicyTransition({
+          ...(await loadStageParticipantLoads(db, currentIssue.companyId, currentExecutionPolicy)),
           issue: currentIssue,
           policy: currentExecutionPolicy,
           requestedStatus: "done",
