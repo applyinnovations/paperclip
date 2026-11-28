@@ -1,5 +1,5 @@
 import { isProspectiveBlockedTransition } from "./routable-blocked.js";
-import { recoveryActionAttentionCondition, requiresReviewAttention, terminalBlockerRequiresAttention, ATTENTION_AGENT_ERROR_STATUS } from "./attention-source-eligibility.js";
+import { recoveryActionAttentionCondition, requiresReviewAttention, terminalBlockerRequiresAttention, ATTENTION_AGENT_ERROR_STATUS, loadTerminalBlockerAutoWakeStates, terminalBlockerAutoWakeHoldsCard } from "./attention-source-eligibility.js";
 import { attentionIssueCondition } from "./issue-visibility.js";
 import { issueService } from "./issues.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -242,17 +242,24 @@ export function decisionRetentionService(
             )).limit(1);
           const state = parseIssueExecutionState(source.executionState);
           const attention = await issueService(database).listReviewAttention(input.companyId, [source]);
-          eligible = requiresReviewAttention({
-            hasHumanParticipant: state?.status === "pending" && state.currentParticipant?.type === "user",
+          const hasHumanParticipant = state?.status === "pending" && state.currentParticipant?.type === "user";
+          const stalled = attention.get(source.id)?.state === "stalled";
+          // Same gate as the Inbox: a stalled review still being auto-woken is not a card yet.
+          const autoWakeHolds = stalled && !hasHumanParticipant && !source.assigneeUserId && !pendingApproval
+            && terminalBlockerAutoWakeHoldsCard((await loadTerminalBlockerAutoWakeStates(database, input.companyId, [source.id])).get(source.id));
+          eligible = !autoWakeHolds && requiresReviewAttention({
+            hasHumanParticipant,
             hasUserAssignee: Boolean(source.assigneeUserId), hasPendingApproval: Boolean(pendingApproval),
-            stalled: attention.get(source.id)?.state === "stalled",
+            stalled,
           });
         } else if (visible && input.sourceKind === "blocker_attention" && source.status === "blocked") {
           const owner = source.unblockDescriptor?.owner;
           const ownsDescriptor = owner === "board" || (owner && "userId" in owner && owner.userId === input.actor.userId);
           const attention = (await issueService(database).listBlockerAttention(input.companyId, [source])).get(source.id);
+          const terminalIssueId = attention?.terminalBlockerIssueId ?? source.id;
+          const autoWake = (await loadTerminalBlockerAutoWakeStates(database, input.companyId, [terminalIssueId])).get(terminalIssueId);
           eligible = Boolean(ownsDescriptor && isProspectiveBlockedTransition(source))
-            || (terminalBlockerRequiresAttention(attention) && (attention.terminalBlockerIssueId ?? source.id) === source.id);
+            || (terminalBlockerRequiresAttention(attention, autoWake) && terminalIssueId === source.id);
         }
         if (!eligible) throw notFound("Attention source not found");
       }

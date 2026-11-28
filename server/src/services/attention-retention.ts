@@ -2,7 +2,7 @@ import { and, eq, getTableColumns, inArray, isNull, sql, type SQL } from "drizzl
 import { agents, decisionRetention, decisions, heartbeatRuns,
   issueApprovals, issueRecoveryActions, issueThreadInteractions, issues, approvals, type Db } from "@paperclipai/db";
 import { evaluateAgentInvokability } from "./agent-invokability.js";
-import { HUMAN_RECOVERY_OWNER_TYPES, ATTENTION_BUDGET_WARNING_PERCENT, ATTENTION_AGENT_ERROR_STATUS, collapsePendingConfirmationsToNewest, listFailedRunsWithNewerRun, loadNewestSettledConfirmationAt, readRunIssueId, requiresReviewAttention, terminalBlockerRequiresAttention } from "./attention-source-eligibility.js";
+import { HUMAN_RECOVERY_OWNER_TYPES, ATTENTION_BUDGET_WARNING_PERCENT, ATTENTION_AGENT_ERROR_STATUS, collapsePendingConfirmationsToNewest, listFailedRunsWithNewerRun, loadNewestSettledConfirmationAt, readRunIssueId, requiresReviewAttention, terminalBlockerIsStranded } from "./attention-source-eligibility.js";
 import { decisionRetentionService, DEFAULT_DECISION_ARCHIVE_DAYS } from "./decision-retention.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
@@ -190,7 +190,7 @@ export function attentionRetentionService(db: Db) {
       const blockerBatch = blockerRoots.length ? await issueService(database).listBlockerAttentionBatch(companyId, blockerRoots)
         : { attention: new Map(), deferredRootIds: new Set<string>() };
       const blockers: PageEvidence["blockers"] = blockerBatch.attention;
-      const terminalIds = [...blockers.values()].filter(terminalBlockerRequiresAttention)
+      const terminalIds = [...blockers.values()].filter(terminalBlockerIsStranded)
         .map(attention => attention.terminalBlockerIssueId).filter((id): id is string => id != null && !visible.has(id));
       for (const row of await readIssues(terminalIds)) visible.set(row.id, row);
       result.set(companyId, {
@@ -241,7 +241,9 @@ export function attentionRetentionService(db: Db) {
         // Keep unknown roots visible; a later source change can revalidate them.
         if (fresh?.deferredRootIds.has(row.id)) return null;
         const attention = evidence ? evidence.blockers.get(row.id) : fresh!.attention.get(row.id);
-        if (!terminalBlockerRequiresAttention(attention)) return null;
+        // Archive deadlines run in days; the auto-wake hold (APP-761) lasts
+        // minutes and changes no retention row, so it is not applied here.
+        if (!terminalBlockerIsStranded(attention)) return null;
         sourceId = attention.terminalBlockerIssueId ?? row.id;
         if (lock && sourceId !== candidate.sourceId) await database.execute(sql`select id from issues
           where company_id = ${candidate.companyId}::uuid and id = ${sourceId}::uuid for update`);

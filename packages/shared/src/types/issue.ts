@@ -641,6 +641,21 @@ export interface IssueBlockerStalledWakeContext {
   };
 }
 
+/**
+ * Wake context of `issue_terminal_blocker_stranded`: the woken issue blocks
+ * other work and nothing is moving it.
+ */
+export interface IssueTerminalBlockerStrandedWakeContext {
+  terminalIssueId: string;
+  terminalIssueIdentifier: string | null;
+  terminalIssueStatus: string;
+  /** Open issues this one blocks directly (a sample; see blockedIssueCount). */
+  blockedIssues: Array<{ id: string; identifier: string | null; title: string }>;
+  blockedIssueCount: number;
+  attempt: number;
+  maxAttempts: number;
+}
+
 export interface IssueRecoveryAction {
   /** Read-only activity of the exact native run named by the wake policy. */
   nativeRunActivity?: {

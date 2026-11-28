@@ -179,6 +179,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_blockers_resolved",
   "issue_children_completed",
   "issue_blocker_stalled",
+  "issue_terminal_blocker_stranded",
   "issue_status_changed",
   "issue_tree_restored",
   "issue_recovery_action_restored",
@@ -2754,6 +2755,7 @@ export async function buildPaperclipWakePayload(input: {
     childIssueSummaryTruncated:
       input.contextSnapshot.childIssueSummaryTruncated === true,
     blockerStall: input.contextSnapshot.blockerStall ?? null,
+    terminalBlockerStranded: input.contextSnapshot.terminalBlockerStranded ?? null,
     dispositionRepair:
       buildReviewPathRecoveryDisposition(input.contextSnapshot) ??
       (input.contextSnapshot.legacyDispositionEpisode ? {
