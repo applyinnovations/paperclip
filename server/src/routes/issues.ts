@@ -344,6 +344,7 @@ import {
 } from "../services/issue-hierarchy.js";
 import {
   authorizationDeniedDetails,
+  type AuthorizationDecision,
   issueReadSqlCondition,
   projectReadSqlCondition,
 } from "../services/authorization.js";
@@ -3540,6 +3541,65 @@ function logIssueListRequest(input: {
   });
 }
 
+// APP-790/APP-799: one structured security event per denied tasks:assign
+// decision, so Loki can alert on an actor that keeps assigning outside its
+// grants. Field names are shared with authz.project_write_workspace.denied
+// (APP-827) so one LogQL shape covers both; the Loki alert parses them, so do
+// not rename them. Every field is an id or an enum picked explicitly: never the
+// request body, the issue title or description, the assignment scope object or
+// decision.explanation. Allowed decisions log nothing.
+export const TASKS_ASSIGN_DENIED_EVENT = "authz.tasks_assign.denied";
+
+const LOGGABLE_OPAQUE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// Ids in the assignment scope can come from the request (assigneeUserId and
+// some assigneeAgentId inputs are unvalidated strings), and actor.runId is
+// copied verbatim from X-Paperclip-Run-Id for agent keys. Only well-formed ids
+// enter the security event; anything else is logged as null.
+export function loggableUuid(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || value !== value.trim() || !isUuidLike(value)) return null;
+  return value;
+}
+
+export function loggableOpaqueId(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || !LOGGABLE_OPAQUE_ID_RE.test(value)) return null;
+  return value;
+}
+
+function logTasksAssignDenied(
+  actor: Request["actor"],
+  companyId: string,
+  scope: {
+    issueId?: string | null;
+    projectId?: string | null;
+    parentIssueId?: string | null;
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
+  } | undefined,
+  decision: AuthorizationDecision,
+) {
+  const actorAgentId = actor.type === "agent" ? loggableUuid(actor.agentId) : null;
+  const actorUserId = actor.type === "board" ? loggableOpaqueId(actor.userId) : null;
+  logger.warn({
+    event: TASKS_ASSIGN_DENIED_EVENT,
+    action: "tasks:assign",
+    companyId: loggableUuid(companyId),
+    actorType: actor.type,
+    actorId: actorAgentId ?? actorUserId,
+    actorAgentId,
+    actorUserId,
+    runId: loggableUuid(actor.runId),
+    targetAssigneeAgentId: loggableUuid(scope?.assigneeAgentId),
+    targetAssigneeUserId: loggableOpaqueId(scope?.assigneeUserId),
+    issueId: loggableUuid(scope?.issueId),
+    parentIssueId: loggableUuid(scope?.parentIssueId),
+    projectId: loggableUuid(scope?.projectId),
+    reason: decision.reason,
+    code: decision.code ?? null,
+    grantPermissionKey: decision.grant?.permissionKey ?? null,
+  }, "tasks assign denied");
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -5144,6 +5204,7 @@ export function issueRoutes(
       scope: assignmentScope ?? null,
     });
     if (decision.allowed) return;
+    logTasksAssignDenied(req.actor, companyId, assignmentScope, decision);
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
