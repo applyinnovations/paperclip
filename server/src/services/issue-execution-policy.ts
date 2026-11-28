@@ -60,6 +60,14 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * Current open work per stage participant, keyed by `stageParticipantKey`.
+   * When present, multi-participant stages pick the least-loaded eligible
+   * participant instead of always the first one.
+   */
+  participantLoads?: ReadonlyMap<string, number>;
+  /** Participants (by `stageParticipantKey`) that cannot be woken right now. */
+  ineligibleParticipants?: ReadonlySet<string>;
 };
 
 export type ExecutionPolicyDecisionLike = {
@@ -608,12 +616,27 @@ function nextPendingStageAfter(
   return policy.stages.find((stage, index) => index > completedIndex && !completed.has(stage.id)) ?? null;
 }
 
-function selectStageParticipant(
+export function stageParticipantKey(principal: Pick<IssueExecutionStagePrincipal, "type" | "agentId" | "userId">): string {
+  return principal.type === "agent" ? `agent:${principal.agentId ?? ""}` : `user:${principal.userId ?? ""}`;
+}
+
+export type StageParticipantSelectionOptions = {
+  preferred?: IssueExecutionStagePrincipal | null;
+  exclude?: IssueExecutionStagePrincipal | null;
+  loads?: ReadonlyMap<string, number> | null;
+  ineligible?: ReadonlySet<string> | null;
+};
+
+/**
+ * Picks who works a stage next. `preferred` wins when it is a participant (so a
+ * review returns to the same reviewer after changes are requested). Otherwise
+ * ineligible participants are skipped while an eligible one remains, and the
+ * lowest load wins, with ties going to the order in `stage.participants`.
+ * Without loads or ineligibility data this is the first non-excluded participant.
+ */
+export function selectStageParticipant(
   stage: IssueExecutionStage,
-  opts?: {
-    preferred?: IssueExecutionStagePrincipal | null;
-    exclude?: IssueExecutionStagePrincipal | null;
-  },
+  opts?: StageParticipantSelectionOptions,
 ): IssueExecutionStagePrincipal | null {
   const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
   if (participants.length === 0) return null;
@@ -621,8 +644,28 @@ function selectStageParticipant(
     const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));
     if (preferred) return preferred;
   }
-  const first = participants[0];
-  return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
+  const ineligible = opts?.ineligible;
+  const eligible = ineligible && ineligible.size > 0
+    ? participants.filter((participant) => !ineligible.has(stageParticipantKey(participant)))
+    : participants;
+  const candidates = eligible.length > 0 ? eligible : participants;
+  const loads = opts?.loads;
+  let chosen = candidates[0];
+  if (loads && loads.size > 0) {
+    let chosenLoad = loads.get(stageParticipantKey(chosen)) ?? 0;
+    for (const candidate of candidates.slice(1)) {
+      const load = loads.get(stageParticipantKey(candidate)) ?? 0;
+      if (load < chosenLoad) {
+        chosen = candidate;
+        chosenLoad = load;
+      }
+    }
+  }
+  return chosen ? { type: chosen.type, agentId: chosen.agentId ?? null, userId: chosen.userId ?? null } : null;
+}
+
+function participantLoadOptions(input: TransitionInput): Pick<StageParticipantSelectionOptions, "loads" | "ineligible"> {
+  return { loads: input.participantLoads ?? null, ineligible: input.ineligibleParticipants ?? null };
 }
 
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
@@ -1064,6 +1107,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
+        ...participantLoadOptions(input),
         exclude: existingState?.returnAssignee ?? null,
       });
     if (!currentParticipant) {
@@ -1111,6 +1155,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
     if (!escalatedHold && !stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
+        ...participantLoadOptions(input),
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
         exclude: existingState?.returnAssignee ?? null,
       });
@@ -1196,6 +1241,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         }
 
         const participant = selectStageParticipant(nextStage, {
+          ...participantLoadOptions(input),
           preferred: explicitAssignee,
           exclude: existingState?.returnAssignee ?? null,
         });
@@ -1391,6 +1437,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
+    ...participantLoadOptions(input),
     preferred:
       existingState?.status === CHANGES_REQUESTED_STATUS
         ? explicitAssignee ?? existingState.currentParticipant ?? null
@@ -1416,6 +1463,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       return { patch };
     }
     participant = selectStageParticipant(pendingStage, {
+      ...participantLoadOptions(input),
       preferred:
         existingState?.status === CHANGES_REQUESTED_STATUS
           ? explicitAssignee ?? existingState.currentParticipant ?? null
