@@ -1592,7 +1592,13 @@ function withPortableIssueDefaults(
       if (agentSlug) participants.push({ agentSlug });
       else warnings.push(`Project ${projectSlug} default ${stage.type} stage participant was omitted from export because only exported agents are portable.`);
     }
-    if (participants.length > 0) stages.push({ type: stage.type, participants });
+    if (participants.length > 0) {
+      stages.push({
+        type: stage.type,
+        participants,
+        ...(stage.requireReviewedSha === true ? { requireReviewedSha: true } : {}),
+      });
+    }
   }
   const portableSettings = extractPortableIssueDefaultSettings(
     projectSlug,
@@ -1633,7 +1639,11 @@ function resolvePortableIssueDefaults(
   const rawStages = Array.isArray(defaultIssueExecutionPolicy.stages)
     ? (defaultIssueExecutionPolicy.stages as unknown[])
     : [];
-  const stages: Array<{ type: string; participants: Array<{ type: "agent"; agentId: string }> }> = [];
+  const stages: Array<{
+    type: string;
+    participants: Array<{ type: "agent"; agentId: string }>;
+    requireReviewedSha?: boolean;
+  }> = [];
   for (const stage of rawStages) {
     const type = isPlainRecord(stage) ? asString(stage.type) : null;
     const rawParticipants: unknown[] = isPlainRecord(stage) && Array.isArray(stage.participants) ? stage.participants : [];
@@ -1644,7 +1654,13 @@ function resolvePortableIssueDefaults(
       if (agentId) participants.push({ type: "agent", agentId });
       else warnings.push(`Project ${projectSlug} default ${type ?? "unknown"} stage names agent ${agentSlug ?? "(no agentSlug)"}, which is not in the company; participant skipped.`);
     }
-    if (type && participants.length > 0) stages.push({ type, participants });
+    if (type && participants.length > 0) {
+      stages.push({
+        type,
+        participants,
+        ...(isPlainRecord(stage) && stage.requireReviewedSha === true ? { requireReviewedSha: true } : {}),
+      });
+    }
   }
   const portableSettings = extractPortableIssueDefaultSettings(
     projectSlug,

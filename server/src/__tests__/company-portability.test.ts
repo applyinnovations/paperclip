@@ -1772,6 +1772,7 @@ describe("company portability", () => {
         "      defaultIssueExecutionPolicy:",
         "        stages:",
         "          - type: review",
+        "            requireReviewedSha: true",
         "            participants:",
         "              - agentSlug: code-reviewer",
         "              - agentSlug: nobody",
@@ -1793,7 +1794,7 @@ describe("company portability", () => {
       executionWorkspacePolicy: {
         enabled: true,
         defaultIssueExecutionPolicy: {
-          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }], requireReviewedSha: true }],
         },
       },
     }));
@@ -1819,6 +1820,7 @@ describe("company portability", () => {
               id: "stage-1",
               type: "review",
               approvalsNeeded: 1,
+              requireReviewedSha: true,
               participants: [
                 { id: "p-1", type: "agent", agentId: "agent-1", userId: null },
                 { id: "p-2", type: "user", agentId: null, userId: "user-1" },
@@ -1843,7 +1845,9 @@ describe("company portability", () => {
     expect(extension).not.toContain("stage-1");
     expect(exported.manifest.projects.find((project) => project.slug === "launch")?.executionWorkspacePolicy).toEqual({
       enabled: true,
-      defaultIssueExecutionPolicy: { stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }] }] },
+      defaultIssueExecutionPolicy: {
+        stages: [{ type: "review", participants: [{ agentSlug: "claudecoder" }], requireReviewedSha: true }],
+      },
     });
     expect(exported.warnings).toContainEqual(expect.stringContaining("only exported agents are portable"));
   });
