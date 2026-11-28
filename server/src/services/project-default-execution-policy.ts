@@ -9,6 +9,7 @@ type StageInput = {
   id?: string;
   type: string;
   participants?: Array<{ id?: string; type: string; agentId?: string | null; userId?: string | null }>;
+  requireReviewedSha?: boolean;
 };
 
 function withoutIds(stages: ReadonlyArray<StageInput>) {
@@ -19,6 +20,7 @@ function withoutIds(stages: ReadonlyArray<StageInput>) {
       agentId: participant.agentId ?? null,
       userId: participant.userId ?? null,
     })),
+    ...(stage.requireReviewedSha === true ? { requireReviewedSha: true } : {}),
   }));
 }
 

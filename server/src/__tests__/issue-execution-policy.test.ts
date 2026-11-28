@@ -558,6 +558,142 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("review stage with requireReviewedSha", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    function flaggedPolicy(requireReviewedSha: boolean | undefined) {
+      return normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            ...(requireReviewedSha === undefined ? {} : { requireReviewedSha }),
+            participants: [{ type: "agent", agentId: qaAgentId }],
+          },
+        ],
+      })!;
+    }
+    function approve(input: {
+      policy: IssueExecutionPolicy;
+      commentBody?: string;
+      decision?: "approve" | "request_changes";
+      requestedStatus?: string;
+    }) {
+      const stageId = input.policy.stages[0]!.id;
+      return applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: input.policy,
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: input.policy,
+        requestedStatus: input.requestedStatus,
+        decision: input.decision,
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: input.commentBody,
+      });
+    }
+
+    it.each([
+      { name: "approve, flagged, no line", flag: true, decision: "approve" as const, body: "LGTM", recorded: false },
+      { name: "status done, flagged, no line", flag: true, status: "done", body: "LGTM", recorded: false },
+      { name: "approve, flagged, comment omitted", flag: true, decision: "approve" as const, body: undefined, recorded: false },
+      { name: "status done, flagged, comment omitted", flag: true, status: "done", body: undefined, recorded: false },
+      { name: "approve, flagged, whitespace comment", flag: true, decision: "approve" as const, body: "  \n ", recorded: false },
+      { name: "approve, flagged, short sha", flag: true, decision: "approve" as const, body: "LGTM\nReviewed-SHA: 0123456", recorded: false },
+      { name: "approve, flagged, uppercase sha", flag: true, decision: "approve" as const, body: `LGTM\nReviewed-SHA: ${sha.toUpperCase()}`, recorded: false },
+      { name: "approve, flagged, last line invalid", flag: true, decision: "approve" as const, body: `Reviewed-SHA: ${sha}\nReviewed-SHA: nope`, recorded: false },
+      { name: "approve, flagged, valid line", flag: true, decision: "approve" as const, body: `LGTM\n\nReviewed-SHA: ${sha}`, recorded: true },
+      { name: "status done, flagged, valid line", flag: true, status: "done", body: `reviewed-sha:  ${sha}  `, recorded: true },
+      { name: "approve, unflagged, no line", flag: undefined, decision: "approve" as const, body: "LGTM", recorded: true },
+      { name: "approve, flag false, no line", flag: false, decision: "approve" as const, body: "LGTM", recorded: true },
+    ])("$name → recorded: $recorded", ({ flag, decision, status, body, recorded }) => {
+      const policy = flaggedPolicy(flag);
+      const run = () => approve({ policy, commentBody: body, decision, requestedStatus: status });
+      if (recorded) {
+        const result = run();
+        expect(result.decision).toMatchObject({ stageType: "review", outcome: "approved" });
+        expect(result.patch.executionState).toMatchObject({ status: "completed" });
+        return;
+      }
+      let error: any;
+      try {
+        run();
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeDefined();
+      expect(error.status).toBe(422);
+      expect(error.details).toMatchObject({
+        code: "reviewed_sha_required",
+        stageId: policy.stages[0]!.id,
+        stageType: "review",
+      });
+      expect(error.message).toContain("Reviewed-SHA: <sha>");
+      expect(error.message).toContain("40-character lowercase hexadecimal");
+    });
+
+    it("keeps the generic missing-comment error on unflagged stages", () => {
+      expect(() => approve({ policy: flaggedPolicy(undefined), decision: "approve" })).toThrow(
+        expect.objectContaining({
+          status: 422,
+          details: expect.objectContaining({ code: "structured_review_decision_required" }),
+        }),
+      );
+    });
+
+    it("does not require the line to request changes", () => {
+      const result = approve({
+        policy: flaggedPolicy(true),
+        commentBody: "Please add tests.",
+        decision: "request_changes",
+      });
+      expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+    });
+
+    it("keeps the flag through normalization and the board UI policy editor", () => {
+      const policy = flaggedPolicy(true);
+      expect(policy.stages[0]).toMatchObject({ type: "review", requireReviewedSha: true });
+      expect(flaggedPolicy(false).stages[0]).not.toHaveProperty("requireReviewedSha");
+      const edited = buildExecutionPolicy({
+        existingPolicy: policy,
+        reviewerValues: [`agent:${qaAgentId}`, `agent:${ctoAgentId}`],
+        approverValues: [],
+      });
+      expect(edited?.stages[0]).toMatchObject({ type: "review", requireReviewedSha: true });
+    });
+
+    it("rejects the flag on approval stages", () => {
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [
+            { type: "approval", requireReviewedSha: true, participants: [{ type: "user", userId: ctoUserId }] },
+          ],
+        }),
+      ).toThrow("Invalid execution policy");
+    });
+
+    it("treats dropping the flag as removing the stage", () => {
+      const previous = flaggedPolicy(true);
+      const { requireReviewedSha: _dropped, ...weakened } = previous.stages[0]!;
+      expect(
+        hasRemovedRequiredExecutionStages(previous, { ...previous, stages: [weakened] }).map((stage) => stage.id),
+      ).toEqual([previous.stages[0]!.id]);
+      expect(hasRemovedRequiredExecutionStages(previous, previous)).toEqual([]);
+    });
+  });
+
   describe("approval-only policy (no review stage)", () => {
     const policy = approvalOnlyPolicy();
 

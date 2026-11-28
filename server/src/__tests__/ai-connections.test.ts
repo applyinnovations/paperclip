@@ -1885,7 +1885,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const subscription = await service.save(companyId, subscriptionUser, { provider, method: "subscription", ownership: "personal", name: "Subscription", loginSessionId: "fixture", allAgents: true, agentIds: [] }, token);
     const api = await service.save(companyId, apiUser, { provider, method: "api_key", ownership: "personal", name: "API", apiKey: "fixture", allAgents: true, agentIds: [] }, "fixture-api");
     // This is the exact same saved bot config, including a legacy setup method.
-    const bot = { ...input, adapterType, binding: { provider, method: "subscription", mode: "responsible_user" } as const, config: { model: "unchanged-model", env: { [apiEnv]: "ambient", CLAUDE_CODE_OAUTH_TOKEN: "ambient" } } };
+    const bot = { ...input, adapterType, binding: { provider, method: "subscription", mode: "responsible_user" } as const, config: { model: "unchanged-model", env: { [apiEnv]: "ambient", CLAUDE_CODE_OAUTH_TOKEN: "ambient", GOOGLE_APPLICATION_CREDENTIALS: "/configured/adc.json", GOOGLE_API_KEY: "ambient" } } };
     const original = structuredClone(bot);
     const [subRun, apiRun] = await Promise.all([subscriptionUser, apiUser].map(responsibleUserId => prepareManagedAiRuntime(db, { ...bot, responsibleUserId })));
     try {
@@ -1901,6 +1901,12 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       } else {
         expect(await readFile(path.join(subEnv.CODEX_HOME, "auth.json"), "utf8")).toBe(token);
         expect(JSON.parse(await readFile(path.join(apiEnvValues.CODEX_HOME, "auth.json"), "utf8"))).toEqual({ OPENAI_API_KEY: "fixture-api" });
+      }
+      for (const env of [subEnv, apiEnvValues]) {
+        // Neither CLI reads Google ADC as AI auth, so the host's value reaches tools like sops;
+        // a value configured on the agent is still dropped, and other Google AI keys stay blank.
+        expect(env).not.toHaveProperty("GOOGLE_APPLICATION_CREDENTIALS");
+        expect(env.GOOGLE_API_KEY).toBe("");
       }
       expect(subEnv.HOME).not.toBe(apiEnvValues.HOME);
       expect(subRun.identity).not.toBe(apiRun.identity);

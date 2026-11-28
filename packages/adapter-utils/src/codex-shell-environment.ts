@@ -9,15 +9,23 @@ const PROVIDER_ONLY_KEYS: ReadonlySet<string> = new Set([
 const IDENTITY_KEYS = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"];
 // Paperclip's gh and git launchers in the shell fetch the run's GitHub credential with this capability.
 const GITHUB_LAUNCHER_KEYS = ["PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN"];
+// Host keys a Codex shell may inherit when the launch env leaves them unset.
+// Codex never reads Google ADC as model auth; the managed runtime leaves this
+// key unset for Codex so tools such as sops reach the pod's workload identity.
+// A launch env that sets it (including the "" blank) always wins.
+const AMBIENT_SHELL_KEYS = ["GOOGLE_APPLICATION_CREDENTIALS"];
 
 /** Only resolved adapter configuration can opt a service secret into shell access.
- * The launch environment here is Paperclip-built, never ambient process.env.
+ * The launch environment here is Paperclip-built, never ambient process.env;
+ * only AMBIENT_SHELL_KEYS may come from inheritedEnvironment.
  * Return names only: values must stay out of provider config and argv.
  */
 export function codexShellEnvironmentKeys(
   environment: Record<string, string>,
   configuredEnvironment: Record<string, unknown>,
   hasAgentIdentity: boolean,
+  /** Host env the Codex process inherits (local launches only). */
+  inheritedEnvironment?: Readonly<Record<string, string | undefined>>,
 ): string[] {
   const configuredSecrets = new Set(Object.entries(configuredEnvironment)
     .filter(([key, value]) => ENVIRONMENT_NAME.test(key) && typeof value === "string" && typeof environment[key] === "string"
@@ -30,5 +38,6 @@ export function codexShellEnvironmentKeys(
       && (key === "PAPERCLIP_API_KEY" || configuredSecrets.has(key) || !SECRET_NAME.test(key))),
     ...GITHUB_LAUNCHER_KEYS.filter(key => environment[key]),
     ...(hasAgentIdentity ? IDENTITY_KEYS : []),
+    ...AMBIENT_SHELL_KEYS.filter(key => !(key in environment) && !!inheritedEnvironment?.[key]),
   ])].sort();
 }

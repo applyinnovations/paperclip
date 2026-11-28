@@ -80,6 +80,17 @@ export const AI_AUTH_ENV_KEYS = [
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_USE_FOUNDRY",
 ] as const;
+/**
+ * Harnesses whose managed AI auth can never be Google ADC. They inherit the
+ * host's GOOGLE_APPLICATION_CREDENTIALS so tools such as sops reach Cloud KMS.
+ * Managed Claude cannot select Vertex: CLAUDE_CODE_USE_VERTEX is rejected in
+ * agent env, blanked here and ignored in project settings (--setting-sources
+ * user). Every other harness, including any added later, keeps the blank.
+ */
+const AMBIENT_GOOGLE_ADC_HARNESSES: ReadonlySet<string> = new Set(["claude_local", "codex_local"]);
+export function keepsAmbientGoogleAdc(harness: string): boolean {
+  return AMBIENT_GOOGLE_ADC_HARNESSES.has(harness);
+}
 export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
   const result = {
     ...(env && typeof env === "object" ? (env as Record<string, unknown>) : {}),
@@ -347,7 +358,11 @@ export async function prepareManagedAiRuntime(
     if (retainedCleanupScope) releaseCredentialHome = bindRetainedAiCredentialHome(providerHome, retainedCleanupScope);
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
-      ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
+      ...Object.fromEntries(
+        AI_AUTH_ENV_KEYS
+          .filter((key) => !(key === "GOOGLE_APPLICATION_CREDENTIALS" && keepsAmbientGoogleAdc(harness)))
+          .map((key) => [key, ""]),
+      ),
       ...managedAiHomeEnvironment(home),
       ...(input.binding.provider === "github" ? { GH_TOKEN: "", GITHUB_TOKEN: "" } : {}),
     };

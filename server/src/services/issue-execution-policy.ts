@@ -11,7 +11,12 @@ import type {
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import {
+  REVIEWED_SHA_TRAILER_KEY,
+  issueExecutionPolicySchema,
+  issueExecutionStateSchema,
+  parseReviewedSha,
+} from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type AssigneeLike = {
@@ -90,6 +95,11 @@ const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
+const REVIEWED_SHA_REQUIRED_MESSAGE =
+  `This review stage requires the reviewed commit. Add a line \`${REVIEWED_SHA_TRAILER_KEY}: <sha>\` to the ` +
+  "approval comment, where <sha> is the full 40-character lowercase hexadecimal commit id you reviewed " +
+  `(for example \`${REVIEWED_SHA_TRAILER_KEY}: 0123456789abcdef0123456789abcdef01234567\`), on a line of its own. ` +
+  "Include it in the same request as the approval; prior comments are not considered.";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 const STRUCTURED_DECISION_GUIDANCE =
   'Submit a structured review decision (decision: "approve" or "request_changes" with a comment including Reviewed-SHA) instead of patching status directly.';
@@ -494,6 +504,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
         type: stage.type,
         approvalsNeeded: 1 as const,
         participants: dedupedParticipants,
+        ...(stage.requireReviewedSha ? { requireReviewedSha: true } : {}),
       };
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
@@ -809,6 +820,9 @@ function stagePreserved(
   if (!nextStage) return false;
   if (nextStage.type !== previousStage.type) return false;
   if ((nextStage.approvalsNeeded ?? 1) < (previousStage.approvalsNeeded ?? 1)) return false;
+  // Dropping the Reviewed-SHA requirement weakens the stage just like
+  // lowering approvalsNeeded does.
+  if (previousStage.requireReviewedSha === true && nextStage.requireReviewedSha !== true) return false;
   const prevKeys = participantKeys(previousStage);
   const nextKeys = participantKeys(nextStage);
   if (prevKeys.size !== nextKeys.size) return false;
@@ -1127,6 +1141,19 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (principalsEqual(currentParticipant, actor)) {
       if (requestedDecision === "approve" || requestedStatus === "done") {
+        // A flagged review stage reports the missing Reviewed-SHA line first,
+        // so an omitted comment gets the specific error and the line format.
+        if (
+          activeStage.type === "review" &&
+          activeStage.requireReviewedSha === true &&
+          parseReviewedSha(input.commentBody) === null
+        ) {
+          throw unprocessable(REVIEWED_SHA_REQUIRED_MESSAGE, {
+            code: "reviewed_sha_required",
+            stageId: activeStage.id,
+            stageType: activeStage.type,
+          });
+        }
         if (!input.commentBody?.trim()) {
           throw unprocessable(
             `Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT} ${STRUCTURED_DECISION_GUIDANCE}`,

@@ -102,6 +102,7 @@ export interface CompanyPortabilityProjectDefaultExecutionPolicy
   stages: Array<{
     type: IssueExecutionStage["type"];
     participants: Array<{ agentSlug: string }>;
+    requireReviewedSha?: boolean;
   }>;
 }
 

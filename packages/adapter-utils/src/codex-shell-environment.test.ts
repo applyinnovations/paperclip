@@ -42,3 +42,15 @@ it("passes the run's GitHub broker capability so the gh and git launchers can fe
   expect(names).not.toContain("PAPERCLIP_GITHUB_BRIDGE_TOKEN");
   expect(JSON.stringify(names)).not.toContain("capability");
 });
+
+it("passes only host GOOGLE_APPLICATION_CREDENTIALS through when the launch env leaves it unset (APP-724)", () => {
+  const host = { GOOGLE_APPLICATION_CREDENTIALS: "/var/run/pod/adc.json", GOOGLE_API_KEY: "host-key", DATABASE_URL: "postgres://host" };
+  const names = codexShellEnvironmentKeys({}, {}, false, host);
+  expect(names).toContain("GOOGLE_APPLICATION_CREDENTIALS");
+  expect(names).not.toContain("GOOGLE_API_KEY");
+  expect(names).not.toContain("DATABASE_URL");
+  expect(JSON.stringify(names)).not.toContain("/var/run/pod");
+  // Remote launches pass no host env; an empty host value adds nothing.
+  expect(codexShellEnvironmentKeys({}, {}, false)).not.toContain("GOOGLE_APPLICATION_CREDENTIALS");
+  expect(codexShellEnvironmentKeys({}, {}, false, { GOOGLE_APPLICATION_CREDENTIALS: "" })).not.toContain("GOOGLE_APPLICATION_CREDENTIALS");
+});

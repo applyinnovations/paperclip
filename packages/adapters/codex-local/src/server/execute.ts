@@ -1313,7 +1313,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (observabilityProfile) replaceCodexProfileArgs(args, observabilityProfile.name);
       else if (observabilityPreparationFailed) disableCodexObservabilityArgs(args);
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity));
+      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity),
+        executionTargetIsRemote ? undefined : process.env);
       args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
         "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =
