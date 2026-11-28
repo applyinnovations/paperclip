@@ -387,6 +387,11 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     return { s, heartbeat, holdId: hold!.id, savedWakeId: saved[0]!.id };
   }
 
+  // A wake saved behind a live run keeps its stage reason in the saved context.
+  const isStageReviewWake = (wake: typeof agentWakeupRequests.$inferSelect) =>
+    wake.reason === "execution_review_requested" ||
+    (wake.payload?._paperclipWakeContext as Record<string, unknown> | undefined)?.wakeReason === "execution_review_requested";
+
   const holdEvidence = async (holdId: string) =>
     (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, holdId)))[0]!.evidence;
 
@@ -405,7 +410,7 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
     await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
     const wakes = await reviewerWakes(s);
     expect(wakes.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
-    expect(wakes.filter(wake => wake.reason === "execution_review_requested")).toHaveLength(1);
+    expect(wakes.filter(isStageReviewWake)).toHaveLength(1);
     expect((await reviewerRuns(s)).filter(r => !r.retryOfRunId)).toHaveLength(1);
   });
 
@@ -428,7 +433,7 @@ describeEmbeddedPostgres("agent stage handoff from its own run", () => {
 
     await deliverReconciledExecutions(db, heartbeat.wakeup, heartbeat.releaseIssueExecutionAndPromote);
     expect(await holdEvidence(holdId)).toMatchObject({ continuationDelivery: "delivered", continuationRunId: run!.id });
-    expect((await reviewerWakes(s)).filter(wake => wake.reason === "execution_review_requested")).toHaveLength(1);
+    expect((await reviewerWakes(s)).filter(isStageReviewWake)).toHaveLength(1);
     expect((await reviewerRuns(s)).filter(r => !r.retryOfRunId)).toHaveLength(1);
   });
 

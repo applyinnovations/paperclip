@@ -383,10 +383,16 @@ export async function deliverReconciledExecutions(
         // already started (also after a crash before delivery was recorded,
         // and even when that run has finished), otherwise promote it through
         // the stopped run's own release drain, which consumes it atomically.
+        // A wake saved behind a live run is stored with the generic
+        // `issue_execution_deferred` reason; its stage reason is kept in the
+        // saved wake context, and stays there after promotion.
         const stageReceipts = and(
           eq(agentWakeupRequests.companyId, action.companyId),
           eq(agentWakeupRequests.agentId, stageParticipantAgentId),
-          inArray(agentWakeupRequests.reason, ["execution_review_requested", "execution_approval_requested"]),
+          or(
+            inArray(agentWakeupRequests.reason, ["execution_review_requested", "execution_approval_requested"]),
+            sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' in ('execution_review_requested', 'execution_approval_requested')`,
+          ),
           sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
         );
         const findStageSuccessor = async () => {
