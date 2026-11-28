@@ -10772,6 +10772,8 @@ export function issueRoutes(
                   tx,
                   postCommitActivityPublications,
                   postCommitIssueActions,
+                  // This route records its own outcome for the action below.
+                  { callerResolvesRecoveryActionId: activeRecoveryAction.id },
                 )
               : await svc.update(
                   id,

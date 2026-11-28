@@ -322,28 +322,12 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
 
-export type IssuePostCommitAction =
-  | {
-    type: "cancel_native_question_run";
-    runId: string;
-    issueId: string;
-    issueStatus: string;
-  }
-  | {
-    /**
-     * Settle the closed task's open recovery action after commit. A caller that
-     * resolves that action itself inside the same transaction (the recovery
-     * resolve route) has already settled it, so this finds nothing and is a no-op.
-     */
-    type: "settle_terminal_recovery_action";
-    issueId: string;
-    companyId: string;
-    issueStatus: string;
-    identifier: string | null;
-    actorAgentId: string | null;
-    actorUserId: string | null;
-    actorRunId: string | null;
-  };
+export type IssuePostCommitAction = {
+  type: "cancel_native_question_run";
+  runId: string;
+  issueId: string;
+  issueStatus: string;
+};
 
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
@@ -351,39 +335,10 @@ export async function executeIssuePostCommitActions(
   actions: readonly IssuePostCommitAction[],
 ): Promise<void> {
   if (actions.length === 0) return;
-  for (const action of actions) {
-    if (action.type !== "settle_terminal_recovery_action") continue;
-    try {
-      const { settleRecoveryActionsForTerminalIssue } = await import("./terminal-issue-recovery-settlement.js");
-      await settleRecoveryActionsForTerminalIssue(db, {
-        id: action.issueId,
-        companyId: action.companyId,
-        status: action.issueStatus,
-        identifier: action.identifier,
-      }, {
-        agentId: action.actorAgentId,
-        userId: action.actorUserId,
-        runId: action.actorRunId,
-      });
-    } catch (err) {
-      // The recovery reconciler settles terminal sources too, and the attention
-      // feed already hides them; a failure here must not report the committed
-      // issue transition as failed.
-      logger.warn(
-        { err, issueId: action.issueId },
-        "terminal recovery action settlement deferred to recovery sweep",
-      );
-    }
-  }
-  const runActions = actions.filter(
-    (action): action is Extract<IssuePostCommitAction, { type: "cancel_native_question_run" }> =>
-      action.type === "cancel_native_question_run",
-  );
-  if (runActions.length === 0) return;
   const { heartbeatService } = await import("./heartbeat.js");
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
-  for (const action of runActions) {
+  for (const action of actions) {
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
@@ -11348,7 +11303,14 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        /**
+         * The recovery action this caller resolves itself in the same
+         * transaction; the terminal-close settlement leaves it to the caller.
+         */
+        callerResolvesRecoveryActionId?: string | null;
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -12195,32 +12157,24 @@ export function issueService(db: Db) {
                 }
               }
             }
-            // Settle the open recovery action after commit. Inside a caller's
-            // transaction without a post-commit queue, the recovery reconciler
-            // settles it instead (and the attention feed hides it meanwhile).
-            if (dbOrTx === db || postCommitActions) {
-              const [openRecovery] = await tx
-                .select({ id: issueRecoveryActions.id })
-                .from(issueRecoveryActions)
-                .where(and(
-                  eq(issueRecoveryActions.companyId, updated.companyId),
-                  eq(issueRecoveryActions.sourceIssueId, updated.id),
-                  inArray(issueRecoveryActions.status, ["active", "escalated"]),
-                ))
-                .limit(1);
-              if (openRecovery) {
-                queuedPostCommitActions.push({
-                  type: "settle_terminal_recovery_action",
-                  issueId: updated.id,
-                  companyId: updated.companyId,
-                  issueStatus: updated.status,
-                  identifier: updated.identifier ?? null,
-                  actorAgentId: actorAgentId ?? null,
-                  actorUserId: actorUserId ?? null,
-                  actorRunId: actorRunId ?? null,
-                });
-              }
-            }
+            // Settle the open recovery action in this transaction, so the
+            // action resolved is the one open at the close and its resolution
+            // rolls back with the status change.
+            const { settleRecoveryActionsForTerminalIssue } =
+              await import("./terminal-issue-recovery-settlement.js");
+            await settleRecoveryActionsForTerminalIssue(
+              tx as unknown as Db,
+              updated,
+              {
+                agentId: actorAgentId ?? null,
+                userId: actorUserId ?? null,
+                runId: actorRunId ?? null,
+              },
+              {
+                callerResolvesActionId: options.callerResolvesRecoveryActionId ?? null,
+                publications: activityPublications,
+              },
+            );
             for (const interaction of expiredInteractions) {
               await logActivity(tx as unknown as Db, {
                 companyId: updated.companyId,
